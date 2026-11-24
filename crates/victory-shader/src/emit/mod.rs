@@ -549,6 +549,10 @@ pub fn emit(
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // Unless `VICTORY_WAVE_WIDE=0`, a program no other form takes gets this one last: the
+        // 64-lane form it would have instead is refused by a host of 32-lane waves, which
+        // then never runs it (dispatch arguments, culling and relocation passes left unrun).
+        let wide_last = !wide_on && wide_option.as_ref().is_none_or(|v| v != "0");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -635,6 +639,23 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if wide_last {
+            let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+            let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches, last", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
