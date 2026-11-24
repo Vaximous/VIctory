@@ -45,6 +45,13 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: runs in copy-back between its read of title memory and its
+    /// write, as a title thread's write would.
+    static AFTER_READ: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -213,19 +220,38 @@ impl Shadow {
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    // takes the title's bytes in turn. Only the runs of
+                    // bytes the GPU wrote go back: the title's threads keep
+                    // writing the rest of the piece between our read of it
+                    // and this write, and putting back the whole piece
+                    // undid those writes.
+                    #[cfg(test)]
+                    AFTER_READ.with(|f| {
+                        if let Some(f) = f.borrow().as_ref() {
+                            f();
+                        }
+                    });
+                    let mut runs: Vec<(usize, usize)> = Vec::new();
+                    for (i, ((t, h), o)) in
+                        title.iter_mut().zip(host.iter_mut()).zip(old).enumerate()
+                    {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            match runs.last_mut() {
+                                Some((_, end)) if *end == i => *end = i + 1,
+                                _ => runs.push((i, i + 1)),
+                            }
                         }
                         *h = *t;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+                        crate::watch::writing(start + at + first, last - first);
+                        for (a, e) in runs {
+                            // SAFETY: inside the piece just read.
+                            let from = unsafe { title.as_ptr().add(a) };
+                            crate::host::write_mapped((start + at + a) as *mut u8, from, e - a);
+                            written += e - a;
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -496,4 +522,58 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Three pages of title memory on page bounds (plain heap memory, so
+    /// not write-watched) and their host copy; `None` without a host GPU.
+    /// Returns the memory's owner, the address of the first page and the
+    /// copy.
+    fn title() -> Option<(Vec<u8>, usize, Shadow)> {
+        let memory = vec![0u8; 4 * PAGE];
+        let base = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let (buffer, data) = host()?.shared_buffer(3 * PAGE as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu, base as u64, 3 * PAGE as u64);
+        Some((memory, base, shadow))
+    }
+
+    /// A write of one byte: the title's into its memory, or a shader's
+    /// into the copy.
+    fn poke(at: usize, value: u8) {
+        // SAFETY: the tests pass addresses inside the memory or the copy.
+        unsafe { (at as *mut u8).write_volatile(value) }
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: as in `poke`.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// A title thread writes the page while copy-back has it read: only the
+    /// bytes the shader wrote go back, so the title's write stays.
+    #[test]
+    fn a_title_write_during_copy_back_stays() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        s.update(base, PAGE);
+        s.writing(base, PAGE);
+        poke(copy(base + 100), 9);
+        poke(copy(base + 101), 8);
+        AFTER_READ.with(|f| *f.borrow_mut() = Some(Box::new(move || poke(base + 4000, 7))));
+        s.copy_back(base, PAGE);
+        AFTER_READ.with(|f| *f.borrow_mut() = None);
+        assert_eq!(
+            (peek(base + 100), peek(base + 101)),
+            (9, 8),
+            "the shader's bytes"
+        );
+        assert_eq!(peek(base + 4000), 7, "the title's write in between");
+    }
 }
