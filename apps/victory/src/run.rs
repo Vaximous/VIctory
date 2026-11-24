@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    fps: Option<u32>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -28,6 +29,14 @@ pub fn run(
     }
 
     let images = cfg.cache_subdir("images")?;
+    let fps_limit = fps.or(cfg.graphics.fps_limit);
+    victory_hle::modules::d3d12x::set_fps_limit(fps_limit);
+    victory_hle::modules::d3d12x::set_allow_tearing(cfg.graphics.allow_tearing);
+    match fps_limit {
+        Some(0) => println!("fps limit      uncapped"),
+        Some(n) => println!("fps limit      {n} fps"),
+        None => {}
+    }
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
@@ -136,6 +145,7 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    victory_loader::profile_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
@@ -339,6 +349,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: Option<u32>) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }
