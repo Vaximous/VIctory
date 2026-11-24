@@ -146,6 +146,22 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_CLAMP=0`, for measurement only: indirect calls read the
+/// title's arguments as they are, with no clamp pass (`crate::indirect`)
+/// before them, only a wait for earlier shader writes where there may be
+/// some. What the clamp costs the card is what this saves; arguments the
+/// clamp would have cut can hang the card.
+fn unclamped() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let off = std::env::var_os("VICTORY_CLAMP").is_some_and(|v| v == "0");
+        if off {
+            tracing::warn!("indirect arguments are not clamped (VICTORY_CLAMP=0): for measurement only");
+        }
+        off
+    })
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -198,6 +214,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Whether a shader of the pipeline last bound can store to buffers
+    /// (`HostList::wrote` after its draws).
+    stores: bool,
 }
 
 impl Drop for State {
@@ -394,6 +413,34 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
+    Some(gpu)
+}
+
+/// A table's constant buffer in a copy in the card's memory
+/// (`crate::shadow::cards`), 256-byte aligned there with room for its view:
+/// the view shows the copy itself, brought up to date as a root view's,
+/// and no fill of upload memory reads title memory for it at submission.
+///
+/// Such fills waited for every flight in the air whose shaders may write
+/// the copy: a title heap of 174 MB is declared written whole, and the
+/// world's constant reads in it made a submission wait for the card about
+/// 17 ms a frame (143 ms with more lists in the air, run fxab6). On the
+/// card the copy holds, in queue order, the title's bytes sent up before
+/// the submission and what earlier flights' shaders wrote, which is what
+/// the console's draw would read. `VICTORY_CARD_CONSTANTS=0` fills them as
+/// before.
+fn constant_in_card_copy(list: &HostList, address: u64, size: u32) -> Option<u64> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_CARD_CONSTANTS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let size = u64::from(size);
+    let shadow = crate::shadow::find(address, size.max(1))?;
+    let gpu = shadow.gpu(address);
+    if !shadow.carded() || gpu % 256 != 0 || shadow.left(address) < size.next_multiple_of(256) {
+        return None;
+    }
+    shadow.refresh(list, address, size);
     Some(gpu)
 }
 
@@ -896,6 +943,7 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        self.stores = p.stages.iter().any(|stage| stage.translated().stores);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1713,6 +1761,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.wrote();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1812,6 +1861,9 @@ impl State {
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    if self.stores {
+                        list.wrote();
+                    }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -2006,6 +2058,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = constant_in_card_copy(list, address, size) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -2144,6 +2200,9 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if self.stores {
+                list.wrote();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2245,6 +2304,9 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            if self.stores {
+                list.wrote();
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2370,8 +2432,33 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
+        let unclamped = unclamped();
+        if unclamped {
+            self.window = None;
+        }
         let (bounded, at) = match hit {
             Some(hit) => hit,
+            None if unclamped => {
+                args.refresh(list, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(list, *at, 4);
+                }
+                if list.writes_unwaited() {
+                    let barrier = D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(None),
+                            }),
+                        },
+                    };
+                    // SAFETY: an open list.
+                    unsafe { list.list.ResourceBarrier(&[barrier]) };
+                    list.waited();
+                }
+                (args.buffer.clone(), offset)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -2435,7 +2522,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !unclamped {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2458,10 +2547,15 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if kind == DISPATCH || self.stores {
+            list.wrote();
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !unclamped {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
