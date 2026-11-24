@@ -64,9 +64,12 @@ The relay (`VICTORY_RELAY=2`) is on by default; `VICTORY_RELAY=0` turns it
 off. With it, each flight's compare also pushes the pieces it flagged down
 to PC memory in the flight itself, so the relay merges them without a fetch
 of its own (`VICTORY_CARD_PUSH_MB`, 256 MB of slots; 0 fetches them as
-before; not yet measured in a run). Most of the other newer speed changes sit behind environment switches
-that are off by default (`VICTORY_LATE_WAIT`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+before; not yet measured in a run). With the relay, title buffers of 1 MiB
+or more (up to 1024 MB of them) get their copy in card memory and the
+card's re-hashing joins runs of pieces (`VICTORY_CARD_BUFFERS_MIN_MB`,
+`VICTORY_CARD_BUFFERS_MB`, `VICTORY_CARD_REHASH_RUNS`): about 215 against
+288 ms a frame in the world. Most of the other newer speed changes sit behind environment switches
+that are off by default (`VICTORY_WIDE_BACK`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
 ### Known problems
