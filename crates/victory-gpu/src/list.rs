@@ -1929,6 +1929,50 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Diagnostics: the title's barrier groups by what they say, as (group
+/// type, barriers, the first barrier's sync before and after, access
+/// before and after), read as the PC's `D3D12_BARRIER_GROUP` (type,
+/// count, pointer; each barrier starting with those four words) lays them
+/// out: how many since the last frame-rate line.
+#[cfg(all(windows, feature = "diagnostics"))]
+static GROUP_KINDS: std::sync::Mutex<Option<std::collections::HashMap<[u32; 6], u64>>> = std::sync::Mutex::new(None);
+
+/// Counts `count` groups at `groups` in [`GROUP_KINDS`].
+///
+/// # Safety
+/// `groups` holds `count` groups as the title passes them.
+#[cfg(all(windows, feature = "diagnostics"))]
+unsafe fn group_kinds(count: u32, groups: *const u8) {
+    if groups.is_null() {
+        return;
+    }
+    let mut kinds = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    let kinds = kinds.get_or_insert_with(Default::default);
+    for g in 0..count.min(16) as usize {
+        // SAFETY: the caller's; 16 bytes a group.
+        let (kind, n, first) = unsafe {
+            let at = groups.add(g * 16);
+            (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned(), at.add(8).cast::<*const u32>().read_unaligned())
+        };
+        let words = if first.is_null() || n == 0 {
+            [0; 4]
+        } else {
+            // SAFETY: the group's first barrier starts with four words.
+            unsafe { [0, 1, 2, 3].map(|i| first.add(i).read_unaligned()) }
+        };
+        *kinds.entry([kind, n.min(99), words[0], words[1], words[2], words[3]]).or_insert(0) += 1;
+    }
+}
+
+/// The barrier groups most seen since the last call (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_group_kinds() -> Vec<([u32; 6], u64)> {
+    let mut v: Vec<_> = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default().into_iter().collect();
+    v.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    v.truncate(10);
+    v
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -1938,6 +1982,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
+        // SAFETY: the title passes `count` groups.
+        unsafe { group_kinds(count, _groups) };
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if let Some(list) = host_list(this)
             && !list.writes_unwaited()

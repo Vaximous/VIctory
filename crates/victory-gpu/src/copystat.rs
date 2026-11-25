@@ -1258,6 +1258,13 @@ pub(crate) fn log(frames: f64) {
         c[C::TextureMoves as usize],
         c[C::TitleBarrierCalls as usize],
     );
+    #[cfg(windows)]
+    for (k, n) in crate::list::take_group_kinds() {
+        tracing::info!(
+            "  title barrier groups: {:.1} a frame of type {} with {} barriers, the first: sync {:#x} -> {:#x}, access {:#x} -> {:#x}",
+            n as f64 / frames.max(1.0), k[0], k[1], k[2], k[3], k[4], k[5]
+        );
+    }
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
