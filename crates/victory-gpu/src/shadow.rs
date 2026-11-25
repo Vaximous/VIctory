@@ -223,39 +223,58 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Result<ID3D12Resource, &'static str> {
     if !cards() {
-        return None;
+        return Err("");
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
+    if size < least {
+        return Err("");
     }
-    let host = host()?;
+    if size >= 1 << 30 {
+        return Err("1 GiB or more");
+    }
+    let host = host().ok_or("")?;
     if !host.card_ready() {
-        return None;
+        return Err("the host is not ready for card copies");
     }
     // Only while the card has room: with this copy on it, the card's use
-    // must stay under the textures' line (`resource::room_line`, nine
-    // tenths of the budget). The textures stop `card_reserve` below that
-    // line, so the copies find their room even when the textures came
-    // first (with a fifth kept free instead, run fxdef1 made 2 copies
+    // must stay under `card_room_percent` of the budget. The textures stop
+    // `card_reserve` below their own line (`resource::room`, nine tenths),
+    // so the copies find their room even when the textures came first (with a fifth kept free instead, run fxdef1 made 2 copies
     // against 96, and snapshotted 678 MB a frame on the CPU).
     if let Some([budget, used, ..]) = host.video_memory() {
-        let line = if card_reserve_on() { crate::resource::room_line(budget) } else { budget / 10 * 8 };
+        let line = if card_reserve_on() { budget / 100 * card_room_percent() } else { budget / 10 * 8 };
         if used + size > line {
-            return None;
+            return Err("the card's budget");
         }
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+        return Err("VICTORY_CARD_BUFFERS_MB");
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
-    buffer
+    buffer.ok_or("no buffer could be made")
+}
+
+/// The share of the card's budget, in percent, up to which the card's
+/// memory may be in use with a title buffer's copy made there
+/// ([`card_for`]): 95 unless `VICTORY_CARD_BUFFERS_ROOM_PERCENT` says
+/// another (50 to 98). Above the textures' line (`resource::room`, 90): render targets and the host's own buffers grow past what the
+/// textures leave (run fxdef0: 9,925 MB in use of 10,977 with the reserve,
+/// 74 copies 738 MB made against 96 939 MB on the old base), and a buffer's
+/// copy on the card is worth more than a texture's.
+fn card_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUFFERS_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(95, |percent| percent.clamp(50, 98))
+    })
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -1258,6 +1277,10 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// Since the last frame-rate line, bytes snapshotted on the CPU per title
+/// buffer's copy (its start and length), for the line's biggest.
+static SNAPPED_BY: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+
 /// What bound a range shaders may write ([`Shadow::gpu_writes`]).
 #[derive(Clone, Copy)]
 pub(crate) enum Declarer {
@@ -1351,10 +1374,19 @@ pub(crate) fn back_line(frames: f64) {
         );
     }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let mut snapped: Vec<((u64, u64), u64)> =
+        std::mem::take(&mut *SNAPPED_BY.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
+    snapped.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+    let biggest: Vec<String> = snapped
+        .iter()
+        .take(10)
+        .map(|((start, len), bytes)| format!("{start:#x}+{len:#x}: {:.1} MB", mb(*bytes as f64 / frames)))
+        .collect();
+    tracing::info!(buffers = snapped.len(), biggest = ?biggest, "snapshotted on the CPU per frame, by title buffer");
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
@@ -1970,6 +2002,9 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        if !self.window && taken > 0 {
+            *SNAPPED_BY.lock().unwrap_or_else(|e| e.into_inner()).entry((self.start, self.len)).or_default() += taken as u64;
+        }
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -3055,8 +3090,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        let (buffer, card) = match card_for(size).inspect_err(|why| {
+            if !why.is_empty() {
+                let [budget, used, ..] = host().and_then(|h| h.video_memory()).unwrap_or_default();
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    why,
+                    used_mb = used >> 20,
+                    budget_mb = budget >> 20,
+                    card_copies_mb = CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                    "a buffer's host copy could not go to the card's memory"
+                );
+            }
+        }) {
+            Ok(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -3072,7 +3120,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 };
                 (on_card, Some(card))
             }
-            None => (buffer, None),
+            Err(_) => (buffer, None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
