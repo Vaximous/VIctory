@@ -22,7 +22,10 @@
 //!
 //! The tiles go back to the pool when the host copy is dropped, which is
 //! after the card finished with it (`crate::host::retire`).
-//! `VICTORY_TILED_TEXTURES=0`: committed host copies, as before.
+//! Off by default (`VICTORY_TILED_TEXTURES=1` turns it on): the one run
+//! with it (fxtile1) lost the device after 3.5 minutes, cause not found.
+//! It saved 3.4 GB there (4,509 copies, 1,419 MB of tiles against 4,791
+//! MB committed).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,13 +36,13 @@ use windows::Win32::Graphics::Direct3D12::*;
 const HEAP_TILES: u32 = 1024;
 const TILE: u64 = 64 << 10;
 
-/// Whether streamed textures' host copies are reserved resources: on
-/// unless `VICTORY_TILED_TEXTURES=0`, and only with tiled resources tier 2
-/// or more.
+/// Whether streamed textures' host copies are reserved resources:
+/// `VICTORY_TILED_TEXTURES=1`, and only with tiled resources tier 2 or
+/// more.
 pub(crate) fn on(device: &ID3D12Device) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var_os("VICTORY_TILED_TEXTURES").is_some_and(|v| v == "0") {
+        if std::env::var_os("VICTORY_TILED_TEXTURES").is_none_or(|v| v != "1") {
             return false;
         }
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
