@@ -77,6 +77,9 @@ thread_local! {
     /// it writes through that have an extent (None: not collected).
     static CHECK_VIEWS: std::cell::RefCell<Option<Vec<crate::extent::CheckView>>> =
         const { std::cell::RefCell::new(None) };
+    /// As [`STORES`], for a compute stage: its shader's hash (its first 16
+    /// hex digits) and why it has no store extents ("" if it has).
+    static UNEXTENDED: std::cell::Cell<(u64, &'static str)> = const { std::cell::Cell::new((0, "")) };
     /// While a direct dispatch is bound: its groups along each axis.
     static GROUPS: std::cell::Cell<Option<[u32; 3]>> = const { std::cell::Cell::new(None) };
     /// While `State::early_textures` runs the texture pass: the
@@ -1113,6 +1116,10 @@ impl State {
             let t = stage.translated();
             STORES.set(t.stores);
             BOUNDED.set(t.bounded);
+            if compute {
+                let hash = u64::from_str_radix(stage.shader.hash.get(..16).unwrap_or(""), 16).unwrap_or(0);
+                UNEXTENDED.set((hash, t.extents_why));
+            }
             if compute && let Some(e) = &t.extents {
                 let (ranges, reads) = self.leaf_ranges(e);
                 // The constant buffer dwords the extents were bounded with,
@@ -1128,6 +1135,7 @@ impl State {
             STORES.set(true);
             BOUNDED.set(false);
             EXTENT.with_borrow_mut(|x| *x = None);
+            UNEXTENDED.set((0, ""));
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -3047,6 +3055,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u3
                 });
                 if let Some(extent) = extent {
                     crate::shadow::extent_seen(len, extent.map(|(lo, hi)| hi.saturating_sub(lo)));
+                }
+                let (hash, why) = UNEXTENDED.get();
+                if hash != 0 && !matches!(extent, Some(Some(_))) {
+                    crate::extent::declared_whole(hash, if why.is_empty() { "unbounded" } else { why }, len);
                 }
                 if let (Some(Some(extent)), Some(at)) = (extent, at)
                     && !shadow.in_place()
