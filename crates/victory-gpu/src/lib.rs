@@ -49,6 +49,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod cardcopy;
+#[cfg(windows)]
 mod extent;
 #[cfg(windows)]
 mod guarded;

@@ -1,0 +1,238 @@
+//! Title buffer copies done by the card, in their list's order
+//! (`VICTORY_CARD_COPIES=1`).
+//!
+//! A title buffer copy is done on the CPU when its list is submitted. When
+//! its source is memory a flight in the air may write (a shader's results
+//! the title copies on), the submission waits for that flight to run and
+//! land first (in the world twice a frame, 30-90 ms each: the card then
+//! idles while the next submission is prepared). Done by the card between
+//! the host copies of both buffers, the copy comes after the flight on the
+//! one host queue, as the title's own copy comes after its shaders; the
+//! destination is declared written like a shader's view, so it reaches
+//! title memory with the list's copy-back, and a read of it waits for that
+//! as for any shader write.
+//!
+//! Which copies: those whose source once made a submission wait
+//! ([`blocked`]): the same ranges are copied every frame.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::host::HostList;
+
+/// Whether copies whose source made a submission wait are done by the card.
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CARD_COPIES").is_ok_and(|v| v == "1"))
+}
+
+/// `VICTORY_CARD_COPIES_CHECK=1`: the first copies done by the card are
+/// compared with what the CPU's copy would have written (the source as the
+/// card held it right after the copy, against the destination in title
+/// memory once the list has landed).
+fn check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_CARD_COPIES_CHECK").is_ok_and(|v| v == "1"))
+}
+
+/// The most copies compared in a run.
+const CHECKS_MOST: u64 = 2000;
+
+/// Source ranges (start, end) of title buffer copies that made a submission
+/// wait for flights, joined.
+static LEARNED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Since the last frame-rate line: copies done by the card, their bytes,
+/// sources learned; and of all time: compared, alike, different.
+static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A title buffer copy from `[src, src + len)` made a submission wait for
+/// flights: later copies from there are done by the card.
+pub(crate) fn blocked(src: usize, len: usize) {
+    if !on() || len == 0 {
+        return;
+    }
+    let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if learned.iter().any(|&(a, b)| a <= src && src + len <= b) {
+        return;
+    }
+    STATS[2].fetch_add(1, Ordering::Relaxed);
+    learn(&mut learned, src, len);
+}
+
+/// `ranges` (in order, joined) with `[src, src + len)`.
+fn learn(ranges: &mut Vec<(usize, usize)>, src: usize, len: usize) {
+    ranges.push((src, src + len));
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(a, b) in ranges.iter() {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    *ranges = joined;
+}
+
+/// Whether `[src, src + len)` overlaps one of `ranges` (in order, joined).
+fn overlaps(ranges: &[(usize, usize)], src: usize, len: usize) -> bool {
+    let at = ranges.partition_point(|r| r.1 <= src);
+    ranges.get(at).is_some_and(|&(a, _)| a < src + len)
+}
+
+fn learned(src: usize, len: usize) -> bool {
+    overlaps(&LEARNED.lock().unwrap_or_else(|e| e.into_inner()), src, len)
+}
+
+/// A copy compared ([`check_on`]): the destination, and the source's bytes
+/// as the card read them back.
+struct Compared {
+    dst: usize,
+    src: Box<[u8]>,
+    done: Box<std::sync::atomic::AtomicU32>,
+    age: u32,
+}
+
+static COMPARED: Mutex<Vec<Compared>> = Mutex::new(Vec::new());
+
+fn uav_barrier() -> windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER {
+    use windows::Win32::Graphics::Direct3D12::*;
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+/// The title's copy of `len` bytes from `src` to `dst` (title memory),
+/// recorded into `list`: done by the card if its source is one that made a
+/// submission wait and both ends have host copies. Whether it was; if not
+/// the caller defers it to the CPU as before.
+pub(crate) fn try_copy(list: &HostList, dst: usize, src: usize, len: usize) -> bool {
+    if !on() || len == 0 || !learned(src, len) {
+        return false;
+    }
+    let (Some(from), Some(to)) =
+        (crate::shadow::find(src as u64, len as u64), crate::shadow::find(dst as u64, len as u64))
+    else {
+        return false;
+    };
+    if from.left(src as u64) < len as u64 || to.left(dst as u64) < len as u64 {
+        return false;
+    }
+    // Both copies up to date with the title's bytes at submission (where
+    // flights write the source, the refresh leaves their bytes alone), then
+    // the destination is written by the card.
+    from.refresh(list, src as u64, len as u64);
+    to.refresh(list, dst as u64, len as u64);
+    to.gpu_writes(list, dst as u64, len as u64, crate::shadow::Declarer::View);
+    let l = &list.list;
+    // SAFETY: an open list; live host copies (the list's steps hold them
+    // until it is reset), the ranges inside them (checked above).
+    unsafe {
+        l.ResourceBarrier(&[uav_barrier()]);
+        l.CopyBufferRegion(&to.buffer, to.offset(dst as u64), &from.buffer, from.offset(src as u64), len as u64);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(len as u64, Ordering::Relaxed);
+    if check_on() && STATS[3].load(Ordering::Relaxed) < CHECKS_MOST {
+        compare_later(list, &from, src, dst, len);
+    }
+    true
+}
+
+/// [`check_on`]: the source's bytes on the card, read back right after
+/// the copy, to compare with the destination once the list has landed.
+fn compare_later(list: &HostList, from: &crate::shadow::Shadow, src: usize, dst: usize, len: usize) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let Some(back) = host.read_back_buffer(len as u64) else {
+        return;
+    };
+    // SAFETY: as in `try_copy`; the read-back buffer is fresh and `len`
+    // bytes long.
+    unsafe {
+        list.list.CopyBufferRegion(&back, 0, &from.buffer, from.offset(src as u64), len as u64);
+    }
+    let mut record = Compared {
+        dst,
+        src: vec![0u8; len].into_boxed_slice(),
+        done: Box::new(std::sync::atomic::AtomicU32::new(0)),
+        age: 0,
+    };
+    list.defer_read_back(back, record.src.as_mut_ptr(), [len, 1, len]);
+    list.defer_write(record.done.as_ptr().cast(), crate::queue::Written::Value(1), 4);
+    STATS[3].fetch_add(1, Ordering::Relaxed);
+    COMPARED.lock().unwrap_or_else(|e| e.into_inner()).push(record);
+}
+
+/// For the frame-rate line.
+pub(crate) fn line(frames: f64) {
+    if !on() {
+        return;
+    }
+    let mut compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
+    compared.retain_mut(|c| {
+        if c.done.load(Ordering::Acquire) == 0 {
+            c.age += 1;
+            if c.age > 30 {
+                // A list may still write them: never freed.
+                std::mem::forget(std::mem::take(&mut c.src));
+                std::mem::forget(std::mem::replace(&mut c.done, Box::new(std::sync::atomic::AtomicU32::new(0))));
+                return false;
+            }
+            return true;
+        }
+        let mut now = vec![0u8; c.src.len()];
+        let same = crate::host::read_into(c.dst as *const u8, &mut now) && *now == *c.src;
+        STATS[if same { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
+        if !same {
+            let first = now.iter().zip(c.src.iter()).position(|(a, b)| a != b);
+            tracing::warn!(
+                dst = format_args!("{:#x}", c.dst),
+                len = c.src.len(),
+                ?first,
+                "a buffer copy done by the card left other bytes than its source"
+            );
+        }
+        false
+    });
+    drop(compared);
+    let made = STATS[0].swap(0, Ordering::Relaxed) as f64 / frames;
+    let bytes = STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+    tracing::info!(
+        "title buffer copies done by the card per frame (VICTORY_CARD_COPIES=1): {made:.1}, {:.1} KB; sources learned \
+         {}; compared {} (alike {}, different {})",
+        bytes / 1024.0,
+        STATS[2].load(Ordering::Relaxed),
+        STATS[3].load(Ordering::Relaxed),
+        STATS[4].load(Ordering::Relaxed),
+        STATS[5].load(Ordering::Relaxed),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{learn, overlaps};
+
+    /// Learned sources join where they touch; a copy is done by the card if
+    /// it reads any of them.
+    #[test]
+    fn learned_sources_join_and_match_overlaps() {
+        let mut r = Vec::new();
+        learn(&mut r, 0x1000, 0x800);
+        learn(&mut r, 0x1800, 0x800);
+        learn(&mut r, 0x4000, 0x100);
+        assert_eq!(r, [(0x1000, 0x2000), (0x4000, 0x4100)]);
+        assert!(overlaps(&r, 0x1f00, 0x200));
+        assert!(overlaps(&r, 0x3f00, 0x101));
+        assert!(!overlaps(&r, 0x2000, 0x2000));
+        assert!(!overlaps(&r, 0x4100, 0x10));
+    }
+}
