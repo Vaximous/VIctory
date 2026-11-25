@@ -982,7 +982,8 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_some_and(|v| v == "1"))
+    // On by default; `VICTORY_WIDE_BACK=0` turns it off.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
