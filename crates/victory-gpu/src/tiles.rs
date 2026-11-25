@@ -165,7 +165,10 @@ pub(crate) fn reserved(
     // reserved resources take; the out pointer is ours.
     let made = unsafe { device.CreateReservedResource(&d, state, None, &mut texture) };
     let texture = made.ok().and(texture)?;
-    let (mips, slices) = (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize));
+    // As made: a description of 0 levels asks for the whole chain.
+    // SAFETY: a live resource.
+    let made = unsafe { texture.GetDesc() };
+    let (mips, slices) = (u32::from(made.MipLevels).max(1), u32::from(made.DepthOrArraySize).max(1));
     let count = mips * slices;
     let mut total = 0u32;
     let mut packed = D3D12_PACKED_MIP_INFO::default();
