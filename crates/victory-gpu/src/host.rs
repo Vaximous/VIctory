@@ -813,6 +813,11 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// The ranges of title memory the list's table views declared written
+    /// (address, bytes, whether narrowed by a store extent), with when and
+    /// in which frame: for [`read_place`]'s look at what a read waits for.
+    #[cfg(feature = "diagnostics")]
+    declared: Mutex<Vec<(usize, usize, bool, std::time::Instant, u64, (u64, &'static str))>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -2312,6 +2317,9 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    /// When it was sent to the card (looked at with diagnostics).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    sent_at: std::time::Instant,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2459,6 +2467,132 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Reads that waited for flights ([`relay_exact`]), by where the newest
+/// flight that declared what is read stands in the line: waits, the newest
+/// flight in the air was it, an older one was (or one being landed), the
+/// flights in the air after it (not waited for), the flights in the air,
+/// microseconds waited when it was the newest, when an older one.
+static READ_PLACE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// For [`READ_PLACE`], before a read waits for flights: whether the newest
+/// flight whose declared ranges `runs` read is the newest in the air (None
+/// when none is found, as when they landed meanwhile).
+fn read_place(runs: &[&HostList]) -> Option<bool> {
+    let flights: Vec<Vec<(usize, usize)>> = {
+        let line = line();
+        let mut flights = Vec::new();
+        if !line.in_hand.is_empty() || line.settling {
+            // The flights being landed: older than everything in the line,
+            // their ranges still in `written`.
+            flights.push(line.written.clone());
+        }
+        for item in &line.line {
+            if let Late::Run(flight) = item {
+                let mut ranges = Vec::new();
+                join_ranges(&mut ranges, flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                flights.push(ranges);
+            }
+        }
+        flights
+    };
+    let last = flights.iter().rposition(|ranges| blocked_by(ranges, runs, false).is_some())?;
+    let newest = last + 1 == flights.len();
+    #[cfg(feature = "diagnostics")]
+    producer(runs, &flights[last]);
+    READ_PLACE[0].fetch_add(1, Ordering::Relaxed);
+    READ_PLACE[if newest { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+    READ_PLACE[3].fetch_add((flights.len() - last - 1) as u64, Ordering::Relaxed);
+    READ_PLACE[4].fetch_add(flights.len() as u64, Ordering::Relaxed);
+    Some(newest)
+}
+
+/// Since the last frame-rate line, of reads that waited for a flight:
+/// those whose producing declaration was found; of them recorded in the
+/// frame of the read, narrowed by an extent; microseconds from the
+/// declaration to the flight's send, and from the send to the read.
+#[cfg(feature = "diagnostics")]
+static PRODUCERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The ranges of title memory `runs` read at submission: what, where, bytes.
+#[cfg(feature = "diagnostics")]
+fn read_ranges(runs: &[&HostList]) -> Vec<(&'static str, usize, usize)> {
+    let mut out = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    out.push(("a buffer copy's source", src, len));
+                    out.push(("a buffer copy's destination", dst, len));
+                }
+                &Step::Fill(_, src, len) => out.push(("a fill of upload memory", src, len)),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    out.push(("a texture", at, len));
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// For a read of `runs` that waits for flights: the newest flight that
+/// declared what is read (its ranges `ranges`), and in its lists the table
+/// view whose declaration it is: when and in which frame that was recorded,
+/// whether an extent narrowed it, when the flight was sent.
+#[cfg(feature = "diagnostics")]
+fn producer(runs: &[&HostList], ranges: &[(usize, usize)]) {
+    let reads = read_ranges(runs);
+    let Some(&(what, at, len)) = reads.iter().find(|&&(_, at, len)| touches(ranges, at, at + len)) else {
+        return;
+    };
+    let line = line();
+    let found = line.line.iter().rev().find_map(|item| {
+        let Late::Run(flight) = item else {
+            return None;
+        };
+        flight.lists.iter().find_map(|l| {
+            let declared = l.host().declared.lock().unwrap_or_else(|e| e.into_inner());
+            declared
+                .iter()
+                .find(|&&(a, n, ..)| a < at + len && at < a + n)
+                .map(|&d| (d, flight.number, flight.sent_at))
+        })
+    });
+    drop(line);
+    let now = std::time::Instant::now();
+    let frame = crate::queue::presented();
+    let Some(((address, bytes, narrowed, recorded, recorded_frame, (hash, why)), number, sent)) = found else {
+        static UNFOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if UNFOUND.fetch_add(1, Ordering::Relaxed) < 20 {
+            tracing::info!(
+                "a read waits for a flight whose declaration of it is not a table view's (or that flight landed): \
+                 {what} at {at:#x}+{len:#x}"
+            );
+        }
+        return;
+    };
+    let to_send = sent.saturating_duration_since(recorded).as_micros() as u64;
+    let to_read = now.saturating_duration_since(sent).as_micros() as u64;
+    PRODUCERS[0].fetch_add(1, Ordering::Relaxed);
+    PRODUCERS[1].fetch_add(u64::from(recorded_frame == frame), Ordering::Relaxed);
+    PRODUCERS[2].fetch_add(u64::from(narrowed), Ordering::Relaxed);
+    PRODUCERS[3].fetch_add(to_send, Ordering::Relaxed);
+    PRODUCERS[4].fetch_add(to_read, Ordering::Relaxed);
+    static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TOLD.fetch_add(1, Ordering::Relaxed);
+    if n < 60 || n.is_multiple_of(200) {
+        tracing::info!(
+            "a read waits for flight {number}: {what} at {at:#x}+{len:#x}, declared by a table view {address:#x}+{bytes:#x} \
+             ({}) of shader {hash:016x} ({why}), recorded in frame {recorded_frame} (now {frame}), {:.1} ms before the flight was sent, which was \
+             {:.1} ms ago",
+            if narrowed { "narrowed by its store extent" } else { "whole" },
+            to_send as f64 / 1000.0,
+            to_read as f64 / 1000.0,
+        );
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2472,6 +2606,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 &Step::Copy(dst, src, len) => {
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
+                            if touches(written, src, src + len) {
+                                crate::cardcopy::blocked(src, len);
+                            }
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             note_read_block("a buffer copy", written, src, len);
@@ -2632,6 +2769,17 @@ pub(crate) fn settle_for_present() {
 }
 pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
+}
+
+/// Whether the submitting thread resets landed lists itself at the end of
+/// a submission ([`Host::execute_late`]; `VICTORY_LAND_HERE=1`, as before)
+/// rather than leaving them to the helper thread ([`late_helper`]). What
+/// they let go of is released there: the driver's freeing of allocations
+/// and their card addresses was 4-5% of the submitting thread in the world
+/// (run fxprof3).
+fn land_here() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_HERE").is_some_and(|v| v == "1"))
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
@@ -2938,6 +3086,34 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    if relay_exact() {
+        let p: Vec<u64> = PRODUCERS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+        let n = p[0].max(1) as f64;
+        tracing::info!(
+            "reads that waited, their producing table views per frame: {:.1} found, {:.1} recorded in the frame of \
+             the read, {:.1} narrowed by an extent; on average {:.1} ms from the view's recording to its flight's send, \
+             {:.1} ms from the send to the read",
+            p[0] as f64 / frames,
+            p[1] as f64 / frames,
+            p[2] as f64 / frames,
+            p[3] as f64 / n / 1000.0,
+            p[4] as f64 / n / 1000.0,
+        );
+    }
+    if relay_exact() {
+        let p: Vec<f64> = READ_PLACE.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "reads that waited for flights per frame: {:.1}, the newest flight that declared what is read the newest              in the air {:.1} ({:.1} ms waited), an older one {:.1} ({:.1} ms waited); flights in the air {:.1}, after              the one read and not waited for {:.1}",
+            p[0],
+            p[1],
+            p[5] / 1000.0,
+            p[2],
+            p[6] / 1000.0,
+            p[4],
+            p[3],
         );
     }
     if late_exact() {
@@ -3323,6 +3499,8 @@ impl Host {
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                declared: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -4146,6 +4324,7 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::cardcopy::landed();
         {
             let mut line = line();
             let Line {
@@ -4356,6 +4535,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                sent_at: std::time::Instant::now(),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4373,7 +4553,14 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        if land_here() {
+            land();
+        } else if !line().landed.is_empty() {
+            // Resetting landed lists lets go of what they held (upload
+            // buffers, staging copies): the helper thread does it.
+            line().poke = true;
+            LINE_MOVED.notify_one();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -4400,6 +4587,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                sent_at: std::time::Instant::now(),
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4586,7 +4774,13 @@ impl Host {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
+                let place = read_place(runs);
+                let waiting = std::time::Instant::now();
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                if let Some(newest) = place {
+                    READ_PLACE[if newest { 5 } else { 6 }]
+                        .fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -5151,6 +5345,8 @@ impl HostList {
         self.writes.store(0, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
+        #[cfg(feature = "diagnostics")]
+        self.declared.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.indirect_slices.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5631,6 +5827,22 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// A table view declared `[address, address + len)` written
+    /// (`narrowed`: by a store extent), for [`read_place`].
+    #[cfg(feature = "diagnostics")]
+    /// `shader`: the compute shader's hash and why it has no extents, if
+    /// one is bound (0 if not).
+    pub(crate) fn note_declared(&self, address: u64, len: u64, narrowed: bool, shader: (u64, &'static str)) {
+        self.declared.lock().unwrap_or_else(|e| e.into_inner()).push((
+            address as usize,
+            len as usize,
+            narrowed,
+            std::time::Instant::now(),
+            crate::queue::presented(),
+            shader,
+        ));
+    }
+
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -6120,7 +6332,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into title memory: through the kernel, which reports a destination
+    // page that is not there (the guarded copy only survives the source's).
+    let whole = if title_dst { read_kernel(src, dst, len) } else { read(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6139,7 +6353,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -6162,7 +6376,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -6172,13 +6386,15 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+/// `kernel`: into title memory, read through the kernel ([`read_kernel`]).
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, kernel: bool) {
+    let read = |src: *const u8, dst: *mut u8, len: usize| if kernel { read_kernel(src, dst, len) } else { read(src, dst, len) };
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -6205,7 +6421,19 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
+/// The destination must be host memory (`crate::guarded`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if crate::guarded::on() {
+        // SAFETY: the destination is mapped writable host memory of `len`
+        // bytes; a source page that is not there stops the copy.
+        return unsafe { crate::guarded::copy(src, dst, len) };
+    }
+    read_kernel(src, dst, len)
+}
+
+/// [`read`] through the kernel (`ReadProcessMemory`), which also reports a
+/// destination page that is not there or not writable.
+fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -6242,6 +6470,7 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    crate::extent::card_wrote(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();

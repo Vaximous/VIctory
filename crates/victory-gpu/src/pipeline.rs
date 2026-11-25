@@ -126,6 +126,15 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether every buffer store's address depends on nothing worse than
+    /// the lane's place in the dispatch (`victory_shader::stores`): false
+    /// when its code is not known or it has no stores.
+    pub(crate) bounded: bool,
+    /// Where a compute program's buffer stores can reach (`crate::extent`),
+    /// if every one is followed.
+    pub(crate) extents: Option<std::sync::Arc<crate::extent::StoreExtents>>,
+    /// Why a compute program has no `extents` ("" if it has).
+    pub(crate) extents_why: &'static str,
 }
 
 #[cfg(windows)]
@@ -135,7 +144,14 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let mut done = translate(&self.container);
+                if let Ok(t) = &mut done
+                    && t.extents.is_some()
+                    && crate::extent::denied(&self.hash)
+                {
+                    t.extents = None;
+                    t.extents_why = "denied (VICTORY_EXTENT_DENY)";
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -184,6 +200,26 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let bounded = stores
+        && !programs.is_empty()
+        && programs.iter().all(|p| {
+            victory_shader::ir::build(&p.code, p.wave64, p.vgprs).is_ok_and(|ir| {
+                let terms = victory_shader::stores::store_terms(&ir);
+                terms.total() == 0 || terms.bounded()
+            })
+        });
+    let mut extents_why = "";
+    let extents = programs
+        .iter()
+        .find(|p| p.stage == HwStage::Cs)
+        .and_then(|p| match crate::extent::StoreExtents::of(p) {
+            Ok(e) => Some(std::sync::Arc::new(e)),
+            Err(why) => {
+                tracing::debug!(why, "a compute program without store extents");
+                extents_why = why;
+                None
+            }
+        });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -194,7 +230,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, bounded, extents, extents_why })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

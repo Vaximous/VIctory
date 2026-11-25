@@ -66,6 +66,22 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// As [`STORES`]: whether every buffer store of that stage's shader is
+    /// bounded by the lane's place (`Translated::bounded`).
+    static BOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// As [`STORES`]: that stage's store extents and the range of each of
+    /// their leaves for this call (`crate::extent`).
+    static EXTENT: std::cell::RefCell<Option<(std::sync::Arc<crate::extent::StoreExtents>, Vec<Option<(u32, u32)>>)>> =
+        const { std::cell::RefCell::new(None) };
+    /// With `VICTORY_EXTENT_CHECK=1`, while a dispatch is bound: the views
+    /// it writes through that have an extent (None: not collected).
+    static CHECK_VIEWS: std::cell::RefCell<Option<Vec<crate::extent::CheckView>>> =
+        const { std::cell::RefCell::new(None) };
+    /// As [`STORES`], for a compute stage: its shader's hash (its first 16
+    /// hex digits) and why it has no store extents ("" if it has).
+    static UNEXTENDED: std::cell::Cell<(u64, &'static str)> = const { std::cell::Cell::new((0, "")) };
+    /// While a direct dispatch is bound: its groups along each axis.
+    static GROUPS: std::cell::Cell<Option<[u32; 3]>> = const { std::cell::Cell::new(None) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -828,6 +844,56 @@ impl State {
 
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value.
+    /// The range of each leaf of a compute stage's store extents for the
+    /// call being bound (None: unknown).
+    /// Also the constant buffer dwords read (title address, value).
+    fn leaf_ranges(&self, e: &crate::extent::StoreExtents) -> (Vec<Option<(u32, u32)>>, Vec<(u64, u32)>) {
+        use crate::extent::Leaf;
+        let roots = self.roots_ref(true);
+        let reads = std::cell::RefCell::new(Vec::new());
+        // A dword of a constant buffer in title memory.
+        let read = |address: u64, size: u64, offset: u32| {
+            let at = u64::from(offset);
+            if address == 0 || at + 4 > size || !crate::extent::constant_trusted(address + at) {
+                return None;
+            }
+            // SAFETY: title memory the title gave as a constant buffer.
+            let value = unsafe { ((address + at) as *const u32).read_unaligned() };
+            reads.borrow_mut().push((address + at, value));
+            Some(value)
+        };
+        let ranges = e.leaves
+            .iter()
+            .map(|&(_, leaf)| match leaf {
+                Leaf::Thread(axis) => {
+                    let n = *e.threads.get(usize::from(axis))?;
+                    (n > 0).then(|| (0, n - 1))
+                }
+                Leaf::Group(axis) => {
+                    let n = *GROUPS.get()?.get(usize::from(axis))?;
+                    (n > 0).then(|| (0, n - 1))
+                }
+                Leaf::Constant { slot, dword } => match roots.get(usize::from(slot)) {
+                    Some(Root::Constants(c)) => c.get(dword as usize).map(|&v| (v, v)),
+                    _ => None,
+                },
+                Leaf::Cb { slot, entry, offset } => match roots.get(usize::from(slot)) {
+                    Some(&Root::Table(table)) => match crate::descriptor::view(table + u64::from(entry) * 4) {
+                        Some(View::Constant(address, size)) => read(address, u64::from(size), offset).map(|v| (v, v)),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                // A root view has no size: up to 64 KiB, a constant buffer's most.
+                Leaf::RootCb { slot, offset } => match roots.get(usize::from(slot)) {
+                    Some(&Root::View(address)) => read(address, 64 << 10, offset).map(|v| (v, v)),
+                    _ => None,
+                },
+            })
+            .collect();
+        (ranges, reads.into_inner())
+    }
+
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
@@ -1092,8 +1158,27 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            BOUNDED.set(t.bounded);
+            if compute {
+                let hash = u64::from_str_radix(stage.shader.hash.get(..16).unwrap_or(""), 16).unwrap_or(0);
+                UNEXTENDED.set((hash, t.extents_why));
+            }
+            if compute && let Some(e) = &t.extents {
+                let (ranges, reads) = self.leaf_ranges(e);
+                // The constant buffer dwords the extents were bounded with,
+                // as the submission finds them.
+                crate::extent::dump(&stage.shader.hash.to_string(), &reads, GROUPS.get());
+                if !reads.is_empty() && (crate::extent::narrow() || crate::extent::check_on()) {
+                    let hash = stage.shader.hash.clone();
+                    list.defer_host(move || crate::extent::recheck(&reads, &hash));
+                }
+                EXTENT.with_borrow_mut(|x| *x = Some((e.clone(), ranges)));
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            BOUNDED.set(false);
+            EXTENT.with_borrow_mut(|x| *x = None);
+            UNEXTENDED.set((0, ""));
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1992,7 +2077,7 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, None);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2128,7 +2213,28 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let check = crate::extent::check_on();
+        if check {
+            CHECK_VIEWS.with_borrow_mut(|v| *v = Some(Vec::new()));
+        }
+        GROUPS.set(Some([x, y, z]));
+        let mut bound = self.bind(list, p, true);
+        let views = CHECK_VIEWS.with_borrow_mut(Option::take).unwrap_or_default();
+        // Checked: the views' bytes hashed before and after, around the
+        // dispatch bound again.
+        let pending = if bound && !views.is_empty() {
+            let hash = p.stages.first().map_or("", |s| s.shader.hash.as_str());
+            crate::extent::check_before(list, &views, hash)
+        } else {
+            None
+        };
+        if pending.is_some() {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            bound = self.bind(list, p, true);
+        }
+        GROUPS.set(None);
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2143,6 +2249,11 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         list.wrote();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(pending) = pending {
+            crate::extent::check_after(list, pending);
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -2522,7 +2633,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, Some((u.slot, u.table_offset_dwords)));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -2647,7 +2758,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, Some((slot, u.table_offset_dwords)));
                     }
                 }
                 for k in selected {
@@ -2658,7 +2769,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, Some((slot, k * 8)));
                     }
                 }
                 made.push((slot, first * 32));
@@ -2700,7 +2811,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, Some((slot, k * 8)));
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3272,7 +3383,16 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => {
+                // Clamped records run at most this many groups: store
+                // extents bound group ids with it.
+                if !unclamped {
+                    GROUPS.set(Some(crate::indirect::MOST_GROUPS));
+                }
+                let bound = self.bind(list, p, true);
+                GROUPS.set(None);
+                bound
+            }
             _ => false,
         };
         if !ran {
@@ -3399,7 +3519,8 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// `at`: the table entry the view is at (root slot, dword in the table).
+fn readable(list: &HostList, kind: ResourceType, view: &View, at: Option<(u8, u32)>) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3411,7 +3532,55 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View);
+                // Where the shader's stores can reach in the view.
+                let extent = at.and_then(|at| {
+                    EXTENT.with_borrow(|x| {
+                        let (e, ranges) = x.as_ref()?;
+                        let element = crate::descriptor::host::unordered_element(view);
+                        Some(e.extent(at, element, ranges).map(|(lo, hi)| (lo.min(len), hi.min(len))))
+                    })
+                });
+                if let Some(extent) = extent {
+                    crate::shadow::extent_seen(len, extent.map(|(lo, hi)| hi.saturating_sub(lo)));
+                }
+                let (hash, why) = UNEXTENDED.get();
+                if hash != 0 && !matches!(extent, Some(Some(_))) {
+                    crate::extent::declared_whole(hash, if why.is_empty() { "unbounded" } else { why }, len);
+                }
+                if let (Some(Some(extent)), Some(at)) = (extent, at)
+                    && !shadow.in_place()
+                {
+                    CHECK_VIEWS.with_borrow_mut(|v| {
+                        if let Some(v) = v {
+                            let detail = EXTENT.with_borrow(|x| {
+                                let ranges = x.as_ref().map(|(_, r)| r.clone());
+                                format!(
+                                    "element {:?}, view {view:?}, leaves {:?} {ranges:?}",
+                                    crate::descriptor::host::unordered_element(view),
+                                    x.as_ref().map(|(e, _)| e.leaves.iter().map(|l| l.1).collect::<Vec<_>>()),
+                                )
+                            });
+                            v.push(crate::extent::CheckView { shadow: shadow.clone(), address, len, extent, entry: at, detail });
+                        }
+                    });
+                }
+                match extent {
+                    Some(Some((lo, hi))) if crate::extent::narrow() => {
+                        if hi > lo {
+                            shadow.gpu_writes(list, address + lo, hi - lo, crate::shadow::Declarer::View);
+                            #[cfg(feature = "diagnostics")]
+                            list.note_declared(address + lo, hi - lo, true, UNEXTENDED.get());
+                        }
+                    }
+                    _ => {
+                        shadow.gpu_writes(list, address, len, crate::shadow::Declarer::View);
+                        #[cfg(feature = "diagnostics")]
+                        list.note_declared(address, len, false, UNEXTENDED.get());
+                    }
+                }
+                if BOUNDED.get() {
+                    crate::shadow::declared_by_bounded(len);
+                }
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

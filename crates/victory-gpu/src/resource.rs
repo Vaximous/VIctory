@@ -1384,15 +1384,6 @@ pub(crate) fn room() -> bool {
     }
 }
 
-/// The share of the card's budget, in bytes, up to which the card's memory
-/// may be in use with a title buffer's copy made there
-/// (`crate::shadow::card_for`): the textures' line ([`room_percent`]).
-/// The textures stop [`crate::shadow::card_reserve`] below it.
-#[cfg(windows)]
-pub(crate) fn room_line(budget: u64) -> u64 {
-    budget / 100 * room_percent()
-}
-
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
 /// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
