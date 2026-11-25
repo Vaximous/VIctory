@@ -221,12 +221,16 @@ fn windows() -> bool {
 /// of their own clamped; alone, for being a dispatch, asking for more than
 /// one record, having a count buffer, drawn by shaders that store to
 /// buffers, or (none of those) not a step on from the last window.
-/// Last: windows clamped again for a storing call whose declared writes
-/// overlap them ([`windows_by_writes`]).
-static WINDOWED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Then: windows clamped again for a storing call whose declared writes
+/// overlap them ([`windows_by_writes`]). Then why a call that may read a
+/// window was not a step on from one: no window to step on from; another
+/// buffer, kind or stride than the window's; at or before the window's
+/// last record; a step under the stride, over 256 bytes or not of whole
+/// words; another step than the window's.
+static WINDOWED: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// [`WINDOWED`], taken.
-pub(crate) fn take_windowed() -> [u64; 8] {
+pub(crate) fn take_windowed() -> [u64; 13] {
     std::array::from_fn(|i| WINDOWED[i].swap(0, Ordering::Relaxed))
 }
 
@@ -3153,6 +3157,28 @@ impl State {
                 } else {
                     self.window.clone()
                 };
+                if windowed {
+                    let miss = match &from {
+                        None => 8,
+                        Some(w) if !same(w) => 9,
+                        Some(w) => {
+                            let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                            let step = offset.saturating_sub(last);
+                            if offset <= last {
+                                10
+                            } else if step < u64::from(stride) || step > 256 || step % 4 != 0 {
+                                11
+                            } else if w.records != 1 && step != u64::from(w.step) {
+                                12
+                            } else {
+                                0
+                            }
+                        }
+                    };
+                    if miss > 0 {
+                        WINDOWED[miss].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 let (step, records) = match &from {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);

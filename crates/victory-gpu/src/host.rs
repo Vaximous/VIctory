@@ -6503,8 +6503,8 @@ impl Meter {
             tracing::info!(
                 "indirect calls per frame by their clamp: {:.0} read a window clamped before, {:.0} clamped a window, \
                  alone: {:.0} dispatches, {:.0} of more records, {:.0} with a count buffer, {:.0} drawn by storing shaders, \
-                 {:.0} not a step on; {:.0} windows clamped again for a store that can reach them",
-                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+                 {:.0} not a step on; {:.0} windows clamped again for a store that can reach them;                  not a step on from a window: {:.0} with none, {:.0} of another buffer, kind or stride,                  {:.0} at or before its last record, {:.0} a step out of bounds, {:.0} another step",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]
             );
         }
         late_line(frames);
