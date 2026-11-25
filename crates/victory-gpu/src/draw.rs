@@ -3235,7 +3235,7 @@ impl State {
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
-                if crate::indirect::clamped_as_draw(kind) {
+                if crate::indirect::clamped_as_draw(kind, records) {
                     // The clamp was a draw of ours, with no targets.
                     self.host_roots[0] = 0;
                     if self.topology_set {
