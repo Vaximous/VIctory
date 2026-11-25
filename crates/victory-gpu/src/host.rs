@@ -3950,16 +3950,12 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-<<<<<<< HEAD
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            if ring.is_some() {
-                newer.insert(*piece, after);
-            }
-=======
             let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
             shadow.walls_merged(gpu.len(), merged);
             written += merged;
->>>>>>> local/fxbase
+            if ring.is_some() {
+                newer.insert(*piece, after);
+            }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         if ring.is_some() {
@@ -6798,7 +6794,6 @@ impl Host {
             .cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
-<<<<<<< HEAD
             tracing::info!(
                 width,
                 height,
@@ -6807,10 +6802,7 @@ impl Host {
                 tearing,
                 "presenting to a window"
             );
-=======
-            tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
->>>>>>> local/fxbase
             Ok(Presenter {
                 swap_chain,
                 width,
