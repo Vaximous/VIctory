@@ -240,7 +240,7 @@ fn card_for(size: u64) -> Result<ID3D12Resource, &'static str> {
     }
     // Only while the card has room: with this copy on it, the card's use
     // must stay under `card_room_percent` of the budget. The textures stop
-    // `card_reserve` below their own line (`resource::room`, nine tenths),
+    // `card_reserve` below their own line (`resource::room`, 85 percent),
     // so the copies find their room even when the textures came first (with a fifth kept free instead, run fxdef1 made 2 copies
     // against 96, and snapshotted 678 MB a frame on the CPU).
     if let Some([budget, used, ..]) = host.video_memory() {
@@ -262,18 +262,21 @@ fn card_for(size: u64) -> Result<ID3D12Resource, &'static str> {
 
 /// The share of the card's budget, in percent, up to which the card's
 /// memory may be in use with a title buffer's copy made there
-/// ([`card_for`]): 95 unless `VICTORY_CARD_BUFFERS_ROOM_PERCENT` says
-/// another (50 to 98). Above the textures' line (`resource::room`, 90): render targets and the host's own buffers grow past what the
-/// textures leave (run fxdef0: 9,925 MB in use of 10,977 with the reserve,
-/// 74 copies 738 MB made against 96 939 MB on the old base), and a buffer's
-/// copy on the card is worth more than a texture's.
+/// ([`card_for`]): 88 unless `VICTORY_CARD_BUFFERS_ROOM_PERCENT` says
+/// another (50 to 98). Above the textures' line (`resource::room`, 85):
+/// render targets and the host's own buffers grow past what the textures
+/// leave (run fxdef0: 9,925 MB in use of 10,977 with the reserve, 74
+/// copies 738 MB made against 96 939 MB on the old base), and a buffer's
+/// copy on the card is worth more than a texture's. Not higher: near the
+/// budget the system pages the card's memory to the PC's (run fxg6 at 9.9
+/// of 10.8 GB: every command 3-20 times slower, 0.1 fps).
 fn card_room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_CARD_BUFFERS_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(95, |percent| percent.clamp(50, 98))
+            .map_or(88, |percent| percent.clamp(50, 98))
     })
 }
 

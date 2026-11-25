@@ -3277,6 +3277,11 @@ fn hand_back(back: &[Declared]) {
 }
 
 impl Host {
+    /// The queue every host list runs on (tile mappings go on it too).
+    pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        &self.queue
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {

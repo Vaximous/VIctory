@@ -56,6 +56,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The host copy, for a reserved one's tiles (`crate::tiles`); weak, so
+    /// that the copy can still be let go.
+    host: std::sync::Weak<crate::resource::HostTexture>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -121,6 +124,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return false;
     };
     let Some(host) = host() else { return false };
+    crate::resource::map_all_tiles(placed);
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
         let map = map.get_or_insert_with(HashMap::new);
@@ -461,6 +465,9 @@ pub(crate) fn host_written(resource: This) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default).insert(resource as usize)
     };
+    if new {
+        crate::resource::map_all_tiles(resource);
+    }
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
@@ -832,8 +839,40 @@ impl Staging {
         }
     }
 
+    /// Whether level `mip` of slice `slice` has title memory mapped (any
+    /// 64 KiB block of it): in a slice the levels of the tail lie in its
+    /// first block, the others after it from the smallest up
+    /// (`victory_formats::texture::Layout`).
+    fn level_there(&self, mip: u32, slice: u32) -> bool {
+        let layout = &self.layout;
+        let mips = &layout.mips;
+        let level = mip as usize;
+        if level >= mips.len() || slice >= layout.slices.max(1) {
+            return true;
+        }
+        let base = self.memory as usize + (u64::from(slice) * layout.slice_size) as usize;
+        let tail = (layout.first_tail_mip as usize).min(mips.len());
+        let (from, to) = if level >= tail {
+            (0, layout.alignment.min(layout.slice_size).max(1))
+        } else {
+            (mips[level].offset, if level == 0 { layout.slice_size } else { mips[level - 1].offset })
+        };
+        to > from && mapped_bytes((base + from as usize) as *const u8, (to - from) as usize) > 0
+    }
+
+    /// A reserved host copy gets the tiles of the levels whose title
+    /// memory is mapped now, before the upload this detiling is for.
+    fn map_tiles(&self) {
+        if let Some(host) = self.host.upgrade()
+            && let Some(tiles) = &host.tiles
+        {
+            tiles.map(&host.texture, |mip, slice| self.level_there(mip, slice));
+        }
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        self.map_tiles();
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -1095,6 +1134,9 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Before the map's lock: the sweep takes the host copy's lock, then
+    // this one (`crate::resource::let_go_idle`).
+    let host_copy = crate::resource::host_copy(resource).map(|h| Arc::downgrade(&h)).unwrap_or_default();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
@@ -1162,6 +1204,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        host: host_copy,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

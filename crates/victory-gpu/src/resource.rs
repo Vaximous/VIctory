@@ -1125,6 +1125,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// A reserved resource's tiles (`crate::tiles`): only the levels whose
+    /// title memory is mapped take card memory.
+    pub(crate) tiles: Option<crate::tiles::Tiles>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1303,7 +1306,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        // A texture the title streams in, part of its memory not mapped
+        // yet: a reserved host copy whose levels take card memory as they
+        // arrive (`crate::tiles`). Not one the host writes itself.
+        let reserve = fills(&r.desc)
+            && !crate::texture::host_wrote(this as usize)
+            && texture_layout(&r.desc).is_some_and(|t| {
+                let size = t.planes[0].layout.size as usize;
+                size > 0 && !crate::texture::committed(r.data(), size)
+            });
+        let Some((texture, tiles)) = host_texture(&r.desc, r.host.state, clear, reserve) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1321,6 +1333,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.tiles = tiles;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1357,7 +1370,7 @@ pub(crate) fn host_made<'a>(
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
+/// by this process is under 85 percent of the budget the system gives it
 /// ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB` sets a
 /// limit on those copies' bytes instead). Past the budget the system moves
 /// the card's memory into the PC's, which ended runs 20 and 24.
@@ -1385,8 +1398,11 @@ pub(crate) fn room() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
+/// textures picked by index are made ([`room`]): 85 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97), less the room
+/// kept for title buffers' copies (`crate::shadow::card_reserve`); below
+/// their 88 (`crate::shadow::card_for`), for render targets that grow past
+/// both (run fxg6 paged the card's memory at 9.9 of 10.8 GB). At 90 about a
 /// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
@@ -1398,7 +1414,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(85, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -1597,7 +1613,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
              all mapped {never_whole_mb} MB, {never_part} in part {never_part_mb} MB mapped, {never_none} not mapped); {gone_n} whose host \
              copy was let go ({gone_mb} MB: {gone_whole} all mapped {gone_whole_mb} MB, {gone_part} in part {gone_part_mb} MB mapped, \
              {gone_none} not mapped); since the line before: {let_go} host copies let go {let_go_mb} MB, {again} made again {again_mb} MB, \
-             {made} made in all; noting took {noted_us} us on the frame's thread, the walk {walk_ms} ms on its own"
+             {made} made in all; noting took {noted_us} us on the frame's thread, the walk {walk_ms} ms on its own; {}", crate::tiles::line()
         );
         WALKING.store(false, Relaxed);
     };
@@ -1772,6 +1788,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            tiles: None,
         }
     }
 }
@@ -1843,7 +1860,8 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    reserve: bool,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<crate::tiles::Tiles>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1897,6 +1915,19 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    let initial = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+    if reserve
+        && d.flags & PC_FLAGS == 0
+        && crate::tiles::on(&host.device)
+        // SAFETY: `ResourceDesc` has `D3D12_RESOURCE_DESC`'s layout.
+        && let Some((texture, tiles)) =
+            crate::tiles::reserved(&host.device, unsafe { &*(&raw const d).cast::<D3D12_RESOURCE_DESC>() }, initial)
+    {
+        crate::host::name(&texture, || {
+            format!("texture {}x{} f{} flags {:#x}, tiled", d.width, d.height, d.format, d.flags)
+        });
+        return Some((texture, Some(tiles)));
+    }
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
@@ -1921,7 +1952,21 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, None))
+}
+
+/// The host writes title texture `this`'s host copy itself (a copy, a
+/// resolve, the alias copy): a reserved one gets all of its tiles first.
+#[cfg(windows)]
+pub(crate) fn map_all_tiles(this: This) {
+    if this.is_null() {
+        return;
+    }
+    if let Some((host, _)) = hosted(this, false)
+        && let Some(tiles) = &host.tiles
+    {
+        tiles.map_all(&host.texture);
+    }
 }
 
 /// A texture's console memory and description; `None` for buffers.
