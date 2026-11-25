@@ -1812,6 +1812,24 @@ void work() {
 }
 "#;
 
+    /// The clamp as a draw of one point in a graphics stretch: its vertex
+    /// program writes a draw's arguments and places the point outside the
+    /// view, so nothing is drawn. And the same writes by a compute pass.
+    const POINT: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+float4 spot(uint i : SV_VertexID) : SV_Position {
+    args.Store4(0, uint4(3, 1, 0, 0));
+    return float4(2.0, 2.0, 0.5, 1.0);
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void clamp() {
+    args.Store4(0, uint4(3, 1, 0, 0));
+}
+"#;
+
     /// What changes between every two draws of a batch.
     #[derive(Clone, Copy, PartialEq)]
     enum Between {
@@ -1833,6 +1851,15 @@ void work() {
         /// The same between two waits for every earlier shader write, as
         /// the clamp records them.
         ComputeWithWaits,
+        /// The draw reads its arguments from a buffer, as an indirect call
+        /// (no clamp: the floor of the two below).
+        Indirect,
+        /// A wait for earlier shader writes, the argument buffer moved to
+        /// shader writes, a compute pass writes the arguments, the buffer
+        /// moved back, and the draw reads them: the clamp as recorded.
+        ClampCompute,
+        /// The same with a draw of one point in place of the compute pass.
+        ClampPoint,
     }
 
     struct Rig {
@@ -1847,6 +1874,11 @@ void work() {
         work_root: ID3D12RootSignature,
         work: ID3D12PipelineState,
         words: ID3D12Resource,
+        point_root: ID3D12RootSignature,
+        point: ID3D12PipelineState,
+        point_compute: ID3D12PipelineState,
+        args: ID3D12Resource,
+        signature: ID3D12CommandSignature,
         other: ID3D12Resource,
         depth: ID3D12Resource,
         /// Kept alive: the views below name them.
@@ -1989,6 +2021,41 @@ void work() {
         }
     }
 
+    /// A pipeline that draws one point outside the view, for its vertex
+    /// program's writes: the same target and depth formats as the draws
+    /// around it, nothing written to them, no test.
+    fn point_pipeline(device: &ID3D12Device, root: &ID3D12RootSignature, vs: &[u8]) -> ID3D12PipelineState {
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // SAFETY: the description points at live data and never releases
+        // its pointer to the root signature.
+        unsafe {
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
+                },
+                BlendState: D3D12_BLEND_DESC::default(),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC::default(),
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            device.CreateGraphicsPipelineState(&desc).unwrap()
+        }
+    }
+
     impl Rig {
         /// The default adapter, as the layer takes it; `None` without one
         /// or on a software adapter.
@@ -1999,6 +2066,8 @@ void work() {
                 compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
             ];
             let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let point_vs = compile(POINT, s!("spot"), s!("vs_5_1")).ok()?;
+            let point_cs = compile(POINT, s!("clamp"), s!("cs_5_1")).ok()?;
             // SAFETY: plain object creation on a device of our own; the
             // views are made in heaps that live as long as the rig.
             unsafe {
@@ -2048,6 +2117,36 @@ void work() {
                         ..Default::default()
                     })
                     .ok()?;
+                let point_root: ID3D12RootSignature = device.CreateRootSignature(0, &point_vs[..]).ok()?;
+                let point_compute: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&point_root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: point_cs.as_ptr().cast(),
+                            BytecodeLength: point_cs.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let point = point_pipeline(&device, &point_root, &point_vs);
+                let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    ..Default::default()
+                };
+                let mut signature: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC {
+                            ByteStride: 16,
+                            NumArgumentDescs: 1,
+                            pArgumentDescs: &argument,
+                            NodeMask: 0,
+                        },
+                        None,
+                        &mut signature,
+                    )
+                    .ok()?;
+                let signature = signature?;
 
                 let size = (WIDTH, HEIGHT);
                 let colour = |state| texture(&device, size, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, state);
@@ -2073,6 +2172,13 @@ void work() {
                 let words = buffer(
                     &device,
                     64 << 10,
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let args = buffer(
+                    &device,
+                    256,
                     D3D12_HEAP_TYPE_DEFAULT,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -2144,6 +2250,15 @@ void work() {
                 list.ClearRenderTargetView(targets[0], &[0.0; 4], None);
                 list.ClearRenderTargetView(targets[1], &[0.0; 4], None);
                 list.ClearDepthStencilView(depth_written, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+                list.SetComputeRootSignature(&point_root);
+                list.SetPipelineState(&point_compute);
+                list.SetComputeRootUnorderedAccessView(0, args.GetGPUVirtualAddress());
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
                 let [first_target, second_target] = target;
                 let mut rig = Rig {
                     queue,
@@ -2157,6 +2272,11 @@ void work() {
                     work_root,
                     work,
                     words,
+                    point_root,
+                    point,
+                    point_compute,
+                    args,
+                    signature,
                     other,
                     depth,
                     _kept: vec![first_target, second_target, image],
@@ -2281,8 +2401,37 @@ void work() {
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }
+                            Between::Indirect => {}
+                            Between::ClampCompute | Between::ClampPoint => {
+                                let (indirect, written) =
+                                    (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                l.ResourceBarrier(&[super::uav_barrier(), transition(&self.args, indirect, written)]);
+                                let at = self.args.GetGPUVirtualAddress();
+                                if between == Between::ClampCompute {
+                                    l.SetComputeRootSignature(&self.point_root);
+                                    l.SetPipelineState(&self.point_compute);
+                                    l.SetComputeRootUnorderedAccessView(0, at);
+                                    l.Dispatch(1, 1, 1);
+                                } else {
+                                    l.SetGraphicsRootSignature(&self.point_root);
+                                    l.SetPipelineState(&self.point);
+                                    l.SetGraphicsRootUnorderedAccessView(0, at);
+                                    // A point list.
+                                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(1));
+                                    l.DrawInstanced(1, 1, 0, 0);
+                                    l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+                                    l.SetGraphicsRootSignature(&self.root);
+                                    l.SetGraphicsRootDescriptorTable(0, self.tables[0]);
+                                }
+                                l.ResourceBarrier(&[transition(&self.args, written, indirect)]);
+                                l.SetPipelineState(&self.pipelines[0]);
+                            }
                         }
-                        l.DrawInstanced(3, 1, 0, 0);
+                        if matches!(between, Between::Indirect | Between::ClampCompute | Between::ClampPoint) {
+                            l.ExecuteIndirect(&self.signature, 1, &self.args, 0, None, 0);
+                        } else {
+                            l.DrawInstanced(3, 1, 0, 0);
+                        }
                         drawn += 1;
                     }
                     if part + 1 < lists {
@@ -2338,6 +2487,9 @@ void work() {
             ("(g) nothing changes, in 100 lists run one by one", Between::Nothing, 100),
             ("(h) a compute pass of ours of one group before every draw", Between::Compute, 1),
             ("(i) the same pass between two waits for earlier shader writes", Between::ComputeWithWaits, 1),
+            ("(j) every draw an indirect call, its arguments read from a buffer", Between::Indirect, 1),
+            ("(k) the clamp as recorded, a compute pass, before every indirect draw", Between::ClampCompute, 1),
+            ("(l) the clamp as a one-point draw writing the arguments, before every indirect draw", Between::ClampPoint, 1),
         ];
         let mut least = Vec::new();
         for (name, between, lists) in variants {
