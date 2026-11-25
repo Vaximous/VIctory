@@ -1639,11 +1639,13 @@ void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
 "#;
 
 /// Whether the hashes and compares of copies in the card's memory run
-/// [`CARD_COMPARE_WIDE`] (`VICTORY_CARD_WIDE_HASH=1`) instead of
-/// [`CARD_COMPARE`].
+/// [`CARD_COMPARE_WIDE`] instead of [`CARD_COMPARE`] (on by default;
+/// `VICTORY_CARD_WIDE_HASH=0` turns it off). In the world, run fxg2
+/// against fxg1 (timing runs): the card's time 156 ms a frame against
+/// 173, 3.7 fps against 3.5, with the wave uniformity changes.
 pub(crate) fn card_wide_compare() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_none_or(|v| v != "0"))
 }
 
 /// The groups of a hash or compare pass over `pieces` pieces: 64 pieces a
