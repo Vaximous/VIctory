@@ -5196,6 +5196,8 @@ impl HostList {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TextureMoves, 1);
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }

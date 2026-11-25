@@ -127,6 +127,14 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of the title's barrier groups, those with no store to a buffer
+    /// recorded since the list's last such wait; the clamps that waited;
+    /// the transitions of title textures' host copies (each use that needs
+    /// another state); the title's own barriers (legacy form, calls).
+    GroupsUnwritten,
+    ClampWaits,
+    TextureMoves,
+    TitleBarrierCalls,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1240,11 +1248,15 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each, {:.0} of them with the wait); barrier experiment {}; {:.0} of the groups with no          buffer store since the last wait; {:.0} transitions of title textures' host copies; {:.0} calls          of the title's own barriers",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
-        barrier_test()
+        c[C::ClampWaits as usize],
+        barrier_test(),
+        c[C::GroupsUnwritten as usize],
+        c[C::TextureMoves as usize],
+        c[C::TitleBarrierCalls as usize],
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

@@ -498,6 +498,10 @@ fn record_clamp_as(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
+    if wait {
+        crate::copystat::add(crate::copystat::C::ClampWaits, 1);
+    }
+    #[cfg(feature = "diagnostics")]
     let waits = crate::copystat::barrier_test() & 2 == 0;
     #[cfg(not(feature = "diagnostics"))]
     let waits = true;

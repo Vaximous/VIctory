@@ -744,6 +744,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TitleBarrierCalls, 1);
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -783,6 +785,8 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TextureMoves, 1);
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1935,6 +1939,11 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        if let Some(list) = host_list(this)
+            && !list.writes_unwaited()
+        {
+            crate::copystat::add(crate::copystat::C::GroupsUnwritten, 1);
+        }
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
