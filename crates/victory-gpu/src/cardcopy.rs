@@ -130,6 +130,9 @@ pub(crate) fn try_copy(list: &HostList, dst: usize, src: usize, len: usize) -> b
     from.refresh(list, src as u64, len as u64);
     to.refresh(list, dst as u64, len as u64);
     to.gpu_writes(list, dst as u64, len as u64, crate::shadow::Declarer::View);
+    // What the card copies there is not what a constant buffer read at a
+    // later bind finds: such constants bound no store (`crate::extent`).
+    crate::extent::card_wrote(dst, len);
     let l = &list.list;
     // SAFETY: an open list; live host copies (the list's steps hold them
     // until it is reset), the ranges inside them (checked above).
