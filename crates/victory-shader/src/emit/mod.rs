@@ -553,6 +553,8 @@ pub fn emit(
         // 64-lane form it would have instead is refused by a host of 32-lane waves, which
         // then never runs it (dispatch arguments, culling and relocation passes left unrun).
         let wide_last = !wide_on && wide_option.as_ref().is_none_or(|v| v != "0");
+        // (the wave-wide form found with meetings inside loops, kept for last)
+        let mut wide_late = None;
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -582,7 +584,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || wide_last || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -590,10 +592,20 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
+                        lower::take_loop_meeting();
                         let again = widen(c, native, base, why, driver_loop);
+                        let looped = lower::take_loop_meeting();
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            // By default ahead of the approximate forms only without meetings
+                            // in loops; with them, last of all.
+                            if wide_on || driver_loop || !looped {
+                                return again.map(|(shader, _)| shader);
+                            }
+                            if why {
+                                eprintln!("WAVE64-WIDE meetings in a loop: kept for last");
+                            }
+                            wide_late = Some(again);
                         }
                     }
                 }
@@ -641,6 +653,9 @@ pub fn emit(
                     return local.map(|(shader, _)| shader);
                 }
             }
+        }
+        if let Some(late) = wide_late {
+            return late.map(|(shader, _)| shader);
         }
         if wide_last {
             let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
