@@ -49,17 +49,15 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void clamp_one(uint i) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    if (i >= eff_count) return;
+    uint src_at = args_offset + i * stride;
+    uint dst_at = i * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -137,6 +135,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 }
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    clamp_one(id.x);
+}
+// The same as a draw of one point a record ([`clamp_draws`]): the point
+// lies outside the view, so nothing reaches the targets.
+[RootSignature(RS)]
+float4 vertex(uint i : SV_VertexID) : SV_Position {
+    clamp_one(i);
+    return float4(2.0, 2.0, 0.5, 1.0);
+}
 "#;
 
 /// The most groups per axis of any dispatch or mesh record the clamp
@@ -154,6 +164,29 @@ pub(crate) const MAX_DISPATCH_GROUPS: u32 = 1 << 20;
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// The clamp as a draw of points ([`clamp_draws`]): no targets, no
+    /// pixel program. `None` if it did not compile.
+    draw: Option<ID3D12PipelineState>,
+}
+
+/// Whether the clamp before an indirect draw (not a dispatch) is a draw of
+/// one point a record, outside the view, whose vertex program clamps the
+/// record (`VICTORY_CLAMP_DRAW=1`; off by default). The compute pass before
+/// every indirect draw switched the card from drawing to compute and back:
+/// about 10 microseconds a clamp on the 4070 Ti against about 5 as a draw
+/// (`bare_cost`, batches (k) and (l)). The targets are unbound around the
+/// points (the pipeline names none), and the caller binds its own again
+/// ([`clamped_as_draw`]).
+fn clamp_draws() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_DRAW").is_some_and(|v| v == "1"))
+}
+
+/// Whether the clamp of records of `kind` is recorded as a draw
+/// ([`clamp_draws`]): then the list's graphics root signature, pipeline,
+/// topology and targets are ours after it.
+pub(crate) fn clamped_as_draw(kind: u32) -> bool {
+    kind != 2 && clamp_draws() && clamp().is_some_and(|c| c.draw.is_some())
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -180,6 +213,56 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    let (root, pso) = make_stage(device, s!("main"), s!("cs_5_1"), |root, bytes| {
+        // SAFETY: the description points at live data and never releases
+        // its pointer to the root signature.
+        unsafe {
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+        }
+    })?;
+    let draw = make_stage(device, s!("vertex"), s!("vs_5_1"), |root, bytes| {
+        // SAFETY: as above.
+        unsafe {
+            device.CreateGraphicsPipelineState(&D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            })
+        }
+    });
+    if let Err(e) = &draw {
+        tracing::warn!(error = %e, "no argument clamp as a draw: compute passes only");
+    }
+    Ok(Clamp { root, pso, draw: draw.ok().map(|(_, pso)| pso) })
+}
+
+/// The clamp's `entry` compiled for `target`, its root signature and the
+/// pipeline `make` makes of them.
+fn make_stage(
+    device: &ID3D12Device,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+    make: impl FnOnce(&ID3D12RootSignature, &[u8]) -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -190,8 +273,8 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             s!("clamp"),
             None,
             None,
-            s!("main"),
-            s!("cs_5_1"),
+            entry,
+            target,
             0,
             0,
             &mut code,
@@ -217,15 +300,8 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
+        let pso = make(&root, bytes)?;
+        Ok((root, pso))
     }
 }
 
@@ -273,8 +349,8 @@ pub(crate) fn bound(
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
     #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("clamp {} kind {} records {}", if wait { "waiting" } else { "alone" }, spec.0, spec.2));
-    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, 0).then(|| {
+    list.note_op(|| format!("clamp {}{} kind {} records {}", drawn_note(spec.0), if wait { "waiting" } else { "alone" }, spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, 0, clamped_as_draw(spec.0)).then(|| {
         list.waited();
         dst
     })
@@ -383,8 +459,8 @@ pub(crate) fn bound_ahead(
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
     #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("clamp-window {} kind {} records {}", if wait { "waiting" } else { "alone" }, spec.0, spec.2));
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, 0).then(|| {
+    list.note_op(|| format!("clamp-window {}{} kind {} records {}", drawn_note(spec.0), if wait { "waiting" } else { "alone" }, spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, 0, clamped_as_draw(spec.0)).then(|| {
         list.waited();
         dst
     })
@@ -407,11 +483,17 @@ pub(crate) fn bound_slice(
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
     #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("clamp-{} {} kind {} records {}", if ahead { "window" } else { "slice" }, if wait { "waiting" } else { "alone" }, spec.0, spec.2));
-    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, ahead, wait, fresh, at).then(|| {
+    list.note_op(|| format!("clamp-{} {}{} kind {} records {}", if ahead { "window" } else { "slice" }, drawn_note(spec.0), if wait { "waiting" } else { "alone" }, spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, ahead, wait, fresh, at, clamped_as_draw(spec.0)).then(|| {
         list.waited();
         (dst, at)
     })
+}
+
+/// For timing notes: "drawn " for a clamp recorded as a draw.
+#[cfg(feature = "diagnostics")]
+fn drawn_note(kind: u32) -> &'static str {
+    if clamped_as_draw(kind) { "drawn " } else { "" }
 }
 
 #[cfg(test)]
@@ -424,7 +506,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false, true, None, 0)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, true, None, 0, false)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -444,6 +526,7 @@ fn record_clamp_as(
     wait: bool,
     fresh: Option<bool>,
     dst_offset: u64,
+    as_draw: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -522,22 +605,34 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
-    if let Some(fresh) = fresh
-        && let Ok(l7) = l.cast::<ID3D12GraphicsCommandList7>()
-    {
-        let before = if fresh {
-            (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON)
-        } else {
-            (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT)
-        };
-        let written = (D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
-        // SAFETY: as above.
-        unsafe {
-            if waits && wait {
-                l.ResourceBarrier(&first[..1]);
+    let draw = if as_draw { c.draw.as_ref() } else { None };
+    let shading = if draw.is_some() {
+        D3D12_BARRIER_SYNC_VERTEX_SHADING
+    } else {
+        D3D12_BARRIER_SYNC_COMPUTE_SHADING
+    };
+    // SAFETY: an open list; our root signature and pipelines; the buffers
+    // live (as above).
+    let run = || unsafe {
+        if records == 0 {
+            return;
+        }
+        match draw {
+            Some(pso) => {
+                // No targets: the pipeline names none.
+                l.OMSetRenderTargets(0, None, false, None);
+                l.SetGraphicsRootSignature(&c.root);
+                l.SetPipelineState(pso);
+                l.SetGraphicsRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetGraphicsRootShaderResourceView(1, src_gpu);
+                l.SetGraphicsRootShaderResourceView(2, count_gpu);
+                l.SetGraphicsRootUnorderedAccessView(3, dst_gpu);
+                l.SetGraphicsRootUnorderedAccessView(4, budget);
+                // A point list.
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(1));
+                l.DrawInstanced(records, 1, 0, 0);
             }
-            buffer_barrier(&l7, dst, before, written);
-            if records > 0 {
+            None => {
                 l.SetComputeRootSignature(&c.root);
                 l.SetPipelineState(&c.pso);
                 l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -547,6 +642,24 @@ fn record_clamp_as(
                 l.SetComputeRootUnorderedAccessView(4, budget);
                 l.Dispatch(records.div_ceil(64), 1, 1);
             }
+        }
+    };
+    if let Some(fresh) = fresh
+        && let Ok(l7) = l.cast::<ID3D12GraphicsCommandList7>()
+    {
+        let before = if fresh {
+            (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON)
+        } else {
+            (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT)
+        };
+        let written = (shading, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+        // SAFETY: as above.
+        unsafe {
+            if waits && wait {
+                l.ResourceBarrier(&first[..1]);
+            }
+            buffer_barrier(&l7, dst, before, written);
+            run();
             buffer_barrier(&l7, dst, written, (D3D12_BARRIER_SYNC_EXECUTE_INDIRECT, D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT));
         }
         return true;
@@ -556,16 +669,7 @@ fn record_clamp_as(
         // Earlier shader writes (the title's argument and count passes)
         // first, if any may be unwaited for.
         l.ResourceBarrier(&first[usize::from(!waits || !wait)..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
-        }
+        run();
         l.ResourceBarrier(&second[skip..]);
     }
     true
@@ -842,7 +946,7 @@ void main() {
                 },
                 ..Default::default()
             })?;
-            Ok(Clamp { root, pso })
+            Ok(Clamp { root, pso, draw: None })
         }
     }
 
@@ -1403,6 +1507,8 @@ void main() {
                 fresh,
                 Some(fresh),
                 0,
+                // The second as a draw, after the first's compute pass.
+                !fresh,
             ));
         }
         // SAFETY: an open list; live buffers.
@@ -1448,7 +1554,9 @@ void main() {
                 src[at..at + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
-        for ahead in [true, false] {
+        assert!(warp.clamp.draw.is_some(), "the clamp as a draw must compile on WARP");
+        // Each also as a draw of points (`clamp_draws`).
+        for (ahead, drawn) in [(true, false), (false, false), (true, true), (false, true)] {
             let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
             let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
@@ -1473,6 +1581,7 @@ void main() {
                 true,
                 None,
                 slice,
+                drawn,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1500,7 +1609,7 @@ void main() {
             };
             for (i, groups) in filled.into_iter().enumerate() {
                 let rec = &out[i * 8..i * 8 + 4];
-                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
+                assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}, drawn {drawn}");
             }
             let charged_filled = (5 + 519) * 128;
             if ahead {
@@ -1560,6 +1669,7 @@ void main() {
             true,
             None,
             0,
+            false,
         ));
         done_on(&warp.list, &dst_buf);
         // SAFETY: an open list; the scratch buffer is copied for the check.
