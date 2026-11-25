@@ -4090,6 +4090,7 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::cardcopy::landed();
         {
             let mut line = line();
             let Line {

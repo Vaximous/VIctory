@@ -175,16 +175,21 @@ fn compare_later(list: &HostList, from: &crate::shadow::Shadow, src: usize, dst:
     COMPARED.lock().unwrap_or_else(|e| e.into_inner()).push(record);
 }
 
-/// For the frame-rate line.
-pub(crate) fn line(frames: f64) {
-    if !on() {
+/// After flights landed (their copy-backs and bottom-of-pipe writes done):
+/// the copies compared whose lists have run, before a later copy to the
+/// same place (the same copies are made every frame) changes it.
+pub(crate) fn landed() {
+    if !on() || !check_on() {
         return;
     }
     let mut compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
+    if compared.is_empty() {
+        return;
+    }
     compared.retain_mut(|c| {
         if c.done.load(Ordering::Acquire) == 0 {
             c.age += 1;
-            if c.age > 30 {
+            if c.age > 300 {
                 // A list may still write them: never freed.
                 std::mem::forget(std::mem::take(&mut c.src));
                 std::mem::forget(std::mem::replace(&mut c.done, Box::new(std::sync::atomic::AtomicU32::new(0))));
@@ -206,7 +211,13 @@ pub(crate) fn line(frames: f64) {
         }
         false
     });
-    drop(compared);
+}
+
+/// For the frame-rate line.
+pub(crate) fn line(frames: f64) {
+    if !on() {
+        return;
+    }
     let made = STATS[0].swap(0, Ordering::Relaxed) as f64 / frames;
     let bytes = STATS[1].swap(0, Ordering::Relaxed) as f64 / frames;
     tracing::info!(
