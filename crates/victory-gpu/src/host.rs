@@ -746,6 +746,9 @@ pub(crate) struct HostList {
     /// it clamps arguments only when there may be some. True at the start
     /// (an earlier list of the same submission may have written).
     unwaited_writes: std::sync::atomic::AtomicBool,
+    /// Calls recorded whose shaders may write buffers ([`HostList::wrote`]),
+    /// since the reset.
+    writes: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2117,7 +2120,9 @@ mod relay_tests {
 }
 
 /// The most host lists in the air before the flights are settled
-/// (`VICTORY_LATE_WAIT_LISTS`, 128; 32 settled the flights three times a
+/// (`VICTORY_LATE_WAIT_LISTS`, 512; at 128 the world waited about 70 ms a
+/// frame for lists to land, and with 512 and 65,536 merged runs (run
+/// fxall3m) 185 ms a frame against 204; 32 settled the flights three times a
 /// frame in run 92 and 64 still 1.3-1.7 times in run 99, with 12,919 tables
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
@@ -2126,7 +2131,7 @@ mod relay_tests {
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
+        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512).max(1)
     })
 }
 
@@ -2361,12 +2366,13 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 
 /// At most this many changed runs of title bytes go up to copies in the
 /// card's memory beside flights' writes in one submission
-/// (`VICTORY_MERGE_RUNS`, default 4096; it was 512, which left about one
+/// (`VICTORY_MERGE_RUNS`, default 65,536: 4,096 still settled 0.7 times a
+/// frame, 21 ms of waiting, run fxall3; it was 512, which left about one
 /// settle a frame for "title memory changed under shader writes" once
 /// constants were read from such copies). Each is a small copy of its own.
 fn merge_runs() -> usize {
     static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096))
+    *RUNS.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(65536))
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3123,6 +3129,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
+                writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4942,6 +4949,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.unwaited_writes.store(true, Ordering::Relaxed);
+        self.writes.store(0, Ordering::Relaxed);
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5497,6 +5505,25 @@ impl HostList {
     /// `unwaited_writes`).
     pub(crate) fn wrote(&self) {
         self.unwaited_writes.store(true, Ordering::Relaxed);
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many calls whose shaders may write buffers were recorded since
+    /// the reset ([`HostList::wrote`]).
+    pub(crate) fn write_count(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Whether a range declared written by the list's shaders from its
+    /// `from`th step on ([`Step::GpuWrite`]) overlaps title memory
+    /// `[lo, hi)`; and the step it looked up to, for the next asking.
+    pub(crate) fn declared_writes_overlap(&self, from: usize, lo: usize, hi: usize) -> (bool, usize) {
+        let deferred = self.deferred();
+        let steps = &deferred.copies;
+        let hit = steps.get(from..).is_some_and(|s| {
+            s.iter().any(|step| matches!(step, Step::GpuWrite(_, a, len) if *a < hi && a + len > lo))
+        });
+        (hit, steps.len())
     }
 
     /// A wait for every earlier shader write was recorded.
@@ -6244,8 +6271,8 @@ impl Meter {
             tracing::info!(
                 "indirect calls per frame by their clamp: {:.0} read a window clamped before, {:.0} clamped a window, \
                  alone: {:.0} dispatches, {:.0} of more records, {:.0} with a count buffer, {:.0} drawn by storing shaders, \
-                 {:.0} not a step on",
-                w[0], w[1], w[2], w[3], w[4], w[5], w[6]
+                 {:.0} not a step on; {:.0} windows clamped again for a store that can reach them",
+                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
             );
         }
         late_line(frames);
