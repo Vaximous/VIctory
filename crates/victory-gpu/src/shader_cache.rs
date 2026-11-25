@@ -68,6 +68,8 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_PAIR_SYNC",
+            "VICTORY_EXCHANGE_BARRIERS",
+            "VICTORY_HALF_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
