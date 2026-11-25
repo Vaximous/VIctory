@@ -51,6 +51,8 @@ mod memory;
 #[cfg(windows)]
 mod extent;
 #[cfg(windows)]
+mod guarded;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
