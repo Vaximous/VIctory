@@ -794,6 +794,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// With [`crate::draw`]'s kept windows: a device-local buffer whose
+    /// slices hold clamped records, each clamp its own (buffer, bytes used,
+    /// bytes in all); from the start again after a reset.
+    indirect_slices: Mutex<(Option<ID3D12Resource>, u64, u64)>,
     /// Whether shaders recorded in the list may have written buffers since
     /// its last wait for every earlier shader write (a barrier on all
     /// unordered access): `crate::indirect` waits for those writes before
@@ -1570,6 +1574,88 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// [`CARD_COMPARE`] with a group of 256 threads per piece
+/// ([`card_wide_compare`]): each thread hashes every 256th 16 bytes of the
+/// piece, its loads side by side with its neighbours', and the group folds
+/// the 256 hashes in a fixed order. One thread per piece walked its 64 KiB
+/// alone, 4,096 loads one after the other, with a few dozen waves on the
+/// whole card for a buffer of a few hundred MB. The hashes differ from
+/// [`CARD_COMPARE`]'s; a run uses one of the two throughout. Dispatched as
+/// [`card_compare_groups`] says (the piece is `y * 65535 + x`).
+pub(crate) const CARD_COMPARE_WIDE: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;
+    uint skew;
+    uint size;
+    uint pieces;
+    uint out_at;
+    uint compare;
+};
+ByteAddressBuffer now : register(t0);
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[256];
+uint4 mix(uint4 h, uint4 d) {
+    h = (h ^ d) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+    return h.yzwx ^ (h >> 15);
+}
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 g : SV_GroupID, uint t : SV_GroupIndex) {
+    uint n = g.y * 65535u + g.x;
+    // The same for the whole group: no thread waits below without the rest.
+    if (n >= pieces) return;
+    uint piece = first + n;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (t * 0x2545F491u);
+    [loop]
+    for (uint at = lo + t * 16u; at < hi; at += 4096u) {
+        h = mix(h, now.Load4(at));
+    }
+    part[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint step = 128u; step > 0u; step >>= 1) {
+        if (t < step) {
+            part[t] = mix(part[t], part[t + step] ^ uint4(step, step, step, step));
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (t != 0u) return;
+    h = part[0];
+    if (compare != 0u) {
+        differs.Store(out_at + n * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        if (compare == 2u) hashes.Store4(piece * 16u, h);
+    } else {
+        hashes.Store4(piece * 16u, h);
+    }
+}
+"#;
+
+/// Whether the hashes and compares of copies in the card's memory run
+/// [`CARD_COMPARE_WIDE`] (`VICTORY_CARD_WIDE_HASH=1`) instead of
+/// [`CARD_COMPARE`].
+pub(crate) fn card_wide_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_WIDE_HASH").is_some_and(|v| v == "1"))
+}
+
+/// The groups of a hash or compare pass over `pieces` pieces: 64 pieces a
+/// group for [`CARD_COMPARE`], a group a piece for [`CARD_COMPARE_WIDE`]
+/// (`wide`), up to 65,535 in x and on into y.
+pub(crate) fn card_compare_groups(pieces: u32, wide: bool) -> (u32, u32) {
+    if wide {
+        (pieces.clamp(1, 65535), pieces.div_ceil(65535).max(1))
+    } else {
+        (pieces.div_ceil(64), 1)
+    }
+}
 
 /// With [`relay`], after a flight's compares ([`CARD_COMPARE`]), in the
 /// same list: each piece the compare flagged goes to a slot of a ring in PC
@@ -3203,6 +3289,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                indirect_slices: Mutex::new((None, 0, 0)),
                 unwaited_writes: std::sync::atomic::AtomicBool::new(true),
                 writes: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
@@ -3277,12 +3364,13 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
+        let source = if card_wide_compare() { CARD_COMPARE_WIDE } else { CARD_COMPARE };
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
@@ -3515,7 +3603,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_compare_groups(run.pieces, card_wide_compare());
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     list.Close()?;
@@ -3635,7 +3724,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_compare_groups(r.span.pieces, card_wide_compare());
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The flagged pieces, down to the ring.
@@ -5028,6 +5118,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.indirect_slices.lock().unwrap_or_else(|e| e.into_inner()).1 = 0;
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -5389,7 +5480,10 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if !dred_on() {
+        // Timed (`VICTORY_GPU_TIMING`) without device-removed data too: DRED's
+        // breadcrumbs made world frames about ten times slower, and the times
+        // with them.
+        if !dred_on() && !timing() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -5404,10 +5498,12 @@ impl HostList {
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -5670,6 +5766,31 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// A slice of `size` bytes of device-local scratch memory no earlier
+    /// clamp of the list since its reset wrote: (buffer, offset). Slices
+    /// start 256 bytes apart; a full buffer is kept alive and another,
+    /// twice as large, is started.
+    pub(crate) fn indirect_slice(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let size = size.max(4).next_multiple_of(256);
+        let mut slot = self.indirect_slices.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, used, cap) = &mut *slot;
+        if let Some(b) = buffer.as_ref()
+            && *used + size <= *cap
+        {
+            let at = *used;
+            *used += size;
+            return Some((b.clone(), at));
+        }
+        let alloc = (*cap).saturating_mul(2).max(size).max(1 << 20).next_multiple_of(64 << 10);
+        let fresh = host()?.uav_buffer(alloc)?;
+        name(&fresh, || format!("indirect argument slices {alloc:#x}"));
+        if let Some(old) = buffer.replace(fresh.clone()) {
+            self.keep(&old);
+        }
+        (*used, *cap) = (size, alloc);
+        Some((fresh, 0))
     }
 
     /// Keeps `object` alive until the list is reset.

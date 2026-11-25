@@ -134,6 +134,8 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// Where record 0 lies in `scratch` (0 but with [`keep_windows`]).
+    at: u64,
     /// With [`windows_by_writes`]: the title memory its records came from;
     /// the list's count of storing calls when it was clamped
     /// (`HostList::write_count`); whether a range the list declared
@@ -146,6 +148,26 @@ struct Window {
 
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
+
+/// The most windows kept besides the last one ([`keep_windows`]).
+const KEPT_MOST: usize = 8;
+
+/// `VICTORY_WINDOWS_KEEP=1`: windows of clamped records ([`windows`]) are
+/// clamped each into a slice of scratch memory of its own
+/// (`HostList::indirect_slice`), so a new window leaves the earlier ones
+/// readable: up to [`KEPT_MOST`] are kept besides the last, and a call
+/// whose records lie in any of them runs no clamp of ours. Draws that
+/// cannot store to buffers (direct ones too) leave them; a call that can
+/// ends them after it. A record of no window, with none to walk on from,
+/// opens a window of 16 records ahead. Each clamp pass between draws
+/// stops the card's graphics work for a compute pass of a few threads:
+/// with one window at a time, calls that took turns between two argument
+/// buffers, or a direct draw between two indirect ones, clamped every
+/// record alone (1,228 a frame in the world, run fxgt4, "not a step on").
+fn keep_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| windows() && std::env::var_os("VICTORY_WINDOWS_KEEP").is_some_and(|v| v == "1"))
+}
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (on by default;
@@ -271,6 +293,8 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// Earlier windows still readable ([`keep_windows`]), oldest first.
+    kept: Vec<Window>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -1952,6 +1976,7 @@ impl State {
         // when the window is next used, with `windows_by_writes`).
         if !windows_by_writes() {
             self.window = None;
+            self.kept.clear();
         }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2086,7 +2111,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        if !windows_by_writes() {
+        if !windows_by_writes() && !keep_windows() {
             self.window = None;
         }
         #[cfg(feature = "diagnostics")]
@@ -2103,6 +2128,10 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     if self.stores {
                         list.wrote();
+                        if keep_windows() && !windows_by_writes() {
+                            self.window = None;
+                            self.kept.clear();
+                        }
                     }
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -2418,7 +2447,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        if !windows_by_writes() {
+        if !windows_by_writes() && !keep_windows() {
             self.window = None;
         }
         #[cfg(feature = "diagnostics")]
@@ -2444,6 +2473,10 @@ impl State {
             };
             if self.stores {
                 list.wrote();
+                if keep_windows() && !windows_by_writes() {
+                    self.window = None;
+                    self.kept.clear();
+                }
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -2528,7 +2561,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        if !windows_by_writes() {
+        if !windows_by_writes() && !keep_windows() {
             self.window = None;
         }
         #[cfg(feature = "diagnostics")]
@@ -2550,6 +2583,10 @@ impl State {
             };
             if self.stores {
                 list.wrote();
+                if keep_windows() && !windows_by_writes() {
+                    self.window = None;
+                    self.kept.clear();
+                }
             }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -2666,8 +2703,26 @@ impl State {
             && (by_writes || (kind != DISPATCH && !p.stages.iter().any(|stage| stage.translated().stores)));
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
+        let keep = keep_windows();
         if !windowed || list.first_use(WINDOW_USE) {
+            if !keep || windowed {
+                // windowed here: a new host list, whose windows are none of these
+                self.kept.clear();
+            }
+            if keep && !windowed {
+                // a call of no window leaves the windows for the calls after it
+                if let Some(w) = self.window.take() {
+                    self.kept.push(w);
+                    if self.kept.len() > KEPT_MOST {
+                        self.kept.remove(0);
+                    }
+                }
+            }
             self.window = None;
+        }
+        if keep && by_writes {
+            let writes = list.write_count();
+            self.kept.retain(|w| w.writes == writes);
         }
         // A call that may store came after the window: clamped again if
         // what the list's shaders write can reach its records.
@@ -2685,13 +2740,16 @@ impl State {
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
-            .as_ref()
+            .iter()
+            .chain(self.kept.iter().rev())
+            .filter(|_| windowed)
             .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+            .find(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            .map(|w| (w.scratch.clone(), w.at + offset - w.base));
         let unclamped = unclamped();
         if unclamped {
             self.window = None;
+            self.kept.clear();
         }
         let stores = p.stages.iter().any(|stage| stage.translated().stores);
         let how = if hit.is_some() {
@@ -2736,7 +2794,14 @@ impl State {
                 // (the same step as that window's, if it had one): the
                 // title walks the buffer, so the ones that step apart
                 // after it are clamped with it.
-                let (step, records) = match &self.window {
+                // With kept windows: walk on from the latest of the same
+                // buffer and kind that the record lies past.
+                let from = if keep {
+                    self.window.iter().chain(self.kept.iter().rev()).find(|w| same(w) && offset > w.base).cloned()
+                } else {
+                    self.window.clone()
+                };
+                let (step, records) = match &from {
                     Some(w) if windowed && same(w) => {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = offset.saturating_sub(last);
@@ -2750,6 +2815,11 @@ impl State {
                         } else {
                             (stride, max)
                         }
+                    }
+                    _ if keep && windowed => {
+                        // nothing to walk on from: 16 records ahead at the stride
+                        let fit = (args.left(arguments) / u64::from(stride)).clamp(1, 16) as u32;
+                        (stride, fit)
                     }
                     _ => (stride, max),
                 };
@@ -2767,18 +2837,32 @@ impl State {
                     WINDOWED[6].fetch_sub(1, Ordering::Relaxed);
                     WINDOWED[1].fetch_add(1, Ordering::Relaxed);
                 }
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                let bounded = if keep {
+                    crate::indirect::bound_slice(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                        windowed && records > 1,
+                    )
+                } else if windowed && records > 1 {
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)).map(|b| (b, 0))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records)).map(|b| (b, 0))
                 };
-                let Some(bounded) = bounded else {
+                let Some((bounded, slice_at)) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
                 self.host_pipeline = 0;
                 self.host_roots[1] = 0;
+                if keep && let Some(w) = self.window.take() {
+                    self.kept.push(w);
+                    if self.kept.len() > KEPT_MOST {
+                        self.kept.remove(0);
+                    }
+                }
                 self.window = windowed.then(|| Window {
                     copy: args.id(),
                     kind,
@@ -2787,12 +2871,13 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    at: slice_at,
                     title: (arguments as usize, arguments as usize + step as usize * records as usize),
                     writes: list.write_count(),
                     overlap: false,
                     looked: 0,
                 });
-                (bounded, 0)
+                (bounded, slice_at)
             }
         };
         let ran = match kind {
@@ -2829,6 +2914,10 @@ impl State {
         };
         if kind == DISPATCH || self.stores {
             list.wrote();
+            if keep && !by_writes {
+                self.window = None;
+                self.kept.clear();
+            }
         }
         if kind == MESH {
             self.mesh_scissor(list, false);

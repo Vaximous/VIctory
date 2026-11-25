@@ -260,7 +260,9 @@ pub(crate) fn bound(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
-    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh).then(|| {
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp kind {} records {} wait {wait}", spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, false, wait, fresh, 0).then(|| {
         list.waited();
         dst
     })
@@ -368,9 +370,35 @@ pub(crate) fn bound_ahead(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = clamp_waits(list);
     let fresh = enhanced(list, &dst);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh).then(|| {
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp window kind {} records {} wait {wait}", spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true, wait, fresh, 0).then(|| {
         list.waited();
         dst
+    })
+}
+
+/// [`bound`] (`ahead` false) or [`bound_ahead`] (`ahead` true, no count
+/// buffer) into a slice of the list's scratch memory of its own
+/// (`HostList::indirect_slice`) that no earlier clamp wrote: (buffer,
+/// offset of the first record). Records clamped before stay where they
+/// are for the calls that read them later.
+pub(crate) fn bound_slice(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, (dst, at)) = (clamp()?, list.budget()?, list.indirect_slice(bytes)?);
+    let wait = clamp_waits(list);
+    let fresh = enhanced(list, &dst);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp slice kind {} records {} ahead {ahead} wait {wait}", spec.0, spec.2));
+    record_clamp_as(c, &list.list, &dst, budget, src, count, spec, ahead, wait, fresh, at).then(|| {
+        list.waited();
+        (dst, at)
     })
 }
 
@@ -384,7 +412,7 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, false, true, None)
+    record_clamp_as(c, l, dst, budget, src, count, spec, false, true, None, 0)
 }
 
 /// [`record_clamp`]; `ahead`: the records are a window clamped ahead of
@@ -403,6 +431,7 @@ fn record_clamp_as(
     ahead: bool,
     wait: bool,
     fresh: Option<bool>,
+    dst_offset: u64,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -412,7 +441,7 @@ fn record_clamp_as(
         return false;
     };
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress() + dst_offset) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
@@ -811,10 +840,21 @@ void main() {
     /// compare before it, also a change back.
     #[test]
     fn warp_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE, false);
+    }
+
+    /// The same of the compare with a group per piece
+    /// (`crate::host::CARD_COMPARE_WIDE`).
+    #[test]
+    fn warp_wide_card_compare_stores_the_hash_it_made_when_told() {
+        card_compare_stores_the_hash_it_made_when_told(crate::host::CARD_COMPARE_WIDE, true);
+    }
+
+    fn card_compare_stores_the_hash_it_made_when_told(source: &str, wide: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, source).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -840,7 +880,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES, wide);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1259,6 +1300,7 @@ void main() {
                 false,
                 fresh,
                 Some(fresh),
+                0,
             ));
         }
         // SAFETY: an open list; live buffers.
@@ -1308,7 +1350,9 @@ void main() {
             let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
             let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
-            let dst_buf = warp.default_uav(total as u64);
+            // Ahead, into a slice past the buffer's start (`bound_slice`).
+            let slice = if ahead { 256u64 } else { 0 };
+            let dst_buf = warp.default_uav(total as u64 + slice);
             // SAFETY: mapped buffers of these sizes.
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
@@ -1326,6 +1370,7 @@ void main() {
                 ahead,
                 true,
                 None,
+                slice,
             ));
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
@@ -1335,7 +1380,7 @@ void main() {
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
-                warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+                warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, slice, total as u64);
                 warp.list.ResourceBarrier(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1412,6 +1457,7 @@ void main() {
             true,
             true,
             None,
+            0,
         ));
         done_on(&warp.list, &dst_buf);
         // SAFETY: an open list; the scratch buffer is copied for the check.
