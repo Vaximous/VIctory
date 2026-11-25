@@ -69,6 +69,11 @@ card's re-hashing joins runs of pieces (`VICTORY_CARD_BUFFERS_MIN_MB`,
 that are off by default (`VICTORY_WIDE_BACK`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
 Each is described in a comment where it is read.
 
+An overlay in the top-left corner shows the frame rate, ms per frame, and
+the ms of each frame spent preparing on the CPU and waiting for the GPU,
+updated once a second (`VICTORY_FPS_OVERLAY=0` turns it off). It is drawn
+into the window's back buffer only, so captured frames do not have it.
+
 ### Known problems
 
 - Everything in shadow is black (see above).
