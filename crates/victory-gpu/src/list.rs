@@ -1937,6 +1937,16 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// before and after), read as the PC's `D3D12_BARRIER_GROUP` (type,
 /// count, pointer; each barrier starting with those four words) lays them
 /// out: how many since the last frame-rate line.
+/// Whether the title's barrier groups are counted by kind ([`GROUP_KINDS`];
+/// `VICTORY_BARRIER_KINDS=1`, off by default): with its memory queries and
+/// one lock for all recording threads it took 93% of the busiest
+/// recording thread's time (run fxgp1).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn group_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_KINDS").is_some_and(|v| v == "1"))
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 static GROUP_KINDS: std::sync::Mutex<Option<std::collections::HashMap<[u32; 6], u64>>> = std::sync::Mutex::new(None);
 
@@ -2008,8 +2018,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
-        // SAFETY: the title passes `count` groups.
-        unsafe { group_kinds(count, _groups) };
+        if group_census() {
+            // SAFETY: the title passes `count` groups.
+            unsafe { group_kinds(count, _groups) };
+        }
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if let Some(list) = host_list(this)
             && !list.writes_unwaited()
