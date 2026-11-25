@@ -1292,7 +1292,7 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
 #[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
@@ -5728,9 +5728,9 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
                 // SAFETY: an open list; the marker is copied when recorded.
                 unsafe {
                     self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)

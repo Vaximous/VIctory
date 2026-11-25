@@ -227,6 +227,22 @@ fn keep_windows() -> bool {
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// The longest step between two records a window walks ([`windows`]):
+/// 256 bytes unless `VICTORY_WINDOW_STEP_MOST` says another (16 to 65536).
+/// A record further on from the last window's last one is clamped alone:
+/// 109 calls of the 273 a frame clamped alone for not stepping on in run
+/// fxg6.
+fn step_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_STEP_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(256)
+            .clamp(16, 65536)
+    })
+}
+
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
@@ -2267,6 +2283,13 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
+        // A timing run without device-removed data sums the card's time by
+        // the first word and the pipeline only: the whole text, for every
+        // command, took 311 ms of the recording threads' time a frame in
+        // the world (run fxg4) of about 500. Whole for a listed frame.
+        if crate::host::timing() && !crate::host::dred_on() && !crate::capture::listed(crate::queue::presented() + 1) {
+            return text;
+        }
         // What it draws into (a dispatch writes through its views below).
         if !compute {
             let described = |t: usize| {
@@ -3277,7 +3300,7 @@ impl State {
                             let step = offset.saturating_sub(last);
                             if offset <= last {
                                 10
-                            } else if step < u64::from(stride) || step > 256 || step % 4 != 0 {
+                            } else if step < u64::from(stride) || step > step_most() || step % 4 != 0 {
                                 11
                             } else if w.records != 1 && step != u64::from(w.step) {
                                 12
@@ -3295,7 +3318,7 @@ impl State {
                         let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
                         let step = offset.saturating_sub(last);
                         let walks = step >= u64::from(stride)
-                            && step <= 256
+                            && step <= step_most()
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
                         if walks {
