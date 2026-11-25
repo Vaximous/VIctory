@@ -1943,7 +1943,7 @@ static GROUP_KINDS: std::sync::Mutex<Option<std::collections::HashMap<[u32; 6], 
 /// `groups` holds `count` groups as the title passes them.
 #[cfg(all(windows, feature = "diagnostics"))]
 unsafe fn group_kinds(count: u32, groups: *const u8) {
-    if groups.is_null() {
+    if groups.is_null() || !readable(groups, count.min(16) as usize * 16) {
         return;
     }
     let mut kinds = GROUP_KINDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1954,7 +1954,7 @@ unsafe fn group_kinds(count: u32, groups: *const u8) {
             let at = groups.add(g * 16);
             (at.cast::<u32>().read_unaligned(), at.add(4).cast::<u32>().read_unaligned(), at.add(8).cast::<*const u32>().read_unaligned())
         };
-        let words = if first.is_null() || n == 0 {
+        let words = if first.is_null() || n == 0 || !readable(first.cast(), 16) {
             [0; 4]
         } else {
             // SAFETY: the group's first barrier starts with four words.
@@ -1962,6 +1962,29 @@ unsafe fn group_kinds(count: u32, groups: *const u8) {
         };
         *kinds.entry([kind, n.min(99), words[0], words[1], words[2], words[3]]).or_insert(0) += 1;
     }
+}
+
+/// Whether `len` bytes at `at` are committed, readable memory: the
+/// barrier pointer read from a title group may not be the PC layout's (a
+/// run read through one unchecked and stopped without a word, fxg4).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn readable(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_GUARD,
+        PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    if unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) } == 0 {
+        return false;
+    }
+    let reads = PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE;
+    let end = info.BaseAddress as usize + info.RegionSize;
+    info.State == MEM_COMMIT
+        && info.Protect & reads != 0
+        && info.Protect & PAGE_GUARD == 0
+        && (at as usize).checked_add(len).is_some_and(|e| e <= end)
 }
 
 /// The barrier groups most seen since the last call (diagnostics).
