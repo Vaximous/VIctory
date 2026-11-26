@@ -424,6 +424,22 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
     Some(texture.clone())
 }
 
+/// What a slot shows while the placed texture its view names has no host
+/// copy (not uploaded yet, or let go): mid-grey for a 2D texture or array
+/// ([`neutral_for`]), not black; a null view of its kind otherwise.
+/// `VICTORY_GREY_WAITING=0`: a null view (black), as before.
+fn stand_in(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_GREY_WAITING").is_none_or(|v| v != "0"))
+        && matches!(view, View::Placed(false, resource, _) if resource[0] != 1)
+    {
+        // (The grey texture lives for the run: nothing to keep.)
+        let _ = neutral_for(view, at);
+    } else {
+        null_for(view, at);
+    }
+}
+
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 
 /// Deferred slot flips recorded into an open or not-yet-submitted command
@@ -2546,7 +2562,7 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
+            Some(view) => stand_in(&view, self.at(index)),
             None => null_view(self.at(index)),
         }
         self.put(index);
@@ -3398,7 +3414,11 @@ impl HostHeap {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
+                if later {
+                    stand_in(&view, self.at(index));
+                } else {
+                    null_for(&view, self.at(index));
+                }
             }
             if kept.is_some() || !self.sampler {
                 self.put(index);
