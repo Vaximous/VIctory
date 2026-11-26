@@ -48,7 +48,7 @@ test_titles = []
 #   pitch_per_count = -0.0006
 #   pitch_min = -1.4            # defaults; wrap = 6.2831853 (radians), 360 for degrees, 0 none
 #   pitch_max = 1.4
-# camera = 'D:ictory-data\mouse-camera.toml'
+# camera = 'D:\victory-data\mouse-camera.toml'
 # Stick movement:
 # speed * sensitivity / 2000 counts/s is a full stick.   env: VICTORY_MOUSE_SENS
 # sensitivity = 1.0
