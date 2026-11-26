@@ -1455,10 +1455,139 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
+    let mut g = guards_bare();
+    if TAKING.1.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        taken_now(&mut g, false, true);
+    }
+    g
+}
+
+/// The guards' lock alone, for a fault: what [`guard_apart`] made read-only
+/// meanwhile is noted only by [`open`] (if in its range), not covered.
+fn guards_bare() -> std::sync::MutexGuard<'static, Guards> {
     if let Ok(g) = GUARDS.try_lock() {
         return g;
     }
     waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Whether blocks a refresh found written are made read-only with the guards'
+/// lock let go ([`guard`]): the lock is taken to choose them and to note
+/// them, and the protection is changed between, beside the title's faults
+/// and the other refreshes (some 23 ms a frame of all threads' waiting for
+/// the lock, most of it behind such changes). `VICTORY_GUARD_APART=0`: under
+/// the lock, as before.
+fn guard_apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_APART").is_none_or(|v| v != "0"))
+}
+
+/// Blocks being made read-only with the lock let go ([`guard_apart`]): set
+/// under the lock when chosen, cleared under it when noted. Not in
+/// [`Guards::protected`] meanwhile: who would open one ([`open`],
+/// [`views_mapped`]) waits until its change is done and noted
+/// ([`taken_now`]); a fault of the title's there waits with it.
+static TAKING_BLOCKS: Bits = Bits::new();
+
+/// The runs of [`TAKING_BLOCKS`], each with its state (0 being changed,
+/// 1 read-only now, 2 the change failed), and how many there are.
+#[allow(clippy::type_complexity)]
+static TAKING: (Mutex<Vec<(usize, usize, std::sync::Arc<std::sync::atomic::AtomicU8>)>>, std::sync::atomic::AtomicUsize) =
+    (Mutex::new(Vec::new()), std::sync::atomic::AtomicUsize::new(0));
+
+/// Notes the runs of [`TAKING`] whose change is done (with `wait`, waits for
+/// all of them first). With `full`, as [`protect`] would have: those made
+/// read-only guarded and clean, the other views of their pages covered, the
+/// others protected block by block as before. Without (any taker of the
+/// lock, a fault among them: nothing here may take a lock of another kind),
+/// guarded but not clean: the next refresh tells them as written once and
+/// covers them then.
+fn taken_now(g: &mut Guards, wait: bool, full: bool) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let done: Vec<(usize, usize, u8)> = {
+        let mut runs = TAKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if wait {
+            // The thread changing them holds no lock of ours meanwhile.
+            while runs.iter().any(|r| r.2.load(SeqCst) == 0) {
+                drop(runs);
+                std::thread::yield_now();
+                runs = TAKING.0.lock().unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        let mut done = Vec::new();
+        runs.retain(|(from, to, state)| match state.load(SeqCst) {
+            0 => true,
+            s => {
+                done.push((*from, *to, s));
+                false
+            }
+        });
+        TAKING.1.store(runs.len(), SeqCst);
+        done
+    };
+    for (from, to, state) in done {
+        #[cfg(feature = "diagnostics")]
+        crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+        match (state, full) {
+            (1, true) => {
+                g.protected.insert_all(from..to);
+                g.clean.insert_all(from..to);
+                cover(g, from, to);
+            }
+            (1, false) => g.protected.insert_all(from..to),
+            (_, true) => protect(g, from, to),
+            (_, false) => {
+                protect_here(g, from, to);
+                (from..to).for_each(|block| {
+                    g.clean.remove(block);
+                });
+            }
+        }
+        (from..to).for_each(|block| TAKING_BLOCKS.clear(block));
+    }
+}
+
+/// [`protect`] of `[from, to)` begun under the lock: the blocks are noted
+/// as being taken; [`take_apart`] changes their protection with the lock
+/// let go.
+fn take_later(from: usize, to: usize) -> (usize, usize, std::sync::Arc<std::sync::atomic::AtomicU8>) {
+    // Ahead of the protection (`PROTECTED`), as `protect_here` does.
+    for block in from..to {
+        PROTECTED.set(block);
+        TAKING_BLOCKS.set(block);
+    }
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let mut runs = TAKING.0.lock().unwrap_or_else(|e| e.into_inner());
+    runs.push((from, to, state.clone()));
+    TAKING.1.store(runs.len(), std::sync::atomic::Ordering::SeqCst);
+    (from, to, state)
+}
+
+/// The protection of runs [`take_later`] noted is changed, with no lock of
+/// ours held (the caller holds the mapping as a read does: the runtime
+/// changes none meanwhile); they are noted by the next taker of the lock.
+fn take_apart(runs: &[(usize, usize, std::sync::Arc<std::sync::atomic::AtomicU8>)]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    for (from, to, state) in runs {
+        let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: title view memory; only its protection changes.
+        let mut done = unsafe {
+            VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
+        };
+        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+            // SAFETY: as above; what it was.
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+            done = false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(5, (to - from) as u64);
+            tally(8, started.elapsed().as_nanos() as u64);
+        }
+        state.store(if done { 1 } else { 2 }, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1711,6 +1840,20 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
     }
     let rest = rest();
+    // The blocks to make read-only are chosen under the lock and changed
+    // with it let go ([`guard_apart`]), while no mapping changes (the
+    // runtime's change waits for this read; with one under way, or this
+    // thread making it, under the lock as before).
+    let reading = if guard_apart() && !CHANGING.get().0 { title_memory_reading_now() } else { None };
+    let apart = reading.is_some();
+    let mut later = Vec::new();
+    let mut put = |g: &mut Guards, from: usize, to: usize| {
+        if reading.is_some() {
+            later.push(take_later(from, to));
+        } else {
+            protect(g, from, to);
+        }
+    };
     let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
@@ -1732,12 +1875,17 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            put(&mut g, from, to);
             run = None;
             // Faults of the title's wait for the lock: each block is done on
-            // its own, and looked at anew below.
-            drop(g);
-            g = guards_timed();
+            // its own, and looked at anew below. (Not when the blocks are
+            // made read-only after the lock is let go: the loop is short
+            // then, and who opens one of those waits for its change, which
+            // must not wait for the lock in turn.)
+            if !apart {
+                drop(g);
+                g = guards_timed();
+            }
         }
         // Told as written by this, and read by the caller after.
         if BESIDE.take(block) {
@@ -1748,7 +1896,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                put(&mut g, from, to);
             }
             if g.clean.contains(block) {
                 continue;
@@ -1759,13 +1907,19 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            put(&mut g, from, to);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        put(&mut g, from, to);
     }
     drop(g);
+    if !later.is_empty() {
+        take_apart(&later);
+        drop(reading);
+        let mut g = guards_bare();
+        taken_now(&mut g, false, true);
+    }
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
@@ -2002,6 +2156,11 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     if first >= last {
         return 0;
     }
+    // Blocks being made read-only with the lock let go: once they are, noted
+    // guarded, and opened here with the others.
+    if TAKING_BLOCKS.any(first, last) {
+        taken_now(g, true, false);
+    }
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
@@ -2222,6 +2381,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     // together: none may be writable while another is clean (who asks about
     // that one by its bits takes no lock).
     let mut g = guards();
+    if ranges.iter().any(|&(at, n)| TAKING_BLOCKS.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
+        taken_now(&mut g, true, false);
+    }
     let blocks: Vec<usize> =
         ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
     #[cfg(feature = "diagnostics")]
@@ -2646,7 +2808,7 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let mut g = guards();
+            let mut g = guards_bare();
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
             let opened = open(&mut g, at, at + 1);
@@ -2882,6 +3044,89 @@ mod tests {
             VirtualQuery(at as *const _, &mut info, size_of_val(&info));
             info.Protect
         }
+    }
+
+    /// Blocks made read-only with the guards' lock let go ([`guard_apart`])
+    /// lose no write: threads write all over a view while refreshes guard it
+    /// and copy what they are told was written, and another thread opens
+    /// blocks as our own writes do; at the end the copy holds what the
+    /// memory holds.
+    #[test]
+    fn guarding_apart_loses_no_write_of_threads_writing_meanwhile() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        const BLOCKS: usize = 24;
+        // SAFETY: a pagefile section, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (BLOCKS * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        let end = at + BLOCKS * BLOCK;
+        let mut copy = vec![0u8; BLOCKS * BLOCK];
+        let take = |copy: &mut [u8], pages: &[usize]| {
+            for &page in pages {
+                let (from, to) = ((page * PAGE).max(at), ((page + 1) * PAGE).min(end));
+                if from < to {
+                    // SAFETY: inside our view, read while others write (the
+                    // bytes may be torn; the next look sees the rest).
+                    let bytes = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+                    copy[from - at..to - at].copy_from_slice(bytes);
+                }
+            }
+        };
+        take(&mut copy, &guard(at, end).expect("a view"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..3u64)
+            .map(|n| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(n + 1);
+                    let mut count = 0u64;
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let offset = (x as usize % (BLOCKS * BLOCK)) & !7;
+                        count += 1;
+                        // SAFETY: inside the view; a guard's fault opens it.
+                        unsafe { std::ptr::write_volatile((at + offset) as *mut u64, count << 8 | n) };
+                    }
+                })
+            })
+            .collect();
+        // Our own opening of blocks, as `came_back` does for a write of ours.
+        let opener = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut block = 0;
+                while !stop.load(Relaxed) {
+                    open(&mut guards(), at + block * BLOCK, at + block * BLOCK + 1);
+                    block = (block + 5) % BLOCKS;
+                    std::thread::yield_now();
+                }
+            })
+        };
+        for _ in 0..2000 {
+            take(&mut copy, &guard(at, end).expect("a view"));
+        }
+        stop.store(true, Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+        opener.join().unwrap();
+        take(&mut copy, &guard(at, end).expect("a view"));
+        // SAFETY: inside the view; nothing writes now.
+        let now = unsafe { std::slice::from_raw_parts(at as *const u8, BLOCKS * BLOCK) };
+        assert!(copy == now, "a write was lost");
+        assert!(!TAKING_BLOCKS.any(at / BLOCK, end / BLOCK));
+        title_memory_unmapping(at, BLOCKS * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// A refresh between the opening of a kernel read's destination and the
