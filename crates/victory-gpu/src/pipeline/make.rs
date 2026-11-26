@@ -394,7 +394,21 @@ pub(crate) fn take_waited_us() -> u64 {
     WAITED_US.swap(0, Ordering::Relaxed)
 }
 
+/// `VICTORY_PIPELINE_BLOCK=1`: a recording thread waits for a pipeline being
+/// made (within [`wait_budget`], [`screen_budget`] for passes over the
+/// screen), as before. By default it never waits: the draw is dropped this
+/// frame (counted with the others dropped without a host pipeline) and the
+/// pipeline goes to the front of the workers' queue. A moving run's frame
+/// lines had the recording threads waiting up to 836 ms a frame.
+fn block() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BLOCK").is_some_and(|v| v == "1"))
+}
+
 fn wait(p: &Pending, frame: u64) {
+    if !block() {
+        return;
+    }
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
@@ -624,6 +638,8 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
+                    // Off the title's die, beside our other pools.
+                    crate::cores::keep_many_on_fast_cores("victory-pipelines");
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
