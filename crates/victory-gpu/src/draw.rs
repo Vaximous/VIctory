@@ -759,6 +759,18 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Textures let go and shown again that were made while the card had no
+/// room, since the start (`VICTORY_WANTED_BACK=0`: none, they wait for
+/// room as before).
+pub(crate) static HEAP_TEXTURES_BACK: AtomicU64 = AtomicU64::new(0);
+
+/// The most such textures one pass makes.
+const WANTED_BACK_A_PASS: u32 = 64;
+
+fn wanted_back_on() -> bool {
+    crate::toggled!("VICTORY_WANTED_BACK")
+}
+
 /// Uploads of textures already on the card made while it had no room for
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
@@ -2564,6 +2576,7 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        let mut back_made = 0u32;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2791,7 +2804,36 @@ impl State {
             if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                // A texture let go to make room and shown again comes back
+                // all the same, a bounded number a pass: the sweep lets go
+                // of longer idle ones in its place (`resource::let_go_idle`),
+                // where it waited for room before, which a card past its
+                // line with render targets and buffer copies never had
+                // (white and red patches on what the title shows close up,
+                // in runs that went on into heavier scenes).
+                let back = !has_its_texture
+                    && wanted_back_on()
+                    && back_made < WANTED_BACK_A_PASS
+                    && heap.handle(index).and_then(crate::descriptor::view).is_some_and(|view| match view {
+                        View::Shader(object, _) => crate::resource::wanted_back(object as This),
+                        View::Placed(false, resource, desc) if resource[0] != 1 => {
+                            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                            crate::resource::texture_at_made(address, &resource).is_some_and(crate::resource::wanted_back)
+                        }
+                        _ => false,
+                    });
+                if back {
+                    back_made += 1;
+                    let n = HEAP_TEXTURES_BACK.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture let go and shown again is made although the card has no room for new ones (VICTORY_WANTED_BACK)"
+                        );
+                    }
+                }
+                if !has_its_texture && !back {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds

@@ -2396,6 +2396,18 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether a title texture had a host copy that was let go
+/// ([`let_go_idle`]) and has none now: one the title shows again.
+#[cfg(windows)]
+pub(crate) fn wanted_back(this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER && r.host.gone.load(Relaxed) && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+}
+
 /// A title texture's host copy if it is made; not made here.
 #[cfg(windows)]
 pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
