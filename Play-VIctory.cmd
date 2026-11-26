@@ -2,7 +2,8 @@
 setlocal EnableExtensions DisableDelayedExpansion
 rem Options, in any order:
 rem   pareto-residency  (the default build; accepted for older shortcuts)
-rem   nobuild           start the game without building the shader cache first
+rem   mouse             let the mouse join the pad the title reads
+rem   nobuild          start the game without building the shader cache first
 rem   background        start the game at once and build the cache behind it
 rem   buildonly         build the shader and pipeline cache, do not start the game
 rem   buildsecs N       build at most N seconds before the game starts
@@ -13,11 +14,12 @@ set "only="
 :options
 if "%~1"=="" goto options_done
 if /i "%~1"=="pareto-residency" (shift & goto options)
+if /i "%~1"=="mouse" (set "VICTORY_MOUSE=1" & shift & goto options)
 if /i "%~1"=="nobuild" (set "cache=skip" & shift & goto options)
 if /i "%~1"=="background" (set "cache=background" & shift & goto options)
 if /i "%~1"=="buildonly" (set "only=1" & shift & goto options)
 if /i "%~1"=="buildsecs" (set "VICTORY_CACHE_BUILD_SECONDS=%~2" & shift & shift & goto options)
-echo Usage: Play-VIctory.cmd [nobuild^|background^|buildonly] [buildsecs N] 1>&2
+echo Usage: Play-VIctory.cmd [mouse] [nobuild^|background^|buildonly] [buildsecs N] 1>&2
 exit /b 2
 :options_done
 if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%~dp0..\GTA6.Xbox.v1.0.2.1"

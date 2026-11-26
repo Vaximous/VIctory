@@ -63,6 +63,7 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     graphics(&cfg.graphics)?;
+    input(&cfg.input)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -221,6 +222,54 @@ fn graphics(g: &victory_core::Graphics) -> Result<()> {
     if let Some(on) = g.ray_tracing {
         victory_hle::set_ray_tracing(on);
     }
+    Ok(())
+}
+
+/// Mouse mode (`[input]`), before the title first asks for input.
+#[cfg(windows)]
+fn input(i: &victory_core::Input) -> Result<()> {
+    use victory_hle::modules::gameinput::mouse::{Settings, Target, key};
+    if i.mouse != Some(true) {
+        return Ok(());
+    }
+    let mut s = Settings {
+        enabled: true,
+        ..Settings::default()
+    };
+    let ratio = |name: &str, v: Option<f32>, at: &mut f32| -> Result<()> {
+        if let Some(v) = v {
+            anyhow::ensure!(v >= 0.0, "[input] {name} = {v}: expected a number from 0");
+            *at = v;
+        }
+        Ok(())
+    };
+    ratio("sensitivity", i.sensitivity, &mut s.sensitivity)?;
+    ratio("curve", i.curve, &mut s.curve)?;
+    ratio("deadzone_boost", i.deadzone_boost, &mut s.deadzone_boost)?;
+    ratio("cap", i.cap, &mut s.cap)?;
+    s.invert_y = i.invert_y.unwrap_or(s.invert_y);
+    s.hold_ms = i.hold_ms.unwrap_or(s.hold_ms);
+    if let Some(name) = &i.release_key {
+        s.release_key = key(name).with_context(|| format!("[input] release_key = {name:?}: expected F1-F24, a letter or digit, or 0x.."))?;
+    }
+    let target = |name: &str, v: &Option<String>, at: &mut Target| -> Result<()> {
+        if let Some(v) = v {
+            *at = Target::parse(v).with_context(|| {
+                format!("[input] {name} = {v:?}: expected a b x y up down left right lb rb ls rs menu view lt rt none")
+            })?;
+        }
+        Ok(())
+    };
+    let [left, right, middle, back, forward] = &mut s.buttons;
+    target("left_button", &i.left_button, left)?;
+    target("right_button", &i.right_button, right)?;
+    target("middle_button", &i.middle_button, middle)?;
+    target("back_button", &i.back_button, back)?;
+    target("forward_button", &i.forward_button, forward)?;
+    let [up, down] = &mut s.wheel;
+    target("wheel_up", &i.wheel_up, up)?;
+    target("wheel_down", &i.wheel_down, down)?;
+    victory_hle::modules::gameinput::mouse::configure(s);
     Ok(())
 }
 

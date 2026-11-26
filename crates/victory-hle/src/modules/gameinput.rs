@@ -21,6 +21,8 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+pub mod mouse;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -113,6 +115,10 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// The mouse as a pad (`mouse`), merged into the pad the title reads.
+    fn mouse(&mut self) -> PadState {
+        PadState::default()
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -430,12 +436,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.mouse())
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -479,22 +485,27 @@ impl State {
         &mut self,
         devices: &[Device; DEVICES],
         one_pad: bool,
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(merged(fallback(&keys), mouse), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
         }
         let any_pad = pads.iter().any(Option::is_some);
+        // The mouse joins the first host pad, else the stand-in.
+        if let Some(pad) = pads.iter_mut().flatten().next() {
+            *pad = merged(*pad, mouse);
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merged(fallback(&keys), mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -628,6 +639,9 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    if kind & GAMEPAD_KIND != 0 {
+        mouse::PAD_READ.store(true, Ordering::Relaxed);
+    }
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -1177,6 +1191,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse: super::mouse::host::Mouse,
     }
 
     impl Source for Host {
@@ -1210,10 +1225,13 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             let mut down = scripted();
             if focused() {
+                // The mouse's release key is ours, not the title's.
+                let mouse = super::mouse::settings();
+                let release = if mouse.enabled { mouse.release_key } else { 0 };
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    .filter(|vk| !(0x10..=0x12).contains(vk) && *vk != release && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
@@ -1238,6 +1256,14 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        fn mouse(&mut self) -> PadState {
+            let settings = super::mouse::settings();
+            if !settings.enabled {
+                return PadState::default();
+            }
+            self.mouse.poll(settings)
         }
     }
 

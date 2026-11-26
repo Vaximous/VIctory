@@ -28,3 +28,33 @@ test_titles = []
 
 # false: the title's ray-tracing passes do not run.   env: VICTORY_RAY_TRACING (on/off)
 # ray_tracing = false
+
+[input]
+# Raw mouse input (no acceleration) joins the pad.   env: VICTORY_MOUSE (1/0)
+# While on and the window has focus the cursor is hidden and kept in the
+# window; release_key (default F8) frees it, a click into the window or the
+# key again takes it back; leaving the window (Alt+Tab) frees it too.
+# WASD and the other keys stay the stand-in pad's (docs/README-fxceless.md).
+# mouse = true
+# Movement moves the right stick:
+# speed * sensitivity / 2000 counts/s is a full stick.   env: VICTORY_MOUSE_SENS
+# sensitivity = 1.0
+# Exponent on that speed: 1 linear, above 1 finer slow aim.   env: VICTORY_MOUSE_CURVE
+# curve = 1.0
+# Smallest stick a moving mouse gives, past the title's dead zone.   env: VICTORY_MOUSE_BOOST
+# deadzone_boost = 0.15
+# Largest stick (0 to 1).
+# cap = 1.0
+# env: VICTORY_MOUSE_INVERT_Y (on/off)
+# invert_y = false
+# Shortest press of a click or wheel notch, so a frame sees it (ms).
+# hold_ms = 100
+# release_key = "F8"
+# Pad buttons: a b x y up down left right (D-pad) lb rb ls rs menu view lt rt none.
+# left_button = "rt"       # fire
+# right_button = "lt"      # aim
+# middle_button = "rs"
+# back_button = "lb"       # side button (X1): weapon wheel
+# forward_button = "rb"    # side button (X2)
+# wheel_up = "right"       # D-pad right / left: next / previous weapon
+# wheel_down = "left"

@@ -261,6 +261,15 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // Mouse mode hides the cursor over the window while it is captured.
+    if message == wm::WM_SETCURSOR
+        && lparam as u32 & 0xFFFF == wm::HTCLIENT
+        && super::gameinput::mouse::hidden()
+    {
+        // SAFETY: this thread's window, no cursor.
+        unsafe { wm::SetCursor(std::ptr::null_mut()) };
+        return 1;
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);

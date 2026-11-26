@@ -26,6 +26,8 @@ pub struct Config {
     pub source: Option<PathBuf>,
     /// Picture settings (`[graphics]`).
     pub graphics: Graphics,
+    /// Mouse and keyboard (`[input]`).
+    pub input: Input,
 }
 
 /// `[graphics]`: what the title's picture is made with. Each value is the
@@ -56,6 +58,69 @@ impl Graphics {
     }
 }
 
+/// `[input]`: the mouse as the title's camera and pad buttons. Each value
+/// is the environment's (`VICTORY_MOUSE`, `VICTORY_MOUSE_SENS`,
+/// `VICTORY_MOUSE_CURVE`, `VICTORY_MOUSE_BOOST`, `VICTORY_MOUSE_INVERT_Y`),
+/// else the file's, else the default (victory.example.toml lists them).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Input {
+    /// Mouse mode (off by default).
+    pub mouse: Option<bool>,
+    pub sensitivity: Option<f32>,
+    pub curve: Option<f32>,
+    pub deadzone_boost: Option<f32>,
+    pub cap: Option<f32>,
+    pub invert_y: Option<bool>,
+    pub hold_ms: Option<u32>,
+    /// Frees the cursor and takes it back (`"F8"`).
+    pub release_key: Option<String>,
+    /// Pad buttons (`"rt"`, `"lb"`, `"right"`, ...) for each mouse button.
+    pub left_button: Option<String>,
+    pub right_button: Option<String>,
+    pub middle_button: Option<String>,
+    pub back_button: Option<String>,
+    pub forward_button: Option<String>,
+    pub wheel_up: Option<String>,
+    pub wheel_down: Option<String>,
+}
+
+impl Input {
+    fn resolve(file: Input, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Input> {
+        let text = |k: &str| env(k).and_then(|v| v.into_string().ok()).filter(|v| !v.trim().is_empty());
+        let flag = |k: &str, file: Option<bool>| -> Result<Option<bool>> {
+            Ok(match text(k) {
+                Some(v) => Some(match v.trim().to_ascii_lowercase().as_str() {
+                    "1" | "on" | "true" | "yes" => true,
+                    "0" | "off" | "false" | "no" => false,
+                    other => anyhow::bail!("{k}={other}: expected on or off"),
+                }),
+                None => file,
+            })
+        };
+        let number = |k: &str, file: Option<f32>| -> Result<Option<f32>> {
+            Ok(match text(k) {
+                Some(v) => Some(
+                    v.trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|n| n.is_finite())
+                        .with_context(|| format!("{k}={v}: expected a number"))?,
+                ),
+                None => file,
+            })
+        };
+        Ok(Input {
+            mouse: flag("VICTORY_MOUSE", file.mouse)?,
+            sensitivity: number("VICTORY_MOUSE_SENS", file.sensitivity)?,
+            curve: number("VICTORY_MOUSE_CURVE", file.curve)?,
+            deadzone_boost: number("VICTORY_MOUSE_BOOST", file.deadzone_boost)?,
+            invert_y: flag("VICTORY_MOUSE_INVERT_Y", file.invert_y)?,
+            ..file
+        })
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -63,6 +128,8 @@ struct FileConfig {
     paths: FilePaths,
     #[serde(default)]
     graphics: Graphics,
+    #[serde(default)]
+    input: Input,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -103,8 +170,9 @@ impl Config {
             None => (None, FileConfig::default()),
         };
         let graphics = Graphics::resolve(parsed.graphics, |k| std::env::var_os(k))?;
+        let input = Input::resolve(parsed.input, |k| std::env::var_os(k))?;
         let config = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
-        Ok(Config { graphics, ..config })
+        Ok(Config { graphics, input, ..config })
     }
 
     fn resolve(
@@ -132,6 +200,7 @@ impl Config {
             test_titles,
             source,
             graphics: Graphics::default(),
+            input: Input::default(),
         })
     }
 
@@ -206,6 +275,38 @@ ray_tracing = false
         let bad = |k: &str| (k == "VICTORY_RAY_TRACING").then(|| OsString::from("maybe"));
         assert!(Graphics::resolve(Graphics::default(), bad).is_err());
         assert_eq!(Graphics::resolve(Graphics::default(), none).unwrap(), Graphics::default());
+    }
+
+    #[test]
+    fn input_from_file_and_environment() {
+        let file: FileConfig = toml::from_str(
+            "[input]
+mouse = true
+sensitivity = 1.5
+wheel_up = 'rb'
+release_key = 'F9'
+",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let i = Input::resolve(file.input.clone(), none).unwrap();
+        assert_eq!((i.mouse, i.sensitivity), (Some(true), Some(1.5)));
+        assert_eq!(i.wheel_up.as_deref(), Some("rb"));
+        assert_eq!(i.release_key.as_deref(), Some("F9"));
+        let env = |k: &str| match k {
+            "VICTORY_MOUSE" => Some(OsString::from("0")),
+            "VICTORY_MOUSE_SENS" => Some(OsString::from("2.5")),
+            "VICTORY_MOUSE_INVERT_Y" => Some(OsString::from("on")),
+            _ => None,
+        };
+        let i = Input::resolve(file.input, env).unwrap();
+        assert_eq!((i.mouse, i.sensitivity, i.invert_y), (Some(false), Some(2.5), Some(true)));
+        assert_eq!(i.wheel_up.as_deref(), Some("rb"));
+        let bad = |k: &str| (k == "VICTORY_MOUSE_SENS").then(|| OsString::from("fast"));
+        assert!(Input::resolve(Input::default(), bad).is_err());
+        assert!(toml::from_str::<FileConfig>("[input]
+mice = true
+").is_err());
     }
 
     #[test]
