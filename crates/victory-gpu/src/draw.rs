@@ -2686,6 +2686,21 @@ impl State {
         // (`crate::host::touched`): without room, the slots none read for a
         // while give their textures back (`evict_untouched`); and the due
         // slots read lately go first.
+        // Residency (`crate::tiles::residency`), once an epoch: what shaders
+        // asked of each texture, and the floors that follow from it.
+        if crate::tiles::residency()
+            && !required
+            && let Some((now, seen)) = crate::host::touched::slot_epochs()
+        {
+            static EPOCH: AtomicU64 = AtomicU64::new(0);
+            const WINDOW: u32 = 4;
+            if EPOCH.swap(u64::from(now), Ordering::Relaxed) != u64::from(now)
+                && let Some(lods) = crate::host::touched::slot_min_lod(WINDOW)
+            {
+                host.note_level_wants(frame, now, &seen, &lods, WINDOW);
+                crate::resource::steer_levels(memory, now, WINDOW);
+            }
+        }
         let feedback = if evict_on() { crate::host::touched::slot_epochs() } else { None };
         if let Some((now, seen)) = &feedback
             && !room

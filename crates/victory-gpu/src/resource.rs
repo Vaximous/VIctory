@@ -1234,7 +1234,18 @@ struct Hosted {
     guard_ms: std::sync::atomic::AtomicU64,
     /// Its first host copy was capped to its coarse levels ([`coarse_first`]).
     capped: std::sync::atomic::AtomicBool,
+    /// Residency (`crate::tiles::residency`): the finest level shaders
+    /// asked of it in the last epoch noted, as `epoch << 8 | level`, the
+    /// level [`KEPT_WHOLE`] for one read by texel or through a table (0:
+    /// none noted yet); and when its copy was made (`crate::host::now_ms`).
+    level_want: std::sync::atomic::AtomicU64,
+    level_born: std::sync::atomic::AtomicU64,
 }
+
+/// In [`Hosted::level_want`]: a texture read by texel or through a table,
+/// kept whole.
+#[cfg(windows)]
+const KEPT_WHOLE: u64 = 254;
 
 /// Whether a texture the title places in memory is read, kept and uploaded
 /// from the first level its views show on (`VICTORY_HELD_LEVELS=0`: whole,
@@ -1773,9 +1784,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // Residency (`crate::tiles::residency`): every such texture.
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && (crate::tiles::residency()
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
@@ -1785,8 +1798,20 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
-            if cut.is_some() {
-                tiled = cut;
+            if let Some(cut) = cut {
+                // Its first copy from its coarse levels on, unless the world
+                // loads and the card has room for it whole.
+                if crate::tiles::residency() {
+                    let side = crate::tiles::coarse_side();
+                    let whole = side == 0 || (crate::draw::loading() && room_lately());
+                    let mut first = 0;
+                    while !whole && (r.desc.width >> first).max(u64::from(r.desc.height) >> first) > side {
+                        first += 1;
+                    }
+                    cut.start_at(first);
+                    r.host.level_born.store(crate::host::now_ms().max(1), Relaxed);
+                }
+                tiled = Some(cut);
                 texture = reserved;
             }
         }
@@ -3008,7 +3033,11 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
     if this.is_null() || !crate::tiles::wanted() {
         return None;
     }
-    hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)
+    let start = resource(this).data() as u64;
+    hosted(this, false)
+        .map(|(host, _)| host)
+        .filter(|host| host.tiled.is_some())
+        .map(|host| OnDemand(host, start))
 }
 
 /// The first level a view of title texture `this` may show, if its host
@@ -3022,7 +3051,7 @@ pub(crate) fn first_shown(this: This) -> Option<u32> {
 /// A host copy made without memory of its own (`crate::tiles`), as a
 /// submission-time step of a list holds it.
 #[cfg(windows)]
-pub(crate) struct OnDemand(std::sync::Arc<HostTexture>);
+pub(crate) struct OnDemand(std::sync::Arc<HostTexture>, u64);
 
 // SAFETY: the host texture is named only in queue calls, which any thread
 // may make; what it has been given is behind a lock of its own.
@@ -3058,6 +3087,25 @@ impl OnDemand {
         waiting
     }
 
+    /// [`crate::tiles::Tiled::set_floor`]; `memory` as above (0: its own).
+    /// A floor lowered has its slots uploaded again soon. The bytes given
+    /// back.
+    pub(crate) fn set_floor(&self, queue: &windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue, floor: u32, memory: u64) -> u64 {
+        let Some(tiled) = &self.0.tiled else {
+            return 0;
+        };
+        let was = tiled.floor();
+        let (freed, changed) = tiled.set_floor(queue, &self.0.texture, floor);
+        let memory = if memory == 0 { self.1 } else { memory };
+        if changed {
+            crate::descriptor::host::levels_changed(memory);
+        }
+        if tiled.floor() < was {
+            crate::descriptor::host::levels_wanted(memory);
+        }
+        freed
+    }
+
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
     pub(crate) fn card_wrote(&self, levels: u32, memory: u64) {
         if let Some(tiled) = &self.0.tiled
@@ -3065,6 +3113,155 @@ impl OnDemand {
         {
             crate::descriptor::host::levels_changed(memory);
         }
+    }
+}
+
+/// Residency (`crate::tiles::residency`): shaders asked level `level` of
+/// title texture `this` in epoch `epoch` (`None`: read it by texel or
+/// through a table, so it is kept whole). The finest of an epoch is kept.
+#[cfg(windows)]
+pub(crate) fn note_level_want(this: This, level: Option<u32>, epoch: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return;
+    }
+    let r = resource(this);
+    let code = level.map_or(KEPT_WHOLE, |l| u64::from(l.min(15)));
+    let new = u64::from(epoch) << 8 | code;
+    let _ = r.host.level_want.fetch_update(Relaxed, Relaxed, |was| {
+        if was >> 8 == u64::from(epoch) {
+            let kept = was & 0xff;
+            let code = if code == KEPT_WHOLE || kept == KEPT_WHOLE { KEPT_WHOLE } else { kept.min(code) };
+            Some(u64::from(epoch) << 8 | code)
+        } else if was >> 8 < u64::from(epoch) {
+            Some(new)
+        } else {
+            None
+        }
+    });
+}
+
+/// Residency (`crate::tiles::residency`), once an epoch noted: each host
+/// copy made level by level gets the floor what shaders asked of it says
+/// ([`note_level_want`], over the last `window` epochs up to `epoch`).
+/// - Read by texel or through a table, or noted of nothing two seconds
+///   after it was made: whole.
+/// - Sampled: down to one level finer than the finest asked (ahead of a
+///   camera coming closer), while the card is under the steady band's top
+///   (80 % of its budget, as [`room`] counts it), or at once if it is
+///   coarser than asked.
+/// - Above the band's top, the finest levels of the textures asked least
+///   lately go back: down to one finer than the level asked, the coarse levels
+///   (`crate::tiles::coarse_side`) of those not asked in the window, until
+///   the card is at 77 %, 512 MB at most a pass.
+#[cfg(windows)]
+pub(crate) fn steer_levels(memory: Option<[u64; 4]>, epoch: u32, window: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const HIGH: u64 = 80;
+    const LOW: u64 = 77;
+    const TRIM_MOST: u64 = 512 << 20;
+    const UNTOLD_MS: u64 = 2000;
+    if !crate::tiles::residency() {
+        return;
+    }
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    crate::tiles::RESIDENCY[4].fetch_add(1, Relaxed);
+    let fill = memory.and_then(|[budget, used, ..]| {
+        (budget > 0).then(|| {
+            let used = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept();
+            (used, budget)
+        })
+    });
+    let over = fill.is_some_and(|(used, budget)| used * 100 > budget * HIGH);
+    let under = fill.is_none_or(|(used, budget)| used * 100 < budget * HIGH);
+    let now_ms = crate::host::now_ms();
+    let from = epoch.saturating_sub(window.max(1));
+    // (Asked last, trim target, copy) of those whose finest levels may go.
+    let mut trims: Vec<(u64, u32, OnDemand, u64)> = Vec::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: in the table, under its lock: alive (as in `let_go_idle`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !r.host.placed.load(Relaxed) {
+            continue;
+        }
+        let born = r.host.level_born.load(Relaxed);
+        if born == 0 {
+            continue;
+        }
+        let Some(copy) = host_tiled(at as This) else {
+            continue;
+        };
+        let Some(tiled) = copy.tiled() else {
+            continue;
+        };
+        let floor = tiled.floor();
+        let want = r.host.level_want.load(Relaxed);
+        let told = want != 0 && (want >> 8) as u32 > from;
+        let code = want & 0xff;
+        let coarse = {
+            let side = crate::tiles::coarse_side().max(1);
+            let mut first = 0;
+            while (r.desc.width >> first).max(u64::from(r.desc.height) >> first) > side {
+                first += 1;
+            }
+            first.min(tiled.first_packed())
+        };
+        let (grow, trim) = if told && code == KEPT_WHOLE {
+            crate::tiles::RESIDENCY[3].fetch_add(1, Relaxed);
+            (Some(0), None)
+        } else if told {
+            let asked = code as u32;
+            // (Grown and trimmed to the same level: no going to and fro
+            // about the band's top.)
+            (Some(asked.saturating_sub(1)), Some(asked.saturating_sub(1)))
+        } else if want == 0 && now_ms.saturating_sub(born) > UNTOLD_MS {
+            // Nothing noted of it at all: not a texture read through the
+            // heap's slots as far as the feedback tells; whole, as before.
+            (Some(0), None)
+        } else if want != 0 {
+            (None, Some(coarse))
+        } else {
+            (None, None)
+        };
+        let start = r.data() as u64;
+        if let Some(grow) = grow
+            && grow < floor
+            && (under || code == KEPT_WHOLE || told && (code as u32) < floor)
+        {
+            copy.set_floor(host.queue(), grow, start);
+            continue;
+        }
+        if over
+            && let Some(trim) = trim
+            && trim > floor
+            && trim <= tiled.first_packed()
+        {
+            let bytes = tiled.bytes_before(trim).saturating_sub(tiled.bytes_before(floor));
+            if bytes > 0 {
+                trims.push((want >> 8, trim, copy, bytes));
+            }
+        }
+    }
+    drop(all);
+    if trims.is_empty() {
+        return;
+    }
+    // Asked least lately first.
+    trims.sort_by_key(|t| t.0);
+    let (used, budget) = fill.unwrap_or((0, 0));
+    let need = used.saturating_sub(budget / 100 * LOW).min(TRIM_MOST);
+    let mut freed = 0u64;
+    for (_, trim, copy, _) in trims {
+        if freed >= need {
+            break;
+        }
+        // (The start of its memory: its slots are made again.)
+        freed += copy.set_floor(host.queue(), trim, 0);
     }
 }
 
@@ -3144,6 +3341,8 @@ fn hand_out_resource(
             shed_at: std::sync::atomic::AtomicU64::new(0),
             guard_ms: std::sync::atomic::AtomicU64::new(0),
             capped: std::sync::atomic::AtomicBool::new(false),
+            level_want: std::sync::atomic::AtomicU64::new(0),
+            level_born: std::sync::atomic::AtomicU64::new(0),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
     });

@@ -779,6 +779,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.forget();
         staging.dirty.store(true, Relaxed);
     }
+    // Residency (`crate::tiles::residency`): the floor came down; this
+    // upload gives the levels between their tiles at its submission.
+    if staging.on_demand
+        && crate::resource::host_tiled(resource).is_some_and(|c| c.tiled().is_some_and(crate::tiles::Tiled::take_regrow))
+    {
+        staging.dirty.store(true, Relaxed);
+    }
     // Levels on demand: the last upload left a held level without tiles
     // (the card had no room, or no heap could be had), and nothing else
     // would record an upload again until the title writes the texture: the

@@ -245,6 +245,9 @@ struct Given {
     packed: bool,
     /// The runs taken: the heap's place, first tile, tiles.
     runs: Vec<(usize, u32, u32)>,
+    /// The runs of each level with tiles of its own, as in `runs` (a level
+    /// whose tiles go back before the copy does: [`Tiled::set_floor`]).
+    level_runs: Vec<Vec<(usize, u32, u32)>>,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -271,6 +274,13 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// Residency ([`residency`]): the first level that may have tiles; the
+    /// finer ones have none, and views do not sample them
+    /// (`ResourceMinLODClamp`).
+    floor: AtomicU32,
+    /// Whether the floor came down since the last upload: the next one
+    /// gives the levels between their tiles ([`Tiled::take_regrow`]).
+    regrow: std::sync::atomic::AtomicBool,
 }
 
 impl Tiled {
@@ -328,6 +338,7 @@ impl Tiled {
                 levels: vec![false; standard.len()],
                 packed: false,
                 runs: Vec::new(),
+                level_runs: vec![Vec::new(); standard.len()],
             }),
             standard,
             packed: packed_tiles,
@@ -337,6 +348,8 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            floor: AtomicU32::new(0),
+            regrow: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -379,7 +392,9 @@ impl Tiled {
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
         let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
-        let missing = self.without_locked(&given, named) != 0;
+        // (Not the levels below residency's floor: they wait for no room.)
+        let floor = self.floor.load(Ordering::Relaxed).min(self.first_packed()).min(31);
+        let missing = self.without_locked(&given, named & !((1u32 << floor) - 1)) != 0;
         (changed, missing)
     }
 
@@ -516,9 +531,13 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
-        let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
+        let floor = self.floor.load(Ordering::Relaxed);
         let first_packed = self.standard.len() as u32;
+        // (The levels the card packs together are never below the floor:
+        // [`Tiled::set_floor`].)
+        let now = |level: u32| {
+            level < 32 && named & may & (1 << level) != 0 && (level >= floor || level >= first_packed)
+        };
         // (subresource, tiles, the level if it has tiles of its own) to map now.
         let mut wanted: Vec<(u32, u32, Option<usize>)> = Vec::new();
         for level in 0..first_packed {
@@ -570,7 +589,12 @@ impl Tiled {
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             match level {
-                Some(level) => given.levels[level] = true,
+                Some(level) => {
+                    given.levels[level] = true;
+                    if let Some(own) = given.level_runs.get_mut(level) {
+                        own.extend(runs.iter().map(|&(start, count)| (index, start, count)));
+                    }
+                }
                 None => given.packed = true,
             }
             for &(start, count) in &runs {
@@ -579,6 +603,13 @@ impl Tiled {
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
+        self.reshow(given, named)
+    }
+
+    /// Tells anew the first level a view may show: the first of `named`
+    /// that has tiles. Whether it changed.
+    fn reshow(&self, given: &Given, named: u32) -> bool {
+        let first_packed = self.standard.len() as u32;
         let with_tiles = |level: u32| {
             if level < first_packed {
                 given.levels[level as usize]
@@ -586,8 +617,120 @@ impl Tiled {
                 given.packed
             }
         };
+        let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
         self.shown.swap(shown, Ordering::Relaxed) != shown
+    }
+
+    /// The first level the card packs with others (levels from here on are
+    /// never given back while the copy lives).
+    pub(crate) fn first_packed(&self) -> u32 {
+        self.standard.len() as u32
+    }
+
+    /// Residency's floor now ([`Tiled::set_floor`]).
+    pub(crate) fn floor(&self) -> u32 {
+        self.floor.load(Ordering::Relaxed)
+    }
+
+    /// The bytes of the tiles of the levels before `level`, all of them.
+    pub(crate) fn bytes_before(&self, level: u32) -> u64 {
+        self.standard.iter().take(level as usize).map(|&t| u64::from(t) * TILE).sum()
+    }
+
+    /// Residency ([`residency`]): from now on only the levels from `floor`
+    /// on (at most the first packed one) may have tiles. Raised: the finer
+    /// levels' tiles go back now, on `queue` (after what was submitted
+    /// before, which may still read them; a list recorded before and
+    /// submitted after reads zeros there, and views are made again with the
+    /// floor as their clamp). Lowered: the next upload gives the levels
+    /// between theirs ([`Tiled::take_regrow`]). Returns the bytes given
+    /// back, and whether the first level a view may show changed.
+    pub(crate) fn set_floor(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource, floor: u32) -> (u64, bool) {
+        let floor = floor.min(self.first_packed()).min(self.levels.saturating_sub(1));
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let was = self.floor.swap(floor, Ordering::Relaxed);
+        if floor < was {
+            self.regrow.store(true, Ordering::Relaxed);
+            RESIDENCY[2].fetch_add(1, Ordering::Relaxed);
+            return (0, false);
+        }
+        if floor == was {
+            return (0, false);
+        }
+        RESIDENCY[1].fetch_add(1, Ordering::Relaxed);
+        let mut freed = 0u64;
+        for level in 0..floor.min(self.first_packed()) {
+            let l = level as usize;
+            if !given.levels[l] {
+                continue;
+            }
+            let tiles = self.standard[l];
+            let at = D3D12_TILED_RESOURCE_COORDINATE {
+                X: 0,
+                Y: 0,
+                Z: 0,
+                Subresource: level,
+            };
+            let size = D3D12_TILE_REGION_SIZE {
+                NumTiles: tiles,
+                ..Default::default()
+            };
+            let flags = [D3D12_TILE_RANGE_FLAG_NULL];
+            let counts = [tiles];
+            let began = std::time::Instant::now();
+            // SAFETY: a live reserved texture; one region of the level's
+            // `tiles` tiles, mapped to nothing by one range of that count.
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    1,
+                    Some(&raw const at),
+                    Some(&raw const size),
+                    None,
+                    1,
+                    Some(flags.as_ptr()),
+                    None,
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            given.levels[l] = false;
+            let own = std::mem::take(&mut given.level_runs[l]);
+            let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+            for &(index, start, count) in &own {
+                by_heap.entry(index).or_default().push((start, count));
+                if let Some(at) = given.runs.iter().position(|&run| run == (index, start, count)) {
+                    given.runs.swap_remove(at);
+                }
+                freed += u64::from(count) * TILE;
+            }
+            // (Ahead on the queue of any mapping of these tiles to another
+            // texture: that is made by a later call.)
+            for (index, runs) in by_heap {
+                give_back(index, &runs);
+            }
+        }
+        STATS[2].fetch_sub(freed, Ordering::Relaxed);
+        RESIDENCY[0].fetch_add(freed, Ordering::Relaxed);
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let changed = self.reshow(&given, named);
+        (freed, changed)
+    }
+
+    /// Sets the floor of a copy just made, before its first upload.
+    pub(crate) fn start_at(&self, floor: u32) {
+        let floor = floor.min(self.first_packed()).min(self.levels.saturating_sub(1));
+        self.floor.store(floor, Ordering::Relaxed);
+    }
+
+    /// Whether the floor came down since the last call: the upload being
+    /// recorded is made whole, so that its submission gives the levels
+    /// between their tiles.
+    pub(crate) fn take_regrow(&self) -> bool {
+        self.regrow.swap(false, Ordering::Relaxed)
     }
 
     /// The first level a view of the texture may show; `None` while no
@@ -682,6 +825,58 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
     }
 }
 
+/// Residency's view of a two-dimensional shader view (2D or 2D array) of
+/// a texture whose levels before `first` have no memory: its
+/// `ResourceMinLODClamp` is raised to `first`, its levels are as the title
+/// gave them. Samples stay off the levels without memory; loads by texel
+/// and level read where the title's view says (a texture read that way is
+/// kept whole: [`residency`]). (Taken as the resource's level; were the
+/// card to count it from the view's first level, the clamp is coarser by
+/// that many levels, never finer.)
+pub(crate) fn clamp_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32) {
+    let first = first as f32;
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: `ViewDimension` selects `Texture2D`.
+            let view = unsafe { &mut desc.Anonymous.Texture2D };
+            view.ResourceMinLODClamp = view.ResourceMinLODClamp.max(first);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: `ViewDimension` selects `Texture2DArray`.
+            let view = unsafe { &mut desc.Anonymous.Texture2DArray };
+            view.ResourceMinLODClamp = view.ResourceMinLODClamp.max(first);
+        }
+        _ => {}
+    }
+}
+
+/// Residency by what shaders sample (`VICTORY_TILED_RESIDENCY`, on unless
+/// `0`; with levels on demand, [`wanted`]): every texture the title places
+/// and fills, two-dimensional, one layer, of [`floor`] bytes or more, is
+/// made this way, its first copy from its coarse levels on (at most
+/// [`coarse_side`] texels a side) unless the world is loading with room;
+/// levels finer come as samples ask for them (`crate::host::touched`
+/// `slot_min_lod`, one level finer ahead), the finest of textures sampled
+/// at coarser levels go back above the steady band of the card's budget
+/// (80 %, down to 77 %), and a texture read by texel (a slot read with no
+/// level noted) or through a table is kept whole.
+pub(crate) fn residency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| wanted() && std::env::var_os("VICTORY_TILED_RESIDENCY").is_none_or(|v| v != "0"))
+}
+
+/// The side in texels of a texture's first copy under [`residency`]
+/// (`VICTORY_TILED_FIRST`, 512; 0: whole).
+pub(crate) fn coarse_side() -> u64 {
+    static SIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIDE.get_or_init(|| std::env::var("VICTORY_TILED_FIRST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512))
+}
+
+/// Residency, since the start: bytes of tiles given back, floors raised,
+/// floors lowered, textures kept whole as read by texel or table, steering
+/// passes.
+pub(crate) static RESIDENCY: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// For the log, with the texture queue's line: what this saves, and what
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
@@ -689,6 +884,17 @@ pub(crate) fn status() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     if s[4] == 0 {
         return;
+    }
+    if residency() {
+        let r: Vec<u64> = RESIDENCY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        tracing::info!(
+            "residency by what shaders sample (VICTORY_TILED_RESIDENCY=0: off), since the start: {} steering passes,              {} floors raised giving back {} MB of finest levels, {} floors lowered, {} notes of textures kept whole              (read by texel or through a table)",
+            r[4],
+            r[1],
+            r[0] >> 20,
+            r[2],
+            r[3],
+        );
     }
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
@@ -1564,11 +1770,14 @@ void look() {
                 levels: vec![false, false],
                 packed: false,
                 runs: Vec::new(),
+                level_runs: vec![Vec::new(); 2],
             }),
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            floor: AtomicU32::new(0),
+            regrow: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);

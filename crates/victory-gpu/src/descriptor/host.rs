@@ -520,6 +520,13 @@ pub(crate) fn levels_waiting(start: u64) {
     WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
 }
 
+/// Residency (`crate::tiles::residency`): the placed texture at `start`
+/// has a lower floor, and its slots are uploaded again at the next pass
+/// with room ([`HostHeap::texture_slots_waiting`], at once).
+pub(crate) fn levels_wanted(start: u64) {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, 0);
+}
+
 /// Placed textures (by the start of their memory) filled while the runtime
 /// was remapping with less than was mapped of them
 /// (`crate::texture::fill_unlocked`), whose slots the next texture pass
@@ -2679,6 +2686,46 @@ impl HostHeap {
         (went, bytes)
     }
 
+    /// Residency (`crate::tiles::residency`): for each made slot of a placed
+    /// texture read in the last `window` epochs up to `now` (by `seen`),
+    /// what it asked of its texture (`crate::resource::note_level_want`):
+    /// the finest level sampled (`lods`, from the view's own first level),
+    /// or, read with no level noted (by texel) or through a table lately,
+    /// the whole of it. How many slots told.
+    pub(crate) fn note_level_wants(&self, frame: u64, now: u32, seen: &[u32], lods: &[u8], window: u32) -> u64 {
+        let mut told = 0;
+        for (index, key) in self.made.keys.iter().enumerate() {
+            let key = key.load(std::sync::atomic::Ordering::Relaxed);
+            if key == 0 {
+                continue;
+            }
+            let index32 = index as u32;
+            let tabled = self.tabled_lately(index32, frame);
+            let read = seen.get(index).copied().unwrap_or(0);
+            if !tabled && (read == 0 || now.saturating_sub(read) >= window) {
+                continue;
+            }
+            let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            if resource[0] == 1 {
+                continue;
+            }
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let Some(texture) = crate::resource::texture_at_made(address, &resource) else {
+                continue;
+            };
+            let level = match lods.get(index).copied().unwrap_or(255) {
+                _ if tabled => None,
+                255 => None,
+                lod => Some(crate::resource::first_mip(&desc) + u32::from(lod)),
+            };
+            crate::resource::note_level_want(texture, level, now);
+            told += 1;
+        }
+        told
+    }
+
     /// Whether title slot `index` was emptied by [`HostHeap::evict_untouched`]
     /// and no shader read through it since (by `seen`): it is not made
     /// again yet. One read since is made again, and is no longer noted.
@@ -4334,7 +4381,11 @@ fn make_twinned(
                             },
                         },
                     };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    if crate::tiles::residency() {
+                        crate::tiles::clamp_from(desc.get_or_insert(whole), first);
+                    } else {
+                        crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    }
                 }
                 if copy.base > 0
                     && let Some(desc) = &mut desc
