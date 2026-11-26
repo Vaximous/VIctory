@@ -267,11 +267,15 @@ Mouse mode (off by default; `[input] mouse = true` in victory.toml,
 adds raw mouse input to that pad, with the keys above still working. While
 the window has focus the cursor is hidden and kept in it; F8
 (`release_key`) frees it, F8 again or a click into the window takes it
-back, and Alt+Tab frees it too. Movement moves the right stick.
+back, and Alt+Tab frees it too. With a camera file (`[input] camera`,
+`VICTORY_MOUSE_CAMERA`; your own, kept outside the repository) movement turns
+the cameras it names directly, a fixed angle per count with no stick curve or
+aim assist; wherever none of them is found (and with no file) it moves the
+right stick.
 
 | Mouse | Pad (default; `[input]` in victory.example.toml) |
 |------|-----|
-| movement | right stick |
+| movement | camera (camera file), else right stick |
 | left / right button | right / left trigger (fire / aim) |
 | middle button | right stick click |
 | side buttons (back / forward) | left / right shoulder |

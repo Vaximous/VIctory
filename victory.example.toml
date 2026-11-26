@@ -30,13 +30,26 @@ test_titles = []
 # ray_tracing = false
 
 [input]
-# Raw mouse input (no acceleration) joins the pad.   env: VICTORY_MOUSE (1/0)
+# Raw mouse input (no acceleration): the camera, and buttons on the pad.   env: VICTORY_MOUSE (1/0)
 # While on and the window has focus the cursor is hidden and kept in the
 # window; release_key (default F8) frees it, a click into the window or the
 # key again takes it back; leaving the window (Alt+Tab) frees it too.
 # WASD and the other keys stay the stand-in pad's (docs/README-fxceless.md).
 # mouse = true
-# Movement moves the right stick:
+# Camera file (outside this folder): where the title keeps each camera's yaw
+# and pitch, as pointer chains from the title image's base. Movement then turns
+# those directly (a fixed angle per count, no stick curve); where none is found
+# it moves the right stick instead.   env: VICTORY_MOUSE_CAMERA
+#   [[camera]]
+#   name = "on foot"
+#   yaw = [0x1234, 0x10]        # image base + 0x1234 -> pointer, + 0x10
+#   pitch = [0x1234, 0x14]
+#   yaw_per_count = -0.0006     # radians per count at sensitivity 1; sign = direction
+#   pitch_per_count = -0.0006
+#   pitch_min = -1.4            # defaults; wrap = 6.2831853 (radians), 360 for degrees, 0 none
+#   pitch_max = 1.4
+# camera = 'D:ictory-data\mouse-camera.toml'
+# Stick movement:
 # speed * sensitivity / 2000 counts/s is a full stick.   env: VICTORY_MOUSE_SENS
 # sensitivity = 1.0
 # Exponent on that speed: 1 linear, above 1 finer slow aim.   env: VICTORY_MOUSE_CURVE

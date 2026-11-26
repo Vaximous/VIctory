@@ -4,7 +4,7 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -NoRayTracing none of the title's ray-traced passes run
 # -Upscaler     fsr4 (the title's ML upscaler), none (bilinear, fastest) or fxaa
-# -Mouse       raw mouse input as the camera stick and pad buttons (F8 frees the cursor; [input] in victory.toml)
+# -Mouse       raw mouse input: the camera and pad buttons (F8 frees the cursor; [input] in victory.toml)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.

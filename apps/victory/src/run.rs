@@ -84,6 +84,7 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
+    cameras(&cfg.input, image.base())?;
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
@@ -270,6 +271,33 @@ fn input(i: &victory_core::Input) -> Result<()> {
     target("wheel_up", &i.wheel_up, up)?;
     target("wheel_down", &i.wheel_down, down)?;
     victory_hle::modules::gameinput::mouse::configure(s);
+    Ok(())
+}
+
+/// Mouse look written into the title's cameras (`[input] camera`), found
+/// from the title image's base.
+#[cfg(windows)]
+fn cameras(i: &victory_core::Input, base: usize) -> Result<()> {
+    use victory_hle::modules::gameinput::camera::{Camera, configure};
+    let (Some(true), Some(path)) = (i.mouse, &i.camera) else {
+        return Ok(());
+    };
+    let file = victory_core::CameraFile::load(path)?;
+    let list = file
+        .camera
+        .into_iter()
+        .map(|c| Camera {
+            name: c.name,
+            yaw: c.yaw,
+            pitch: c.pitch,
+            yaw_per_count: c.yaw_per_count,
+            pitch_per_count: c.pitch_per_count,
+            pitch_min: c.pitch_min,
+            pitch_max: c.pitch_max,
+            wrap: c.wrap,
+        })
+        .collect();
+    configure(base as u64, list, i.sensitivity.unwrap_or(1.0), i.invert_y.unwrap_or(false));
     Ok(())
 }
 

@@ -5,7 +5,10 @@
 //! merged into the pad the title already reads, with a real pad or the
 //! keyboard's stand-in (WASD still walks).
 //!
-//! Movement: the stick shows the mouse's average speed since the title last
+//! Movement turns the title's camera directly where a camera hook is
+//! configured and found (`camera`); elsewhere it is the right stick.
+//!
+//! Stick: the stick shows the mouse's average speed since the title last
 //! read the pad (it reads once a frame), so each frame turns by about what
 //! the mouse moved in it, whatever the frame time; once the title has read
 //! it and the mouse stands still the stick is back at zero by the next poll.
@@ -180,7 +183,10 @@ pub(super) fn stick(dx: f64, dy: f64, secs: f64, s: &Settings) -> (f32, f32) {
     let shaped = m.powf(f64::from(s.curve).max(0.05));
     let out = (boost + (1.0 - boost) * shaped).min(f64::from(s.cap).clamp(0.0, 1.0));
     let scale = out / m;
-    ((x * scale).clamp(-1.0, 1.0) as f32, (y * scale).clamp(-1.0, 1.0) as f32)
+    (
+        (x * scale).clamp(-1.0, 1.0) as f32,
+        (y * scale).clamp(-1.0, 1.0) as f32,
+    )
 }
 
 /// Movement since the title last read the pad.
@@ -205,7 +211,11 @@ impl Window {
         self.dx += i64::from(dx);
         self.dy += i64::from(dy);
         self.last = now;
-        (self.dx as f64, self.dy as f64, (now - self.start).max(MIN_WINDOW))
+        (
+            self.dx as f64,
+            self.dy as f64,
+            (now - self.start).max(MIN_WINDOW),
+        )
     }
 }
 
@@ -320,15 +330,15 @@ impl Mapper {
 /// Raw input, the cursor, and the release key.
 #[cfg(windows)]
 pub(super) mod host {
-    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
     use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
     use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows_sys::Win32::UI::Input::{
-        GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE,
-        RAWINPUTHEADER, RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
+        GetRawInputData, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+        RID_INPUT, RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         ClipCursor, CreateWindowExW, DispatchMessageW, GetClipCursor, GetCursorPos,
@@ -554,15 +564,23 @@ pub(super) mod host {
                         tracing::debug!("mouse released");
                     }
                     PAD_READ.store(false, Ordering::Relaxed);
+                    super::super::camera::clear();
                     return PadState::default();
                 }
             }
             self.ignore &= held;
             let read = PAD_READ.swap(false, Ordering::Relaxed);
             let now = START.elapsed().as_secs_f64();
+            // Movement turns the camera where one is hooked, else the stick.
+            let stick = if super::super::camera::live() {
+                super::super::camera::add(dx, dy);
+                (0, 0)
+            } else {
+                (dx, dy)
+            };
             self.mapper.step(
                 s,
-                (dx, dy),
+                stick,
                 wheel,
                 held & !self.ignore,
                 pressed & !self.ignore,
@@ -593,11 +611,17 @@ mod tests {
         // Mouse down is stick down; inverted, up.
         let (_, y) = stick(0.0, FULL_SPEED * 0.05, 0.1, &s);
         assert!(close(y, -0.5));
-        let inverted = Settings { invert_y: true, ..s.clone() };
+        let inverted = Settings {
+            invert_y: true,
+            ..s.clone()
+        };
         let (_, y) = stick(0.0, FULL_SPEED * 0.05, 0.1, &inverted);
         assert!(close(y, 0.5));
         // Sensitivity scales.
-        let fast = Settings { sensitivity: 2.0, ..s };
+        let fast = Settings {
+            sensitivity: 2.0,
+            ..s
+        };
         let (x, _) = stick(FULL_SPEED * 0.025, 0.0, 0.1, &fast);
         assert!(close(x, 0.5));
     }
@@ -705,7 +729,10 @@ mod tests {
             seen.push(m.step(&s, (0, 0), wheel, 0, 0, false, t).buttons);
             t += 0.01;
         }
-        let presses = seen.windows(2).filter(|w| w[0] == 0 && w[1] == RIGHT).count()
+        let presses = seen
+            .windows(2)
+            .filter(|w| w[0] == 0 && w[1] == RIGHT)
+            .count()
             + usize::from(seen[0] == RIGHT);
         assert_eq!(presses, 2, "{seen:?}");
         assert!(seen.iter().all(|&b| b == 0 || b == RIGHT));

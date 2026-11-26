@@ -1,0 +1,341 @@
+//! Mouse look written straight into the title's camera, as mouse injectors
+//! for console emulators do: where the user's camera file
+//! (`[input] camera`, env `VICTORY_MOUSE_CAMERA`; nothing of the title is in
+//! this repository) names the camera's yaw and pitch, each mouse count adds
+//! a fixed angle to them, 1:1 with no stick curve, acceleration or aim
+//! assist, and the mouse leaves the right stick alone. Where none of the
+//! named cameras is found the mouse moves the stick (`mouse`).
+//!
+//! A field is found by a pointer chain from the title image's base:
+//! `[rva, o1, o2, ...]` is `base + rva`, then for each further offset the
+//! pointer there plus the offset. Every read and write goes through the
+//! kernel (`ReadProcessMemory` on ourselves), so a chain that leads nowhere
+//! fails instead of faulting. The angles are written when the title asks
+//! for its gamepad reading, on its own thread, before it updates its
+//! camera from the (then still) stick.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+/// One camera's fields and how a mouse count turns them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Camera {
+    pub name: String,
+    pub yaw: Vec<u64>,
+    pub pitch: Vec<u64>,
+    /// Angle per mouse count at sensitivity 1 (its sign is the direction).
+    pub yaw_per_count: f32,
+    pub pitch_per_count: f32,
+    pub pitch_min: f32,
+    pub pitch_max: f32,
+    /// The yaw's period (2π for radians, 360 for degrees); 0 does not wrap.
+    pub wrap: f32,
+}
+
+struct Cameras {
+    base: u64,
+    list: Vec<Camera>,
+    /// Mouse sensitivity and vertical inversion.
+    scale: f32,
+    invert_y: bool,
+}
+
+static CAMERAS: OnceLock<Cameras> = OnceLock::new();
+/// Counts moved since the title last read its pad.
+static DX: AtomicI32 = AtomicI32::new(0);
+static DY: AtomicI32 = AtomicI32::new(0);
+/// A camera was found when the title last read its pad.
+static LIVE: AtomicBool = AtomicBool::new(false);
+
+/// The cameras of the user's file, with the title image's base.
+pub fn configure(base: u64, list: Vec<Camera>, sensitivity: f32, invert_y: bool) {
+    let names: Vec<&str> = list.iter().map(|c| c.name.as_str()).collect();
+    tracing::info!(cameras = ?names, "mouse camera hooks");
+    let _ = CAMERAS.set(Cameras {
+        base,
+        list,
+        scale: sensitivity,
+        invert_y,
+    });
+}
+
+/// Whether mouse movement goes to a camera rather than the stick.
+pub(super) fn live() -> bool {
+    LIVE.load(Ordering::Relaxed)
+}
+
+/// Counts for the camera, applied at the title's next pad read.
+pub(super) fn add(dx: i32, dy: i32) {
+    DX.fetch_add(dx, Ordering::Relaxed);
+    DY.fetch_add(dy, Ordering::Relaxed);
+}
+
+/// Drops counts not yet applied (the cursor was let go).
+pub(super) fn clear() {
+    DX.store(0, Ordering::Relaxed);
+    DY.store(0, Ordering::Relaxed);
+}
+
+/// The new yaw and pitch for `counts`.
+pub(super) fn turned(
+    camera: &Camera,
+    (yaw, pitch): (f32, f32),
+    (dx, dy): (i32, i32),
+    scale: f32,
+    invert_y: bool,
+) -> (f32, f32) {
+    let dy = if invert_y { -dy } else { dy };
+    let mut yaw = yaw + dx as f32 * camera.yaw_per_count * scale;
+    if camera.wrap > 0.0 {
+        let half = camera.wrap / 2.0;
+        yaw = (yaw + half).rem_euclid(camera.wrap) - half;
+    }
+    let pitch = pitch + dy as f32 * camera.pitch_per_count * scale;
+    let (lo, hi) = (
+        camera.pitch_min.min(camera.pitch_max),
+        camera.pitch_max.max(camera.pitch_min),
+    );
+    (yaw, pitch.clamp(lo, hi))
+}
+
+/// Memory of our own process, read and written through the kernel.
+pub(super) trait Memory {
+    fn read(&self, at: u64, into: &mut [u8]) -> bool;
+    fn write(&self, at: u64, from: &[u8]) -> bool;
+}
+
+fn read_u64(memory: &impl Memory, at: u64) -> Option<u64> {
+    let mut b = [0; 8];
+    memory.read(at, &mut b).then(|| u64::from_le_bytes(b))
+}
+
+fn read_f32(memory: &impl Memory, at: u64) -> Option<f32> {
+    let mut b = [0; 4];
+    memory
+        .read(at, &mut b)
+        .then(|| f32::from_le_bytes(b))
+        .filter(|v| v.is_finite())
+}
+
+/// Where a chain leads, if it leads anywhere.
+pub(super) fn resolve(memory: &impl Memory, base: u64, chain: &[u64]) -> Option<u64> {
+    let (first, rest) = chain.split_first()?;
+    let mut at = base.checked_add(*first)?;
+    for offset in rest {
+        let pointer = read_u64(memory, at)?;
+        if pointer < 0x1_0000 {
+            return None;
+        }
+        at = pointer.checked_add(*offset)?;
+    }
+    Some(at)
+}
+
+/// Turns every camera found by the counts; whether one was.
+pub(super) fn turn(
+    memory: &impl Memory,
+    base: u64,
+    list: &[Camera],
+    counts: (i32, i32),
+    scale: f32,
+    invert_y: bool,
+) -> bool {
+    let mut found = false;
+    for camera in list {
+        let (Some(y), Some(p)) = (
+            resolve(memory, base, &camera.yaw),
+            resolve(memory, base, &camera.pitch),
+        ) else {
+            continue;
+        };
+        let (Some(yaw), Some(pitch)) = (read_f32(memory, y), read_f32(memory, p)) else {
+            continue;
+        };
+        found = true;
+        if counts == (0, 0) {
+            continue;
+        }
+        let (yaw, pitch) = turned(camera, (yaw, pitch), counts, scale, invert_y);
+        memory.write(y, &yaw.to_le_bytes());
+        memory.write(p, &pitch.to_le_bytes());
+    }
+    found
+}
+
+/// At the title's pad read: the counts since the last one go to the cameras.
+pub(super) fn apply() {
+    let Some(cameras) = CAMERAS.get() else {
+        return;
+    };
+    if cameras.list.is_empty() {
+        return;
+    }
+    let counts = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
+    #[cfg(windows)]
+    let found = turn(
+        &host::Own,
+        cameras.base,
+        &cameras.list,
+        counts,
+        cameras.scale,
+        cameras.invert_y,
+    );
+    #[cfg(not(windows))]
+    let found = false;
+    if LIVE.swap(found, Ordering::Relaxed) != found {
+        tracing::info!(found, "mouse camera");
+    }
+}
+
+#[cfg(windows)]
+mod host {
+    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub(super) struct Own;
+
+    impl super::Memory for Own {
+        fn read(&self, at: u64, into: &mut [u8]) -> bool {
+            let mut done = 0;
+            // SAFETY: the kernel checks the source; `into` is ours.
+            let ok = unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    at as *const _,
+                    into.as_mut_ptr().cast(),
+                    into.len(),
+                    &mut done,
+                )
+            };
+            ok != 0 && done == into.len()
+        }
+        fn write(&self, at: u64, from: &[u8]) -> bool {
+            let mut done = 0;
+            // SAFETY: the kernel checks the target, which a chain found.
+            let ok = unsafe {
+                WriteProcessMemory(
+                    GetCurrentProcess(),
+                    at as *const _,
+                    from.as_ptr().cast(),
+                    from.len(),
+                    &mut done,
+                )
+            };
+            ok != 0 && done == from.len()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// Bytes at addresses; everything else unreadable.
+    #[derive(Default)]
+    struct Fake(RefCell<BTreeMap<u64, u8>>);
+
+    impl Fake {
+        fn put(&self, at: u64, bytes: &[u8]) {
+            for (i, b) in bytes.iter().enumerate() {
+                self.0.borrow_mut().insert(at + i as u64, *b);
+            }
+        }
+        fn f32(&self, at: u64) -> f32 {
+            read_f32(self, at).unwrap()
+        }
+    }
+
+    impl Memory for Fake {
+        fn read(&self, at: u64, into: &mut [u8]) -> bool {
+            let m = self.0.borrow();
+            for (i, b) in into.iter_mut().enumerate() {
+                match m.get(&(at + i as u64)) {
+                    Some(v) => *b = *v,
+                    None => return false,
+                }
+            }
+            true
+        }
+        fn write(&self, at: u64, from: &[u8]) -> bool {
+            let mut b = vec![0; from.len()];
+            self.read(at, &mut b) && {
+                self.put(at, from);
+                true
+            }
+        }
+    }
+
+    fn camera() -> Camera {
+        Camera {
+            name: "test".into(),
+            yaw: vec![0x100, 0x10],
+            pitch: vec![0x100, 0x14],
+            yaw_per_count: 0.001,
+            pitch_per_count: -0.001,
+            pitch_min: -1.0,
+            pitch_max: 1.0,
+            wrap: std::f32::consts::TAU,
+        }
+    }
+
+    #[test]
+    fn counts_turn_by_a_fixed_angle_each() {
+        let c = camera();
+        let (yaw, pitch) = turned(&c, (0.5, 0.2), (100, 50), 1.0, false);
+        assert!((yaw - 0.6).abs() < 1e-6 && (pitch - 0.15).abs() < 1e-6);
+        // Sensitivity scales; inverted, down looks up.
+        let (yaw, pitch) = turned(&c, (0.5, 0.2), (100, 50), 2.0, true);
+        assert!((yaw - 0.7).abs() < 1e-6 && (pitch - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn yaw_wraps_and_pitch_is_clamped() {
+        let c = camera();
+        let (yaw, pitch) = turned(&c, (3.1, 0.9), (100, -1000), 1.0, false);
+        assert!((yaw - (3.2 - std::f32::consts::TAU)).abs() < 1e-5, "{yaw}");
+        assert_eq!(pitch, 1.0);
+        let degrees = Camera {
+            wrap: 360.0,
+            yaw_per_count: 1.0,
+            ..c
+        };
+        let (yaw, _) = turned(&degrees, (170.0, 0.0), (20, 0), 1.0, false);
+        assert!((yaw + 170.0).abs() < 1e-4, "{yaw}");
+    }
+
+    #[test]
+    fn chains_follow_pointers_and_fail_safely() {
+        let m = Fake::default();
+        let base = 0x1000_0000;
+        m.put(base + 0x100, &0x2000_0000_u64.to_le_bytes());
+        m.put(0x2000_0010, &0.5_f32.to_le_bytes());
+        m.put(0x2000_0014, &0.0_f32.to_le_bytes());
+        assert_eq!(resolve(&m, base, &[0x100, 0x10]), Some(0x2000_0010));
+        assert_eq!(resolve(&m, base, &[0x100]), Some(base + 0x100));
+        assert_eq!(resolve(&m, base, &[0x200, 0x10]), None);
+        assert!(turn(&m, base, &[camera()], (100, 100), 1.0, false));
+        assert!((m.f32(0x2000_0010) - 0.6).abs() < 1e-6);
+        assert!((m.f32(0x2000_0014) + 0.1).abs() < 1e-6);
+        // A null pointer is no camera, and nothing is written.
+        m.put(base + 0x100, &0_u64.to_le_bytes());
+        assert!(!turn(&m, base, &[camera()], (100, 100), 1.0, false));
+    }
+
+    #[test]
+    fn our_own_memory_is_read_and_written_through_the_kernel() {
+        #[cfg(windows)]
+        {
+            let mut value = 1.5_f32;
+            let at = &raw mut value as u64;
+            let own = host::Own;
+            assert_eq!(read_f32(&own, at), Some(1.5));
+            assert!(own.write(at, &2.5_f32.to_le_bytes()));
+            // SAFETY: written through the kernel just now.
+            assert_eq!(unsafe { std::ptr::read_volatile(&raw const value) }, 2.5);
+            assert_eq!(read_f32(&own, 8), None);
+        }
+    }
+}

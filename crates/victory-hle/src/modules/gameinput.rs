@@ -21,6 +21,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+pub mod camera;
 pub mod mouse;
 
 /// The documented errors.
@@ -641,6 +642,7 @@ extern "system" fn current_reading(
 ) -> HRESULT {
     if kind & GAMEPAD_KIND != 0 {
         mouse::PAD_READ.store(true, Ordering::Relaxed);
+        camera::apply();
     }
     let hub = hub(this);
     let state = hub.state();

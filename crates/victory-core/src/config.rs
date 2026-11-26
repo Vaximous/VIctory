@@ -83,6 +83,65 @@ pub struct Input {
     pub forward_button: Option<String>,
     pub wheel_up: Option<String>,
     pub wheel_down: Option<String>,
+    /// The user's camera file (`CameraFile`), outside the repository.
+    pub camera: Option<PathBuf>,
+}
+
+/// The user's camera file: where the title keeps each camera's yaw and
+/// pitch, found by the user in their own copy (nothing of the title is in
+/// this repository).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraFile {
+    #[serde(default)]
+    pub camera: Vec<CameraHook>,
+}
+
+/// One camera: pointer chains from the title image's base (`[rva, offset,
+/// ...]`: each offset after the first is added to the pointer read where
+/// the chain has got to) and the angle a mouse count turns.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraHook {
+    pub name: String,
+    pub yaw: Vec<u64>,
+    pub pitch: Vec<u64>,
+    pub yaw_per_count: f32,
+    pub pitch_per_count: f32,
+    #[serde(default = "pitch_limit_low")]
+    pub pitch_min: f32,
+    #[serde(default = "pitch_limit_high")]
+    pub pitch_max: f32,
+    /// The yaw's period: 2π for radians (default), 360 for degrees, 0 none.
+    #[serde(default = "tau")]
+    pub wrap: f32,
+}
+
+fn pitch_limit_low() -> f32 {
+    -1.4
+}
+fn pitch_limit_high() -> f32 {
+    1.4
+}
+fn tau() -> f32 {
+    std::f32::consts::TAU
+}
+
+impl CameraFile {
+    /// Reads and checks a camera file.
+    pub fn load(path: &Path) -> Result<CameraFile> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let file: CameraFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for c in &file.camera {
+            anyhow::ensure!(
+                !c.yaw.is_empty() && !c.pitch.is_empty(),
+                "{}: camera {:?} needs a yaw and a pitch chain",
+                path.display(),
+                c.name
+            );
+        }
+        Ok(file)
+    }
 }
 
 impl Input {
@@ -116,6 +175,7 @@ impl Input {
             curve: number("VICTORY_MOUSE_CURVE", file.curve)?,
             deadzone_boost: number("VICTORY_MOUSE_BOOST", file.deadzone_boost)?,
             invert_y: flag("VICTORY_MOUSE_INVERT_Y", file.invert_y)?,
+            camera: env("VICTORY_MOUSE_CAMERA").filter(|v| !v.is_empty()).map(PathBuf::from).or(file.camera.clone()),
             ..file
         })
     }
@@ -307,6 +367,28 @@ release_key = 'F9'
         assert!(toml::from_str::<FileConfig>("[input]
 mice = true
 ").is_err());
+    }
+
+    #[test]
+    fn camera_files_parse() {
+        let file: CameraFile = toml::from_str(
+            "[[camera]]
+name = 'a'
+yaw = [0x10, 0x8]
+pitch = [0x10, 0xc]
+yaw_per_count = 0.001
+pitch_per_count = -0.001
+",
+        )
+        .unwrap();
+        let c = &file.camera[0];
+        assert_eq!((c.yaw.as_slice(), c.pitch.as_slice()), (&[0x10, 0x8][..], &[0x10, 0xc][..]));
+        assert_eq!((c.pitch_min, c.pitch_max, c.wrap), (-1.4, 1.4, std::f32::consts::TAU));
+        assert!(toml::from_str::<CameraFile>("[[camera]]
+name = 'a'
+").is_err());
+        let env = |k: &str| (k == "VICTORY_MOUSE_CAMERA").then(|| OsString::from("cam.toml"));
+        assert_eq!(Input::resolve(Input::default(), env).unwrap().camera, Some(PathBuf::from("cam.toml")));
     }
 
     #[test]
