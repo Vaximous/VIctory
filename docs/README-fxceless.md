@@ -262,9 +262,8 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
-Mouse mode (off by default; `[input] mouse = true` in victory.toml,
-`VICTORY_MOUSE=1`, `scripts\play.ps1 -Mouse` or `Play-VIctory.cmd mouse`)
-adds raw mouse input to that pad, with the keys above still working. While
+Mouse mode (on by default; off with `[input] mouse = false` in victory.toml
+or `VICTORY_MOUSE=0`) adds raw mouse input to that pad, with the keys above still working. While
 the window has focus the cursor is hidden and kept in it; F8
 (`release_key`) frees it, F8 again or a click into the window takes it
 back, and Alt+Tab frees it too. With a camera file (`[input] camera`,

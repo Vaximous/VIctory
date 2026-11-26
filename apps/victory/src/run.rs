@@ -226,11 +226,12 @@ fn graphics(g: &victory_core::Graphics) -> Result<()> {
     Ok(())
 }
 
-/// Mouse mode (`[input]`), before the title first asks for input.
+/// Mouse mode (`[input]`, on unless `mouse = false` or `VICTORY_MOUSE=0`),
+/// before the title first asks for input.
 #[cfg(windows)]
 fn input(i: &victory_core::Input) -> Result<()> {
     use victory_hle::modules::gameinput::mouse::{Settings, Target, key};
-    if i.mouse != Some(true) {
+    if i.mouse == Some(false) {
         return Ok(());
     }
     let mut s = Settings {
@@ -279,7 +280,7 @@ fn input(i: &victory_core::Input) -> Result<()> {
 #[cfg(windows)]
 fn cameras(i: &victory_core::Input, base: usize) -> Result<()> {
     use victory_hle::modules::gameinput::camera::{Camera, configure};
-    let (Some(true), Some(path)) = (i.mouse, &i.camera) else {
+    let (true, Some(path)) = (i.mouse != Some(false), &i.camera) else {
         return Ok(());
     };
     let file = victory_core::CameraFile::load(path)?;

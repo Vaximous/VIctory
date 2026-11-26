@@ -30,12 +30,12 @@ test_titles = []
 # ray_tracing = false
 
 [input]
-# Raw mouse input (no acceleration): the camera, and buttons on the pad.   env: VICTORY_MOUSE (1/0)
+# Raw mouse input (no acceleration), on by default: the camera, and buttons on the pad.   env: VICTORY_MOUSE (1/0)
 # While on and the window has focus the cursor is hidden and kept in the
 # window; release_key (default F8) frees it, a click into the window or the
 # key again takes it back; leaving the window (Alt+Tab) frees it too.
 # WASD and the other keys stay the stand-in pad's (docs/README-fxceless.md).
-# mouse = true
+# mouse = false
 # Camera file (outside this folder): where the title keeps each camera's yaw
 # and pitch, as pointer chains from the title image's base. Movement then turns
 # those directly (a fixed angle per count, no stick curve); where none is found

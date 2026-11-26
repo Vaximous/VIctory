@@ -65,7 +65,7 @@ impl Graphics {
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
-    /// Mouse mode (off by default).
+    /// Mouse mode (on by default; `false` or `VICTORY_MOUSE=0`: off).
     pub mouse: Option<bool>,
     pub sensitivity: Option<f32>,
     pub curve: Option<f32>,
