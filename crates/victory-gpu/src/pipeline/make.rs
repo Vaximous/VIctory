@@ -232,7 +232,9 @@ impl Pending {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     if let Some(why) = p.left_out {
-        return Some(format!("left out on purpose: {why} ({})", hashes(p)));
+        // (One reason for all of them: the report shows the first 40
+        // reasons, and the ray-tracing resolve alone has hundreds.)
+        return Some(format!("left out on purpose: {why}"));
     }
     match p.made.get() {
         Some(Some(_)) => None,
