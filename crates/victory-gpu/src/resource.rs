@@ -2275,7 +2275,7 @@ pub(crate) fn census() -> [u64; 10] {
 /// another such texture's, which the title lays over each other; and the
 /// bytes of title memory they all span. Copies laid over each other as the
 /// title lays them would take about the last.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn targets_shared() -> [u64; 3] {
     let mut spans: Vec<(u64, u64, u64)> = Vec::new();
     for &at in textures().iter() {
