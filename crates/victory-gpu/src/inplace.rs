@@ -73,6 +73,15 @@ pub(crate) fn probe_level() -> u8 {
 /// card copy was turned down go in place rather than to a copy in the PC's
 /// memory (`shadow.rs` `lookup`, `VICTORY_INPLACE_CARD_KB`).
 ///
+/// Measured (open world, moving, frames 600-1800): level 3 is slower,
+/// 73.5 ms against 60.5 (prep 58.6/43.4, card 50.7/38.4), and left the PC
+/// with 4.6 GB of commit instead of 9.6 (5 GB more in memory). The title
+/// maps its pool's 64 KiB pages one by one at addresses whose offsets in
+/// the section do not follow each other, so only 89 windows (424 MB) of
+/// ~770 were ever one run of a section; 1,138 asks were turned down.
+/// Showing scattered pages needs tile mappings, which such heaps refuse
+/// (device removed). Kept off.
+///
 /// What stages 1 and 2 cover is private memory (`XMemVirtualAlloc`'s).
 /// View memory (the page pool) is turned down there: its section is made
 /// reserved, which the host refuses. What a view shows changes when the
