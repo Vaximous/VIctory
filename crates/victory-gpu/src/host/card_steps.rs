@@ -228,6 +228,127 @@ fn meet(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
+/// Whether a fill that reads what a copy at its place in a list (ahead of
+/// it in the submission) wrote is done on the card out of that copy's
+/// source ([`through_placed`]) instead of refusing the submission
+/// (`VICTORY_OVERLAP`, on unless `0`).
+///
+/// Run fox-lap 1: once a frame a fill of 384 bytes of the title's ring of
+/// constants reads what a copy at its place, a few lists earlier, puts
+/// there out of memory shaders write (the copy and the fill are in the same
+/// list, so `VICTORY_PLACED_ORDER` cannot cut between them). Refused, the
+/// submission stood 230-266 ms a frame until every flight that writes the
+/// title's 174 MB heap had landed: the submitting thread did nothing for most
+/// of the frame, and the card ran dry behind it for 8-9 ms a frame.
+pub(crate) fn overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OVERLAP").is_none_or(|v| v != "0"))
+}
+
+/// A check of [`through_placed`] (`VICTORY_OVERLAP_CHECK=1`; off by
+/// default): for every fill made to read a copy's source, the submission
+/// waits for the flights that write that source as before (so it is slow),
+/// takes the bytes the CPU would have read then, and once the submission has
+/// landed compares them with what the card gave the fill (read back from
+/// our buffer). Mismatches are counted on the frame line and the first few
+/// are said with their addresses.
+fn overlap_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| overlap() && crate::switch::on("VICTORY_OVERLAP_CHECK"))
+}
+
+/// Since the last frame-rate line, of [`overlap_check`]: fills compared, and
+/// those whose bytes differed.
+static CHECKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// What [`overlap_check`] compares once the submission has landed: the
+/// read-back buffer, and per fill its place there, the title address read
+/// and the bytes the CPU would have read.
+struct Check {
+    back: ID3D12Resource,
+    fills: Vec<(u64, usize, Vec<u8>)>,
+}
+
+impl Check {
+    fn compare(&self) {
+        let size: u64 = self.fills.iter().map(|f| f.0 + f.2.len() as u64).max().unwrap_or(0);
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: size as usize };
+        // SAFETY: a read-back buffer of ours that the landed list copied into.
+        if unsafe { self.back.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+            return;
+        }
+        for (at, address, eager) in &self.fills {
+            // SAFETY: inside the mapping (`size`).
+            let card = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(*at as usize), eager.len()) };
+            CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            if card != eager.as_slice() {
+                let n = CHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if n < 8 {
+                    let first = card.iter().zip(eager).position(|(a, b)| a != b).unwrap_or(0);
+                    tracing::warn!(
+                        "VICTORY_OVERLAP_CHECK: a fill read through a placed copy's source at {address:#x}+{:#x} differs from                          what the CPU would have read, first at +{first:#x}",
+                        eager.len()
+                    );
+                }
+            }
+        }
+        // SAFETY: mapped above; nothing written.
+        unsafe { self.back.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+    }
+}
+
+/// Fills of `does` that read only bytes the last copy at its place ahead of
+/// them wrote, with nothing between the two writing those bytes or the
+/// copy's source, are made to read the copy's source instead (and asked for:
+/// they are done on the card). Gives each one's place and the copy's.
+///
+/// Why that is the value the wait gave. A copy at its place takes title
+/// memory at submission too ([`place`]: the destination takes the source's
+/// bytes there), so after the wait the fill read the source's bytes as the
+/// landings left them. Done on the card in front of the submission's lists
+/// the fill reads the host copy of the source, which holds the same: every
+/// flight that writes it is ahead of our list on the queue, and the title's
+/// bytes are brought up to date by our list's refresh ([`plan`]'s argument).
+/// What the copy itself does at its place in the list is unchanged.
+fn through_placed(does: &mut [Does]) -> Vec<(usize, usize)> {
+    let mut moved = Vec::new();
+    for i in 0..does.len() {
+        let Does::Fill { src, len, .. } = does[i] else {
+            continue;
+        };
+        let read = (src, src + len);
+        // The last copy at its place ahead of it that writes any of it.
+        let Some(p) = (0..i).rev().find(|&p| matches!(does[p], Does::Placed { dst, len, .. } if meet((dst, dst + len), read)))
+        else {
+            continue;
+        };
+        let Does::Placed { dst, src: from, len: copied } = does[p] else {
+            continue;
+        };
+        let (to, source) = ((dst, dst + copied), (from, from + copied));
+        if read.0 < to.0 || read.1 > to.1 || meet(to, source) {
+            continue;
+        }
+        let between_writes = does[p + 1..i].iter().any(|d| match *d {
+            Does::Copy { dst, len, .. } | Does::Placed { dst, len, .. } => {
+                meet((dst, dst + len), read) || meet((dst, dst + len), source)
+            }
+            Does::Run => true,
+            _ => false,
+        });
+        if between_writes {
+            continue;
+        }
+        if let Does::Fill { src, asked, .. } = &mut does[i] {
+            *src = from + (read.0 - dst);
+            *asked = true;
+        }
+        moved.push((i, p));
+    }
+    moved
+}
+
 /// The bytes `d` reads and writes as a copy or a fill (empty ranges for
 /// what it does not).
 fn reads_writes(d: &Does) -> Option<((usize, usize), (usize, usize))> {
@@ -615,6 +736,10 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// bytes, and submissions that waited instead, refused by a check.
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line: fills made to read a placed copy's source
+/// ([`through_placed`]).
+static THROUGH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -622,6 +747,7 @@ pub(super) struct Taken {
     own: Own,
     steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
+    check: Option<Check>,
 }
 
 impl Taken {
@@ -645,6 +771,9 @@ impl Taken {
 
     /// The submission has run and landed: the list and its buffer are free.
     pub(super) fn landed(self) {
+        if let Some(check) = &self.check {
+            check.compare();
+        }
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
         drop(std::mem::take(&mut *self.own.list.deferred()));
@@ -688,8 +817,12 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        let (mut does, steps) = does_of(written, runs);
+        let moved = if overlap() { through_placed(&mut does) } else { Vec::new() };
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        if !moved.is_empty() {
+            THROUGH.fetch_add(moved.len() as u64, Ordering::Relaxed);
+        }
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -704,6 +837,8 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
+        // With the check: the ops of fills read through a copy's source.
+        let mut checked: Vec<usize> = Vec::new();
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
@@ -772,6 +907,9 @@ impl Host {
                     None => continue,
                 },
             };
+            if overlap_check() && moved.iter().any(|m| m.0 == i) {
+                checked.push(ops.len());
+            }
             ops.push(Op {
                 from: (from, src),
                 len,
@@ -830,6 +968,7 @@ impl Host {
             }
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
+        let check = if checked.is_empty() { None } else { self.overlap_check(&own, &ops, &checked) };
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -859,7 +998,35 @@ impl Host {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            check,
         }))
+    }
+
+    /// [`overlap_check`] for the ops at `checked` of `ops`, which `own`'s list
+    /// (open) has done: their bytes are copied out of our buffer to be read
+    /// back, and the CPU's reading of them is taken after the wait it would
+    /// have had.
+    fn overlap_check(&self, own: &Own, ops: &[Op], checked: &[usize]) -> Option<Check> {
+        let size: u64 = checked.iter().map(|&k| (ops[k].len as u64).next_multiple_of(256)).sum();
+        let back = self.read_back_buffer(size)?;
+        let mut fills = Vec::with_capacity(checked.len());
+        let mut at = 0u64;
+        for &k in checked {
+            let op = &ops[k];
+            let (from, to) = (op.from.1, op.from.1 + op.len);
+            // The wait the CPU's fill had.
+            relay_wait(WHY_READ, |line| !touches(&line.written, from, to) && !line.settling);
+            let mut eager = vec![0u8; op.len];
+            if !read_into(from as *const u8, &mut eager) {
+                continue;
+            }
+            // SAFETY: an open list; our buffer is readable by copies after
+            // its last level ([`record`]); the read-back buffer is ours.
+            unsafe { own.list.list.CopyBufferRegion(&back, at, &own.between, op.at, op.len as u64) };
+            fills.push((at, from, eager));
+            at += (op.len as u64).next_multiple_of(256);
+        }
+        Some(Check { back, fills })
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -906,13 +1073,23 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read a copy's source instead of its place          (VICTORY_OVERLAP={})",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        THROUGH.swap(0, Ordering::Relaxed) as f64 / frames,
+        u8::from(overlap()),
     );
+    if overlap_check() {
+        let c = CHECKED.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "VICTORY_OVERLAP_CHECK: {} fills read through a placed copy's source compared with the CPU's read after the wait, {} differed",
+            c[0],
+            c[1]
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -955,6 +1132,46 @@ mod tests {
     /// What is done on the card, as (place, level), in stage 2.
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
         plan(does, 2, true, &mut None).unwrap()
+    }
+
+    fn placed(dst: usize, src: usize, len: usize) -> Does {
+        Does::Placed { dst, src, len }
+    }
+
+    /// A fill of what a copy at its place wrote reads the copy's source, and
+    /// the submission is no longer refused for it, in either order mode.
+    #[test]
+    fn a_fill_behind_a_placed_copy_reads_its_source() {
+        let mut does = vec![fill(9000, 64, true), placed(1000, 50_000, 0x180), fill(1080, 0x100, true)];
+        assert_eq!(plan(&does, 2, false, &mut None), Err(BEHIND_PLACED));
+        assert_eq!(through_placed(&mut does), [(2, 1)]);
+        assert!(matches!(does[2], Does::Fill { src: 50_080, len: 0x100, asked: true, .. }));
+        assert_eq!(plan(&does, 2, false, &mut None), Ok(vec![(0, 0), (2, 0)]));
+        assert_eq!(plan(&does, 2, true, &mut None), Ok(vec![(0, 0), (2, 0)]));
+    }
+
+    /// Left as they are: a fill ahead of the copy, one that reads past what
+    /// the copy wrote, one behind a later write of those bytes or of the
+    /// source, a copy onto itself, and a fill behind a step of ours.
+    #[test]
+    fn fills_the_copy_does_not_account_for_are_left_alone() {
+        let cases: [Vec<Does>; 6] = [
+            vec![fill(1000, 64, true), placed(1000, 50_000, 0x180)],
+            vec![placed(1000, 50_000, 0x180), fill(1300, 0x100, true)],
+            vec![placed(1000, 50_000, 0x180), copy(1010, 7000, 8, false), fill(1000, 64, true)],
+            vec![placed(1000, 50_000, 0x180), copy(50_010, 7000, 8, false), fill(1000, 64, true)],
+            vec![placed(1000, 900, 0x180), fill(1000, 64, true)],
+            vec![placed(1000, 50_000, 0x180), Does::Run, fill(1000, 64, true)],
+        ];
+        for mut does in cases {
+            let before = format!("{does:?}");
+            assert!(through_placed(&mut does).is_empty(), "{before}");
+            assert_eq!(format!("{does:?}"), before);
+        }
+        // The last copy over the bytes is the one read through.
+        let mut does = vec![placed(1000, 50_000, 64), placed(1000, 60_000, 64), fill(1000, 64, false)];
+        assert_eq!(through_placed(&mut does), [(2, 1)]);
+        assert!(matches!(does[2], Does::Fill { src: 60_000, .. }));
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
