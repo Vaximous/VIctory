@@ -362,6 +362,12 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
+/// For the memory line: texture blocks no piece is cut from.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn empty_blocks() -> usize {
+    lock(&TEXTURES).blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count()
+}
+
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
