@@ -5,6 +5,12 @@
 /// The system's processor sets of group 0: each one's id and its efficiency
 /// class (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8)> {
+    cpu_sets_with_cache().into_iter().map(|(id, class, _)| (id, class)).collect()
+}
+
+/// [`cpu_sets`] with each one's last-level cache (on a processor of two
+/// dies, which die).
+fn cpu_sets_with_cache() -> Vec<(u32, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -24,7 +30,7 @@ fn cpu_sets() -> Vec<(u32, u8)> {
         // SAFETY: the record's type is CpuSet (the only one there is).
         let set = unsafe { &info.Anonymous.CpuSet };
         if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass));
+            sets.push((set.Id, set.EfficiencyClass, set.LastLevelCacheIndex));
         }
         at += info.Size as usize;
     }
@@ -69,8 +75,77 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// `VICTORY_CHAIN_PRIORITY=1`: the threads of ours a frame waits for one by
+/// one (submit, relay, the heaps' records, the views beside, the late
+/// helper) run above normal priority, so that one the title's or a pool's
+/// thread woke runs at once instead of behind them. The timeline of run
+/// foxmem3 had 4.3 to 4.5 ms of every frame's chain in threads woken but
+/// not running yet, with some 30 threads of ours and the title's on 24
+/// processors.
+fn chain_priority() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CHAIN_PRIORITY"))
+}
+
+/// `VICTORY_CCD_SPLIT=1`, on a processor whose cores share two or more last
+/// caches (dies): the title's threads and ours a frame waits for one by one
+/// keep to the first die, the pools of ours (lists translated, landing,
+/// views, the wide jobs) to the others. A preference the system keeps
+/// unless nothing of it is free.
+fn split() -> Option<&'static (Vec<u32>, Vec<u32>)> {
+    static SPLIT: std::sync::OnceLock<Option<(Vec<u32>, Vec<u32>)>> = std::sync::OnceLock::new();
+    SPLIT
+        .get_or_init(|| {
+            if !crate::switch::on("VICTORY_CCD_SPLIT") {
+                return None;
+            }
+            let sets = cpu_sets_with_cache();
+            let first = sets.iter().map(|s| s.2).min()?;
+            let (near, far): (Vec<&(u32, u8, u8)>, Vec<&(u32, u8, u8)>) = sets.iter().partition(|s| s.2 == first);
+            if near.is_empty() || far.is_empty() {
+                return None;
+            }
+            let (near, far): (Vec<u32>, Vec<u32>) = (near.iter().map(|s| s.0).collect(), far.iter().map(|s| s.0).collect());
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessDefaultCpuSets};
+            // SAFETY: our own process and the system's own set ids.
+            let ok = unsafe { SetProcessDefaultCpuSets(GetCurrentProcess(), near.as_ptr(), near.len() as u32) };
+            tracing::info!(
+                first = near.len(),
+                others = far.len(),
+                ok,
+                "the title's threads and the chain's keep to the first die, the pools of ours to the others (VICTORY_CCD_SPLIT)"
+            );
+            Some((near, far))
+        })
+        .as_ref()
+}
+
+/// Under [`split`], keeps the calling thread to its part: `chain`, the
+/// first die. Whether it did.
+fn placed(what: &str, chain: bool) -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    let Some((near, far)) = split() else {
+        return false;
+    };
+    let sets = if chain { near } else { far };
+    // SAFETY: our own thread and a list of the system's own set ids.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), sets.as_ptr(), sets.len() as u32) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept to its die");
+    }
+    ok != 0
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    if from == 1 && chain_priority() {
+        use windows_sys::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        // SAFETY: this thread's own priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    }
+    if placed(what, from == 1) {
+        return;
+    }
     if stage() < from {
         return;
     }
