@@ -325,7 +325,7 @@ macro_rules! numbers {
 
 impl GraphicsState {
     /// The state as bytes.
-    fn put(&self, out: &mut Vec<u8>) {
+    pub(super) fn put(&self, out: &mut Vec<u8>) {
         out.push(u8::from(self.depth_bounds));
         for f in [self.rasterizer.DepthBiasClamp, self.rasterizer.SlopeScaledDepthBias] {
             out.extend(f.to_le_bytes());
@@ -366,7 +366,7 @@ impl GraphicsState {
         }
     }
 
-    fn get(bytes: &[u8]) -> Option<GraphicsState> {
+    pub(super) fn get(bytes: &[u8]) -> Option<GraphicsState> {
         let mut g = GraphicsState::default();
         let (&bounds, mut rest) = bytes.split_first()?;
         g.depth_bounds = bounds != 0;

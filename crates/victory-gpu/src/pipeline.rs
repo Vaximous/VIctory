@@ -756,6 +756,8 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+pub mod book;
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 pub mod known;

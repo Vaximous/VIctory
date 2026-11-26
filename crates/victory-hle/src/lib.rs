@@ -28,6 +28,10 @@ pub use victory_gpu::replay;
 
 #[cfg(windows)]
 pub use victory_gpu::pipeline::known as known_pipelines;
+#[cfg(windows)]
+pub use victory_gpu::pipeline::book as pipeline_book;
+#[cfg(windows)]
+pub use victory_gpu::stage as launch_window;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
