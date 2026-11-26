@@ -37,6 +37,11 @@ pub(crate) struct Pending {
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// When a worker (or a thread making it itself) began it.
+    began: OnceLock<Instant>,
+    /// Named once as in the making for long (diagnostics).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    stalled: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
     key: String,
@@ -182,6 +187,8 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
+            began: OnceLock::new(),
+            stalled: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -194,7 +201,23 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let _ = self.began.set(began);
+            // A panic in the translation or the host's compile must not
+            // leave the pipeline "being made" for the rest of the run (and
+            // end the worker that took it): it is a pipeline that cannot be
+            // made, said once with the reason.
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            }))
+            .unwrap_or_else(|panic| {
+                let why = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a panic".to_owned());
+                tracing::warn!(shaders = ?self.shaders, why, "no host pipeline: making it panicked");
+                None
+            });
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -208,9 +231,28 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(format!("left out on purpose: {why} ({})", hashes(p)));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(match p.queue_state.load(Ordering::Relaxed) {
+            NOT_QUEUED => "never queued".into(),
+            MAKING => {
+                let secs = p.began.get().map_or(0, |b| b.elapsed().as_secs());
+                if secs >= 30 {
+                    // A worker in the driver's compile (or a translation)
+                    // for this long: named once, then counted by its shaders.
+                    if !p.stalled.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(shaders = ?p.shaders, secs, "a host pipeline has been in the making for 30 s or more");
+                    }
+                    format!("in the making for 30 s or more ({})", hashes(p))
+                } else {
+                    "being made".into()
+                }
+            }
+            _ => "being made (queued)".into(),
+        }),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
