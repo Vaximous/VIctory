@@ -883,6 +883,34 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// The time between each present and the one before (tenths of a
+/// millisecond), since the frame-rate line last took them.
+#[cfg(feature = "diagnostics")]
+static FRAME_TIMES: std::sync::Mutex<(Option<std::time::Instant>, Vec<u32>)> = std::sync::Mutex::new((None, Vec::new()));
+
+#[cfg(feature = "diagnostics")]
+fn frame_time() {
+    let now = std::time::Instant::now();
+    let mut times = FRAME_TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(last) = times.0.replace(now) {
+        let tenths = ((now - last).as_micros() / 100).min(u128::from(u32::MAX)) as u32;
+        times.1.push(tenths);
+    }
+}
+
+/// Every frame's time since the last call, in milliseconds, for the
+/// frame-rate line (each frame's own, for percentiles and hitches).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_frame_times() -> String {
+    let taken = std::mem::take(&mut FRAME_TIMES.lock().unwrap_or_else(|e| e.into_inner()).1);
+    let mut text = String::with_capacity(taken.len() * 6);
+    for t in taken {
+        use std::fmt::Write;
+        let _ = write!(text, " {}.{}", t / 10, t % 10);
+    }
+    text
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -926,6 +954,8 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    frame_time();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

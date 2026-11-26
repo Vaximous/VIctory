@@ -386,6 +386,14 @@ fn shared_budget() -> bool {
 }
 
 /// Waits for `p` while frame `frame` has budget left.
+/// Microseconds the recording threads waited for pipelines being made, since
+/// [`take_waited_us`] (a frame's own thread waiting: a direct stall).
+static WAITED_US: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn take_waited_us() -> u64 {
+    WAITED_US.swap(0, Ordering::Relaxed)
+}
+
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
@@ -442,6 +450,7 @@ fn wait(p: &Pending, frame: u64) {
             }
         }
     }
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::PipelineWaitUs,

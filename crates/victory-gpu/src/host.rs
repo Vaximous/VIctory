@@ -9000,6 +9000,33 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            {
+                // What shows late, per frame, at warn level for play logs too.
+                static LAST: std::sync::Mutex<[u64; 4]> = std::sync::Mutex::new([0; 4]);
+                let now = [
+                    crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_RECHECKED[0].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURES_RECHECKED[1].load(Ordering::Relaxed),
+                    crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed),
+                ];
+                let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+                let d: Vec<f64> = (0..4).map(|i| now[i].saturating_sub(last[i]) as f64 / frames).collect();
+                *last = now;
+                let [queued, due, away, _, oldest] =
+                    [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                tracing::warn!(
+                    "late per frame: {dropped:.1} draws dropped without a host pipeline, {making} pipelines queued,                      {:.2} ms the recording threads waited for pipelines; textures picked by index: {:.1} uploads ({:.2} MB),                      {queued} in the queue, {due} due (the oldest {oldest} frames), {away} waiting for their memory,                      {:.1} looks for changes after upload ({:.1} KB read), {:.2} found changed and uploaded again",
+                    crate::pipeline::take_waited_us() as f64 / 1000.0 / frames,
+                    d[0],
+                    d[3] / 1e6,
+                    d[1] + d[2],
+                    (d[1] + d[2]) * 48.0,
+                    d[2],
+                    making = crate::pipeline::making(),
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            tracing::info!("frame times (ms):{}", crate::queue::take_frame_times());
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
