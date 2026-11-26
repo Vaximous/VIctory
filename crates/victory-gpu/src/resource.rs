@@ -1377,7 +1377,12 @@ pub(crate) fn want_level(this: This, first: u32) {
     }
 }
 
-/// Mip residency (`VICTORY_MIP_RESIDENCY=0`: off). Once a second, by the
+/// Mip residency (`VICTORY_MIP_RESIDENCY=1`; off by default: a host copy
+/// without the title's finest levels is wrong for a shader that reads
+/// texels by coordinates (`Load`) rather than sampling: it read outside
+/// the smaller copy, dark blocks over the ground and the player in a
+/// moving run; levels must stay whole and be left out by tiles and a
+/// clamp instead). Once a second, by the
 /// card's memory as [`let_go_idle`] counts it:
 /// - over the high-water mark (92% of the budget), the host copies of
 ///   placed textures used least lately (none used in the last 64 frames and
@@ -1396,7 +1401,7 @@ pub(crate) fn want_level(this: This, first: u32) {
 fn shed_levels(memory: Option<[u64; 4]>) {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MIP_RESIDENCY").is_none_or(|v| v != "0")) || !held_only() {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MIP_RESIDENCY").is_some_and(|v| v == "1")) || !held_only() {
         return;
     }
     let Some([budget, used, ..]) = memory else {
@@ -1519,13 +1524,13 @@ fn shed_levels(memory: Option<[u64; 4]>) {
 /// The first level a placed texture's first host copy holds, from `base`
 /// on: its coarse levels, up to 512 by 512 texels, and finer ones only as the
 /// card has room for them ([`shed_levels`]): the chain whole for every
-/// texture filled the card at once (`VICTORY_COARSE_FIRST=0`: whole, as
-/// before).
+/// texture filled the card at once. Off by default (`VICTORY_COARSE_FIRST=1`
+/// turns it on): wrong for textures read by coordinates, as [`shed_levels`].
 #[cfg(windows)]
 fn coarse_first(desc: &ResourceDesc, base: u32) -> u32 {
     const MOST: u64 = 512 * 512;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COARSE_FIRST").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COARSE_FIRST").is_some_and(|v| v == "1")) {
         return base;
     }
     let mut level = base;
