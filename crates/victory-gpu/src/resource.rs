@@ -1374,6 +1374,42 @@ pub(crate) fn want_level(this: This, first: u32) {
 pub(crate) static KINDS: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// Title textures whose memory was overwritten (a newer view placed there
+/// made their slots stale) or unmapped (streamed out), each with the frame
+/// it was noted in: their host copies go at the next sweep
+/// ([`let_go_idle`]) without waiting to be idle, once no list or slot holds
+/// them (a few sweeps at most; then left to the idle sweep).
+/// `VICTORY_FREE_OVERWRITTEN=0`: left to the idle sweep alone, as before.
+#[cfg(windows)]
+static OVERWRITTEN: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Since the start: host copies let go because their title memory was
+/// overwritten or unmapped ([`overwritten`]), and their bytes.
+#[cfg(windows)]
+pub(crate) static FREED_OVERWRITTEN: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+fn free_overwritten() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FREE_OVERWRITTEN").is_none_or(|v| v != "0"))
+}
+
+/// The title memory of `texture` (one placed in title memory) was
+/// overwritten by a newer texture or unmapped: its host copy is let go at
+/// the next sweep. Locks one mutex and calls nothing.
+#[cfg(windows)]
+pub(crate) fn overwritten(texture: This) {
+    if !free_overwritten() {
+        return;
+    }
+    const MOST: usize = 1 << 16;
+    let mut noted = OVERWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if noted.len() < MOST {
+        noted.push((texture as usize, crate::frame::current()));
+    }
+}
+
 /// Every title texture alive (not buffers), by address: for the sweep and
 /// the memory line. A texture leaves the table before it is freed.
 #[cfg(windows)]
@@ -2156,6 +2192,47 @@ pub(crate) fn let_go_idle() {
         crate::host::retire(host);
         Some(bytes)
     };
+    // Those whose title memory was overwritten or unmapped first, idle or
+    // not: nothing shows them any more. Kept while a list or slot still
+    // holds one, for a few sweeps.
+    {
+        /// Frames a noted texture waits for its holders to let go.
+        const WAIT_FRAMES: u64 = 240;
+        let noted = std::mem::take(&mut *OVERWRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let now = crate::frame::current();
+        let mut again = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (at, frame) in noted {
+            if !seen.insert(at) || !all.contains(&at) {
+                continue;
+            }
+            // SAFETY: in the table, under its lock: alive (as in `let_go`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            match let_go(at, 0) {
+                Some(b) => {
+                    went += 1;
+                    bytes += b;
+                    first.get_or_insert(at);
+                    FREED_OVERWRITTEN[0].fetch_add(1, Relaxed);
+                    FREED_OVERWRITTEN[1].fetch_add(b, Relaxed);
+                }
+                // Still held, or never made: again at the next sweep while
+                // it had one.
+                None if r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                    && now.saturating_sub(frame) < WAIT_FRAMES =>
+                {
+                    again.push((at, frame));
+                }
+                None => {}
+            }
+        }
+        if !again.is_empty() {
+            OVERWRITTEN.lock().unwrap_or_else(|e| e.into_inner()).extend(again);
+        }
+    }
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
         if bytes >= most {
             break;

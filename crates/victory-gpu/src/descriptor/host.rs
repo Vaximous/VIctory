@@ -2194,6 +2194,8 @@ impl HostHeap {
             }
         }
         self.unmake(index);
+        drop(_made);
+        overwritten(key);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
@@ -2561,9 +2563,12 @@ impl HostHeap {
             if slot == index || key == 0 {
                 continue;
             }
-            let _made = self.made.lock(slot);
+            let made = self.made.lock(slot);
             if self.made.get(slot) == Some(key) {
                 self.unmake(slot);
+                // (Not under the slot's lock.)
+                drop(made);
+                overwritten(key);
             }
         }
     }
@@ -4673,6 +4678,21 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
+/// The host slot made from the record `key` showed a placed texture whose
+/// title memory is overwritten or unmapped now: its host copy goes at the
+/// next sweep (`crate::resource::overwritten`). Only a texture made already
+/// is looked up; none is made.
+fn overwritten(key: u64) {
+    if let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32)
+        && resource[0] != 1
+    {
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        if let Some(texture) = crate::resource::texture_at_made(address, &resource) {
+            crate::resource::overwritten(texture);
+        }
+    }
+}
+
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
