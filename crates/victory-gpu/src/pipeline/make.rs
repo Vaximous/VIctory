@@ -140,7 +140,21 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if !defrag_pass() && shaders.iter().any(|s| s.hash == DEFRAG_RELOCATIONS) {
+        return Some("the heap defrag's relocation pass, left out for speed (VICTORY_DEFRAG_PASS=1: run)");
+    }
     None
+}
+
+/// The compute pass that works out a heap defrag's relocations: some 12 ms
+/// of the card's time in a frame, one dispatch.
+const DEFRAG_RELOCATIONS: &str = "02384a60fda6f2d0";
+
+/// `VICTORY_DEFRAG_PASS=1`: [`DEFRAG_RELOCATIONS`] runs; by default its
+/// pipeline is left out and its dispatches dropped, as before it translated.
+fn defrag_pass() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEFRAG_PASS").is_some_and(|v| v == "1"))
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
