@@ -551,10 +551,24 @@ pub(crate) fn note_why(why: String) {
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
+/// Dispatches of the ray-tracing structure builder's stages dropped while it
+/// is off, since the last [`take_drops`]: some 1,900 a frame in the open
+/// world, counted without a string or the drops' lock each.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static BUILDER_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The reason [`BUILDER_DROPS`] are counted under.
+#[cfg(all(windows, feature = "diagnostics"))]
+const BUILDER_OFF: &str = "a stage of the ray-tracing structure builder, which is off";
+
 /// The drops counted since the last call, most first (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
-    let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let builder = BUILDER_DROPS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if builder > 0 {
+        *drops.get_or_insert_with(HashMap::new).entry(BUILDER_OFF.to_owned()).or_default() += builder;
+    }
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
     // Frame reports only show the first 40 reasons. Keep ties ordered so
     // a HashMap iteration order change cannot change which reasons appear.
