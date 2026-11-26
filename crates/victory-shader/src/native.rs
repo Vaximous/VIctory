@@ -63,6 +63,7 @@
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
 //! Merged stages keep their stage data in another layout (not read).
 //!
+//! Kind 0x0c is the FSSM blob stored uncompressed (no XBCH around it).
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
@@ -74,6 +75,9 @@ use crate::dxbc::{u32_at, u64_at};
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
+/// The same native code stored as is: an FSSM blob without the XBCH
+/// compression around it (small programs; seen in place of 0x0d).
+const KIND_NATIVE_RAW: u32 = 0x0c;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -437,13 +441,18 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if kind != KIND_NATIVE && kind != KIND_NATIVE_RAW {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        if kind == KIND_NATIVE {
+            out.extend(programs(&unpack(blob)?)?);
+        } else {
+            out.extend(programs(blob)?);
+        }
     }
     Ok(out)
 }
