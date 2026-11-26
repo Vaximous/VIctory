@@ -2551,6 +2551,12 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line, of the title's fences the thread that
+/// lands flights set: microseconds from the start of their landing, how
+/// many, the longest, flights of the same landing that came after them (they
+/// waited for those flights' landing too).
+static TOLD_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
 /// how many, from the front, can be landed when the card has reached
@@ -2559,6 +2565,24 @@ static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atom
 /// flight (its bottom-of-pipe writes, signals) never before the flight.
 fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
+}
+
+/// Of the `n` landable things at the front of the line ([`landable`]), how
+/// many to land now with `VICTORY_LAND_TELL_FIRST=1`: up to the end of the
+/// first writes and signals with a flight behind them, so what tells the
+/// title its work is done does not wait for the landing of later flights the
+/// card ran meanwhile (they land next, at once).
+fn told_first(line: &[Option<u64>], n: usize) -> usize {
+    let Some(told) = line[..n].iter().position(Option::is_none) else {
+        return n;
+    };
+    let end = line[told..n].iter().position(Option::is_some).map_or(n, |k| told + k);
+    if end < n { end } else { n }
+}
+
+fn tell_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TELL_FIRST").is_some_and(|v| v == "1"))
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -2578,7 +2602,19 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_pieces, landable, told_first};
+
+    /// What tells the title of a flight lands with it, not after later flights.
+    #[test]
+    fn what_tells_the_title_goes_before_later_flights() {
+        let line = [Some(5), None, None, Some(6), None, Some(7)];
+        assert_eq!(told_first(&line, 6), 3);
+        assert_eq!(told_first(&line[3..], 3), 2);
+        assert_eq!(told_first(&line, 3), 3);
+        assert_eq!(told_first(&[Some(1), Some(2)], 2), 2);
+        assert_eq!(told_first(&[None, Some(2), None], 3), 1);
+        assert_eq!(told_first(&[], 0), 0);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3456,7 +3492,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let mut n = landable(&fences, completed);
+                if tell_first() {
+                    n = told_first(&fences, n);
+                }
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
@@ -3654,6 +3693,14 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        let t: Vec<u64> = TOLD_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed)).collect();
+        tracing::info!(
+            "the title's fences set by the relay per frame: {:.1}, {:.2} ms after their landing began on average, the longest              {:.2} ms; {:.1} flights per frame landed with one ahead of them",
+            t[1] as f64 / frames,
+            t[0] as f64 / 1000.0 / t[1].max(1) as f64,
+            t[2] as f64 / 1000.0,
+            t[3] as f64 / frames,
         );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4933,9 +4980,11 @@ impl Host {
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
+        let mut flights_after = items.iter().filter(|l| matches!(l, Late::Run(_))).count() as u64;
         for item in items {
             telling = match item {
                 Late::Run(mut flight) => {
+                    flights_after -= 1;
                     last = flight.number;
                     for &i in &flight.order {
                         read_backs(flight.lists[i].host());
@@ -4958,6 +5007,10 @@ impl Host {
                 }
                 Late::Signal(fence, value) => {
                     crate::fence::set(fence as crate::object::This, value);
+                    TOLD_STATS[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    TOLD_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    TOLD_STATS[2].fetch_max(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    TOLD_STATS[3].fetch_add(flights_after, Ordering::Relaxed);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
