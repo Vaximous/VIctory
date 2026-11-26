@@ -1226,6 +1226,12 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// Mip residency ([`shed_levels`]): the finest level a host copy holds
+    /// at most (0: all of them), the moment it was last shed, and the
+    /// milliseconds it is kept from shedding again after it came back.
+    floor: std::sync::atomic::AtomicU32,
+    shed_at: std::sync::atomic::AtomicU64,
+    guard_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1353,6 +1359,9 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
+    // (Not finer than its shed levels allow: they come back by
+    // [`shed_levels`], with room.)
+    let first = first.max(r.host.floor.load(Relaxed));
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
@@ -1365,6 +1374,147 @@ pub(crate) fn want_level(this: This, first: u32) {
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
+
+/// Mip residency (`VICTORY_MIP_RESIDENCY=0`: off). Once a second, by the
+/// card's memory as [`let_go_idle`] counts it:
+/// - over the high-water mark (92% of the budget), the host copies of
+///   placed textures used least lately (none used in the last 64 frames and
+///   2 s, none kept from it) give up their finest level, down to the
+///   low-water mark (85%), at most 512 MB a second. A copy is made again from
+///   the next level on at its next use, about a quarter of the bytes. Its
+///   slots go on showing the old copy until then (`VICTORY_SHOW_AFTER`), so a
+///   texture that was shown becomes blurrier, never black or grey. Copies of
+///   256 KiB or less, and textures the host writes, are not shed.
+/// - under 80%, the shed textures used most lately get their levels back,
+///   at most 256 MB a second. One that comes back within its guard of being
+///   shed is kept from shedding twice as long the next time (10 s at first,
+///   at most 160 s): what is shed and wanted again at once is not shed in a
+///   loop.
+#[cfg(windows)]
+fn shed_levels(memory: Option<[u64; 4]>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MIP_RESIDENCY").is_none_or(|v| v != "0")) || !held_only() {
+        return;
+    }
+    let Some([budget, used, ..]) = memory else {
+        return;
+    };
+    if budget == 0 {
+        return;
+    }
+    let used = used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
+    const HIGH: u64 = 92;
+    const LOW: u64 = 85;
+    const BACK: u64 = 80;
+    const SHED_MOST: u64 = 512 << 20;
+    const BACK_MOST: u64 = 256 << 20;
+    const KEEP: u64 = 256 << 10;
+    const GUARD_MS: u64 = 10_000;
+    const GUARD_MOST_MS: u64 = 160_000;
+    let now_ms = crate::host::now_ms();
+    let shedding = used * 100 > budget * HIGH;
+    let back = used * 100 < budget * BACK;
+    if !shedding && !back {
+        return;
+    }
+    let all = textures();
+    // (Used moment, texture) of those that may go either way.
+    let mut found: Vec<(u64, usize)> = Vec::new();
+    for &at in all.iter() {
+        // SAFETY: in the table, under its lock: alive (as in `let_go_idle`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || !r.host.placed.load(Relaxed) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let floor = r.host.floor.load(Relaxed);
+        let used_at = r.host.used.load(Relaxed);
+        if back {
+            if floor > 0 {
+                found.push((used_at, at));
+            }
+        } else if used_at != 0
+            && crate::host::long_ago(used_at, 2000, 64)
+            && now_ms >= r.host.shed_at.load(Relaxed) + r.host.guard_ms.load(Relaxed)
+        {
+            found.push((used_at, at));
+        }
+    }
+    let mut moved = 0u64;
+    if shedding {
+        let goal = (used - budget * LOW / 100).min(SHED_MOST);
+        // The least lately used first.
+        found.sort_unstable();
+        for &(_, at) in &found {
+            if moved >= goal {
+                break;
+            }
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            let next = host.base + 1;
+            if host.bytes / 4 < KEEP || base_level(&r.desc, next) != next {
+                continue;
+            }
+            let bytes = host.bytes;
+            r.host.floor.store(next, Relaxed);
+            r.host.shed_at.store(now_ms, Relaxed);
+            // Under the lock, as in `want_level`.
+            crate::texture::unstage(at as This);
+            r.host.grown.store(true, Relaxed);
+            if let Some(old) = made.take() {
+                REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+            }
+            drop(made);
+            crate::descriptor::host::levels_changed(r.data() as u64);
+            moved += bytes - bytes / 4;
+            SHED[0].fetch_add(1, Relaxed);
+            SHED[1].fetch_add(bytes - bytes / 4, Relaxed);
+        }
+    } else {
+        // The most lately used first.
+        found.sort_unstable_by(|a, b| b.cmp(a));
+        let room = (budget * BACK / 100).saturating_sub(used).min(BACK_MOST);
+        for &(_, at) in &found {
+            if moved >= room {
+                break;
+            }
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let bytes = made.as_ref().map_or(0, |(host, _)| host.bytes);
+            r.host.floor.store(0, Relaxed);
+            // Back soon after it was shed: kept longer next time.
+            let guard = r.host.guard_ms.load(Relaxed);
+            let soon = now_ms < r.host.shed_at.load(Relaxed) + guard.max(GUARD_MS) * 2;
+            r.host.guard_ms.store(
+                if soon { (guard * 2).clamp(GUARD_MS, GUARD_MOST_MS) } else { guard.max(GUARD_MS) },
+                Relaxed,
+            );
+            if made.is_some() {
+                crate::texture::unstage(at as This);
+                r.host.grown.store(true, Relaxed);
+                if let Some(old) = made.take() {
+                    REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+                }
+            }
+            drop(made);
+            crate::descriptor::host::levels_changed(r.data() as u64);
+            // About what the whole one takes again.
+            moved += bytes * 3;
+            SHED[2].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Since the start: host copies that gave up their finest level
+/// ([`shed_levels`]), the bytes that freed, and textures given their
+/// levels back.
+#[cfg(windows)]
+pub(crate) static SHED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
@@ -1619,6 +1769,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
+            }
+            // Shed levels stay shed ([`shed_levels`]).
+            let floor = r.host.floor.load(Relaxed);
+            if floor > base {
+                base = base_level(&r.desc, floor).max(base);
             }
         }
         let texture = match texture {
@@ -2096,6 +2251,7 @@ pub(crate) fn let_go_idle() {
         }
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
+    shed_levels(memory);
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
@@ -2946,6 +3102,9 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
+            floor: std::sync::atomic::AtomicU32::new(0),
+            shed_at: std::sync::atomic::AtomicU64::new(0),
+            guard_ms: std::sync::atomic::AtomicU64::new(0),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
     });

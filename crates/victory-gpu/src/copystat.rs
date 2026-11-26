@@ -768,7 +768,7 @@ fn log_memory() {
         "memory of textures: {} title textures have no host copy yet ({:.0} MB of title memory); \
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
-         {:.0} MB since the start ({} {:.0} MB of them freed because their title memory was overwritten or unmapped,          VICTORY_FREE_OVERWRITTEN; {} slots {:.0} MB emptied as no shader read them, VICTORY_EVICT_UNTOUCHED);          {} host copies made in all; passes that made none for lack of \
+         {:.0} MB since the start ({} {:.0} MB of them freed because their title memory was overwritten or unmapped,          VICTORY_FREE_OVERWRITTEN; {} slots {:.0} MB emptied as no shader read them, VICTORY_EVICT_UNTOUCHED; {} shed their finest level freeing {:.0} MB and {} given it back, VICTORY_MIP_RESIDENCY); {} host copies made in all; passes that made none for lack of \
          room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
          shared with it in use",
         census[2],
@@ -786,6 +786,9 @@ fn log_memory() {
         mb(crate::resource::FREED_OVERWRITTEN[1].load(Relaxed)),
         crate::draw::EVICTED_UNTOUCHED[0].load(Relaxed),
         mb(crate::draw::EVICTED_UNTOUCHED[1].load(Relaxed)),
+        crate::resource::SHED[0].load(Relaxed),
+        mb(crate::resource::SHED[1].load(Relaxed)),
+        crate::resource::SHED[2].load(Relaxed),
         kinds[6],
         crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
         mb(card[1]),
