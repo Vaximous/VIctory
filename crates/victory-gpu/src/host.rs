@@ -3760,6 +3760,7 @@ pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
+pub mod touched;
 #[cfg(feature = "diagnostics")]
 mod traffic;
 pub(crate) mod upcheck;
@@ -9139,6 +9140,7 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        touched::tick(frame);
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let planes = overlay.and_then(|(over, over_state)| {

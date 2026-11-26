@@ -102,6 +102,8 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// View-heap slots shaders read through (VICTORY_SLOT_FEEDBACK).
+pub use host::touched::{frames_per_epoch, slot_epochs, touched_slots};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

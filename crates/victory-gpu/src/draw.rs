@@ -1831,6 +1831,22 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_TOUCHED {
+                    // Ours: where shaders note the view-heap slots they read
+                    // through (`crate::host::touched`).
+                    if let Some(gpu) = crate::host::touched::address() {
+                        // SAFETY: an open list; the buffer lives as long as
+                        // the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {

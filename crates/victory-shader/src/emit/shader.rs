@@ -61,6 +61,30 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// The root UAV `u<SLOT_TOUCHED>` in [`ROOT_CBV_SPACE`] (`VICTORY_SLOT_FEEDBACK`): which
+/// view-heap slots shaders read through. Dword 0 holds the host's frame number; a shader
+/// that makes a handle from view-heap slot `i` stores that number into dword `1 + i` (`i`
+/// clamped to [`SLOT_TOUCHED_SLOTS`] - 1). A plain store of one value, the same in every
+/// lane that names the slot: no atomics, and a wave's stores to one slot are one write.
+pub const SLOT_TOUCHED: u8 = 251;
+/// View-heap slots [`SLOT_TOUCHED`] has a dword for.
+pub const SLOT_TOUCHED_SLOTS: u32 = 1 << 20;
+
+/// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 (default) every stage notes the view-heap slots it
+/// reads through ([`SLOT_TOUCHED`]); 2 every stage but pixel programs (a store in a pixel
+/// program may cost the early depth test). Off by default in this crate's own tests,
+/// whose runners bind no buffer there.
+pub fn slot_feedback() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SLOT_FEEDBACK").as_deref().map(str::trim) {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ if cfg!(test) => 0,
+        _ => 1,
+    })
+}
+
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// In a directory entry's first dword: shaders do not store there by address
@@ -232,6 +256,10 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// The host's frame number from [`SLOT_TOUCHED`] (loaded once, in the entry block).
+    touched_frame: Option<V>,
+    /// Slots noted already, by block and index ([Shader::touch]).
+    touched: std::collections::HashSet<(usize, V)>,
     main: V,
     pub entry: usize,
 }
@@ -285,6 +313,8 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            touched_frame: None,
+            touched: Default::default(),
             main,
             entry,
         }
@@ -486,6 +516,7 @@ impl Shader {
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
+        let asked = index;
         let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
@@ -523,7 +554,46 @@ impl Shader {
             218,
             &[index, s, n],
         );
+        let mode = slot_feedback();
+        if !sampler && (mode == 1 || mode == 2 && !self.pixel) && self.touched.insert((block, asked)) {
+            self.touch(block, index);
+        }
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// Notes in [`SLOT_TOUCHED`] that view-heap slot `index` is read through.
+    fn touch(&mut self, block: usize, index: V) {
+        let res = self.t.res_ret;
+        let f32t = self.t.f32;
+        let touched = self.root_uav_handle(SLOT_TOUCHED);
+        let (i32t, align) = (self.t.i32, self.m.i32(4));
+        let iu = self.m.undef(i32t);
+        let frame = match self.touched_frame {
+            Some(v) => v,
+            None => {
+                let (e, zero, one) = (self.entry, self.m.i32(0), self.m.i8(1));
+                let r = self.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[touched, zero, iu, one, align]);
+                let v = self.m.extract(e, r, 0);
+                self.touched_frame = Some(v);
+                v
+            }
+        };
+        let last = self.m.i32(SLOT_TOUCHED_SLOTS - 1);
+        let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.m.tag(at, super::bitcode::Tag::Clamp);
+        let (one, two) = (self.m.i32(1), self.m.i32(2));
+        let at = self.m.bin(block, super::bitcode::Bin::Add, at, one);
+        let at = self.m.bin(block, super::bitcode::Bin::Shl, at, two);
+        let fu = self.m.undef(f32t);
+        let (void, mask) = (self.t.void, self.m.i8(1));
+        self.op(
+            block,
+            "rawBufferStore.f32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[touched, at, iu, frame, fu, fu, fu, mask, align],
+        );
     }
 
     /// The finished container.
