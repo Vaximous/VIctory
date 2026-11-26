@@ -7967,6 +7967,13 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// Whether a flush's looks for refreshes that copy nothing run on several
+/// threads ahead of the rest (`VICTORY_WIDE_NOTHING_NEW=0`: off).
+fn wide_nothing_new() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_NOTHING_NEW").is_none_or(|v| v != "0") && wide_refresh())
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8093,8 +8100,38 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
+        let mut many = spans.len() > FEW;
+        // From some dozens on, the looks that tell which copy nothing are
+        // made on several threads first, and only the rest are asked ahead
+        // and refreshed: some 8,000 of 9,000 refreshes a frame copy nothing,
+        // and one at a time on this thread (under 256) or asked ahead with
+        // the others (over), they held the submission back.
+        // `VICTORY_WIDE_NOTHING_NEW=0`: as before.
+        const WIDE_LOOKS: usize = 24;
+        if spans.len() >= WIDE_LOOKS && wide_nothing_new() {
+            let all = spans.len();
+            let shared = std::sync::Arc::new(spans);
+            let same: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> =
+                std::sync::Arc::new((0..all).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+            {
+                let (shared, same) = (shared.clone(), same.clone());
+                crate::shadow::wide_each(all, move |i| {
+                    let (shadow, from, to) = &shared[i];
+                    if shadow.nothing_new(*from, *to - *from) {
+                        same[i].store(true, Ordering::Relaxed);
+                    }
+                });
+            }
+            spans = shared
+                .iter()
+                .zip(same.iter())
+                .filter(|(_, same)| !same.load(Ordering::Relaxed))
+                .map(|(span, _)| span.clone())
+                .collect();
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            many = false;
+        } else if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
