@@ -71,6 +71,7 @@ fn build() -> [u8; 32] {
             "VICTORY_PAIR_SYNC",
             "VICTORY_EXCHANGE_BARRIERS",
             "VICTORY_HALF_LOCAL",
+            "VICTORY_PAIR_SPIN_LIMIT",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",

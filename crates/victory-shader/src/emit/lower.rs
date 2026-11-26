@@ -956,6 +956,21 @@ pub(super) fn pair_sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAIR_SYNC").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PAIR_SPIN_LIMIT`: how many times a host wave looks for its partner at a meeting
+/// of a pair ([`Lower::meet_with`]) before it gives up (and no later meeting of the pair
+/// waits); 0 waits for ever. 2^20 by default: some 0.1 s, past any wait a working program
+/// has, well before the card is taken for hung.
+pub(super) fn pair_spin_limit() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PAIR_SPIN_LIMIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1 << 20)
+    })
+}
+
+/// The bit of a pair's meeting counter a host wave that gave up waiting sets
+/// ([`pair_spin_limit`]).
+const SPIN_GAVE_UP: u32 = 1 << 30;
+
 /// The most values one meeting of a pair carries ([`Lower::meet_with`]).
 const PAYLOAD: u32 = 2;
 
@@ -4424,13 +4439,40 @@ impl<'a> Lower<'a> {
         let old = self.s.op(pre, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         let odd = self.s.m.bin(pre, Bin::Or, old, one);
         let target = self.s.m.bin(pre, Bin::Add, odd, one);
+        let limit = pair_spin_limit();
         let spin = self.s.m.new_block();
-        self.s.m.terminate(pre, Term::Br(spin));
         let ptr = self.s.m.element(spin, lds, slot);
-        let now = self.s.m.atomic(spin, Rmw::Or, ptr, zero);
-        let now = self.s.op(spin, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[now]);
+        let (now, gave_up) = if limit > 0 {
+            // Bounded: after `limit` looks the host wave gives up and marks the console wave's
+            // counter, after which no meeting of the pair waits. A meeting its partner never
+            // comes to (a lowering whose host waves went different ways) then costs a
+            // wrong result instead of a hung card.
+            let into = self.s.m.new_block();
+            self.s.m.terminate(pre, Term::Br(into));
+            self.s.m.terminate(into, Term::Br(spin));
+            let n = self.s.m.phi(spin, i32t);
+            let next = self.s.m.bin(spin, Bin::Add, n, one);
+            self.s.m.set_phi(n, vec![(zero, into), (next, spin)]);
+            let k = self.s.m.i32(limit);
+            let out = self.s.m.cmp(spin, pred::SGE, next, k);
+            let sticky = self.s.m.i32(SPIN_GAVE_UP);
+            let mark = self.s.m.select(spin, out, sticky, zero);
+            let now = self.s.m.atomic(spin, Rmw::Or, ptr, mark);
+            let now = self.s.op(spin, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[now]);
+            let marked = self.s.m.bin(spin, Bin::And, now, sticky);
+            let marked = self.s.m.cmp(spin, pred::NE, marked, zero);
+            let gave_up = self.s.m.bin(spin, Bin::Or, marked, out);
+            (now, Some(gave_up))
+        } else {
+            self.s.m.terminate(pre, Term::Br(spin));
+            let now = self.s.m.atomic(spin, Rmw::Or, ptr, zero);
+            (self.s.op(spin, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[now]), None)
+        };
         let ahead = self.s.m.bin(spin, Bin::Sub, now, target);
-        let there = self.s.m.cmp(spin, pred::SGE, ahead, zero);
+        let mut there = self.s.m.cmp(spin, pred::SGE, ahead, zero);
+        if let Some(g) = gave_up {
+            there = self.s.m.bin(spin, Bin::Or, there, g);
+        }
         self.s.m.terminate(spin, Term::CondBr(there, c, spin));
         self.s.op(c, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         self.meetings.push(c);
