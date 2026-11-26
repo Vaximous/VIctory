@@ -4,6 +4,15 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// What the launch stage does with the cache (`run --cache`).
+#[cfg(windows)]
+static CACHE_MODE: std::sync::OnceLock<crate::cache::Mode> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub fn set_cache_mode(mode: crate::cache::Mode) {
+    let _ = CACHE_MODE.set(mode);
+}
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -173,6 +182,8 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    // The shader and pipeline cache, before any title code runs.
+    crate::cache::launch(*CACHE_MODE.get_or_init(|| crate::cache::Mode::pick(None)), title_dir)?;
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();

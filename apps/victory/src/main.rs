@@ -3,6 +3,8 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+#[cfg(windows)]
+mod cache;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -127,6 +129,11 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// The shader and pipeline cache built ahead of the title: build it
+    /// without starting the title, or pass the pipeline book on.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Cache(cache::Cache),
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -142,6 +149,12 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Before the title starts: build the shader and pipeline cache
+        /// (default; Esc starts the title), build it behind the title, or
+        /// skip it (default from `VICTORY_CACHE_BUILD`).
+        #[cfg(windows)]
+        #[arg(long, value_enum)]
+        cache: Option<cache::Mode>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -222,11 +235,17 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            #[cfg(windows)]
+            cache,
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
+            #[cfg(windows)]
+            run::set_cache_mode(cache::Mode::pick(cache));
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(windows)]
+        Command::Cache(c) => cache::command(c),
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
