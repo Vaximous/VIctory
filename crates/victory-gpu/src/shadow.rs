@@ -320,6 +320,45 @@ pub(crate) fn card_room_kept() -> u64 {
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+        + late_most().saturating_sub(LATE_USED.load(Ordering::Relaxed))
+}
+
+/// Room on the card kept for copies of title buffers of 1 MiB or more that
+/// come after the card is full (`VICTORY_CARD_LATE_MB`; 256 with
+/// `crate::host::overlap`, else 0): such a copy is made on the card over
+/// the room line and over `card_limits`' second number, and the texture
+/// queue leaves this much free for them ([`card_room_kept`]).
+///
+/// The buffers a title makes when its first world frame needs them come
+/// after the textures have filled the card. One of 20 MB (the upscaler's
+/// own, bound for writes by its heaviest passes) was refused in run fox-lap
+/// 2cb with the card at 10,753 MB of a 10,475 MB budget: its copy stayed in
+/// the PC's memory, and its passes read and wrote it over the bus, some
+/// 240 ms of the card's 264 a frame. In 4o1 it happened to come while there
+/// was room: the card worked 25 ms a frame.
+fn late_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_LATE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(if crate::host::overlap() { 256 } else { 0 })
+            << 20
+    })
+}
+
+/// Bytes of copies made from [`late_most`]'s room.
+static LATE_USED: AtomicU64 = AtomicU64::new(0);
+
+/// Takes `size` bytes of [`late_most`]'s room, for a copy of 1 MiB or
+/// more: whether there was that much.
+fn late_take(size: u64) -> bool {
+    size >= 1 << 20
+        && LATE_USED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (used + size <= late_most()).then_some(used + size)
+            })
+            .is_ok()
 }
 
 /// The copies in the card's memory.
@@ -413,8 +452,11 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+    let over = host.video_memory().filter(|&[budget, used, ..]| used + size > budget / 100 * hundredths);
+    // Over the line, a copy of 1 MiB or more may come from the late room.
+    let mut late = over.is_some() && late_take(size);
+    if let Some([budget, used, ..]) = over
+        && !late
     {
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
@@ -438,13 +480,29 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
+    // Over the number, a copy may still come from the late room.
+    if !late && CARD_BYTES[0].load(Ordering::Relaxed) + size > most {
+        if !late_take(size) {
+            return None;
+        }
+        late = true;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    match (&buffer, late) {
+        (None, true) => {
+            LATE_USED.fetch_sub(size, Ordering::Relaxed);
+        }
+        (None, false) => {}
+        (Some(_), late) => {
+            CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+            if late {
+                tracing::info!(
+                    size_kib = size >> 10,
+                    late_mb = LATE_USED.load(Ordering::Relaxed) >> 20,
+                    "a title buffer's copy is in the card's memory from the room kept for late ones (VICTORY_CARD_LATE_MB)"
+                );
+            }
+        }
     }
     buffer
 }
