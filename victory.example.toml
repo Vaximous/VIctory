@@ -48,6 +48,10 @@ test_titles = []
 #   pitch_per_count = -0.0006
 #   pitch_min = -1.4            # defaults; wrap = 6.2831853 (radians), 360 for degrees, 0 none
 #   pitch_max = 1.4
+#   object = [0x1234, 0x0]      # optional: the camera object, and the image-relative
+#   kind = 0x5678               #   first qword it must hold (only that camera is turned)
+#   yaw_copies = [[0x1234, 0x40]]    # optional: copies the title carries the angles
+#   pitch_copies = [[0x1234, 0x44]]  #   through; each moves by the same amount
 # camera = 'D:\victory-data\mouse-camera.toml'
 # Stick movement:
 # speed * sensitivity / 2000 counts/s is a full stick.   env: VICTORY_MOUSE_SENS

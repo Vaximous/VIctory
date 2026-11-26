@@ -295,6 +295,10 @@ fn cameras(i: &victory_core::Input, base: usize) -> Result<()> {
             pitch_min: c.pitch_min,
             pitch_max: c.pitch_max,
             wrap: c.wrap,
+            object: c.object,
+            kind: c.kind,
+            yaw_copies: c.yaw_copies,
+            pitch_copies: c.pitch_copies,
         })
         .collect();
     configure(base as u64, list, i.sensitivity.unwrap_or(1.0), i.invert_y.unwrap_or(false));

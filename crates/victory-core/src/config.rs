@@ -115,6 +115,20 @@ pub struct CameraHook {
     /// The yaw's period: 2π for radians (default), 360 for degrees, 0 none.
     #[serde(default = "tau")]
     pub wrap: f32,
+    /// A chain to the camera object and the first qword it must hold there
+    /// (its type, relative to the image): only a matching camera is turned,
+    /// so another camera reusing the memory is left alone.
+    #[serde(default)]
+    pub object: Vec<u64>,
+    #[serde(default)]
+    pub kind: Option<u64>,
+    /// More chains to copies the title carries the yaw / pitch through from
+    /// frame to frame; each moves by the same amount, so the turn sticks
+    /// whichever copy the title reads next.
+    #[serde(default)]
+    pub yaw_copies: Vec<Vec<u64>>,
+    #[serde(default)]
+    pub pitch_copies: Vec<Vec<u64>>,
 }
 
 fn pitch_limit_low() -> f32 {
@@ -136,6 +150,19 @@ impl CameraFile {
             anyhow::ensure!(
                 !c.yaw.is_empty() && !c.pitch.is_empty(),
                 "{}: camera {:?} needs a yaw and a pitch chain",
+                path.display(),
+                c.name
+            );
+            anyhow::ensure!(
+                c.kind.is_none() || !c.object.is_empty(),
+                "{}: camera {:?} names a kind but no object chain",
+                path.display(),
+                c.name
+            );
+            let copies = c.yaw_copies.iter().chain(&c.pitch_copies);
+            anyhow::ensure!(
+                copies.into_iter().all(|chain| !chain.is_empty()),
+                "{}: camera {:?} has an empty copy chain",
                 path.display(),
                 c.name
             );
@@ -384,6 +411,24 @@ pitch_per_count = -0.001
         let c = &file.camera[0];
         assert_eq!((c.yaw.as_slice(), c.pitch.as_slice()), (&[0x10, 0x8][..], &[0x10, 0xc][..]));
         assert_eq!((c.pitch_min, c.pitch_max, c.wrap), (-1.4, 1.4, std::f32::consts::TAU));
+        assert!(c.object.is_empty() && c.kind.is_none() && c.yaw_copies.is_empty());
+        let file: CameraFile = toml::from_str(
+            "[[camera]]
+name = 'b'
+object = [0x10, 0x100]
+kind = 0x2000
+yaw = [0x10, 0x148]
+pitch = [0x10, 0x14c]
+yaw_copies = [[0x10, 0x200], [0x10, 0x300]]
+pitch_copies = [[0x10, 0x204]]
+yaw_per_count = 0.001
+pitch_per_count = -0.001
+",
+        )
+        .unwrap();
+        let c = &file.camera[0];
+        assert_eq!((c.object.as_slice(), c.kind), (&[0x10, 0x100][..], Some(0x2000)));
+        assert_eq!((c.yaw_copies.len(), c.pitch_copies[0].as_slice()), (2, &[0x10, 0x204][..]));
         assert!(toml::from_str::<CameraFile>("[[camera]]
 name = 'a'
 ").is_err());

@@ -30,6 +30,14 @@ pub struct Camera {
     pub pitch_max: f32,
     /// The yaw's period (2π for radians, 360 for degrees); 0 does not wrap.
     pub wrap: f32,
+    /// A chain to the camera object, and the image-relative qword it must
+    /// start with to be this camera (its type); none: not checked.
+    pub object: Vec<u64>,
+    pub kind: Option<u64>,
+    /// Copies the title carries the angles through from frame to frame;
+    /// each moves by the same amount as `yaw` / `pitch`.
+    pub yaw_copies: Vec<Vec<u64>>,
+    pub pitch_copies: Vec<Vec<u64>>,
 }
 
 struct Cameras {
@@ -131,6 +139,37 @@ pub(super) fn resolve(memory: &impl Memory, base: u64, chain: &[u64]) -> Option<
     Some(at)
 }
 
+/// Whether the camera's object is there and of its kind (when one is named).
+fn present(memory: &impl Memory, base: u64, camera: &Camera) -> bool {
+    let Some(kind) = camera.kind else {
+        return true;
+    };
+    resolve(memory, base, &camera.object)
+        .and_then(|at| read_u64(memory, at))
+        .is_some_and(|first| Some(first) == base.checked_add(kind))
+}
+
+/// Moves the float at each copy by `by`, wrapped into `wrap` (0: not).
+fn shift(memory: &impl Memory, base: u64, copies: &[Vec<u64>], by: f32, wrap: f32) {
+    if by == 0.0 {
+        return;
+    }
+    for chain in copies {
+        let Some(at) = resolve(memory, base, chain) else {
+            continue;
+        };
+        let Some(value) = read_f32(memory, at) else {
+            continue;
+        };
+        let mut value = value + by;
+        if wrap > 0.0 {
+            let half = wrap / 2.0;
+            value = (value + half).rem_euclid(wrap) - half;
+        }
+        memory.write(at, &value.to_le_bytes());
+    }
+}
+
 /// Turns every camera found by the counts; whether one was.
 pub(super) fn turn(
     memory: &impl Memory,
@@ -142,6 +181,9 @@ pub(super) fn turn(
 ) -> bool {
     let mut found = false;
     for camera in list {
+        if !present(memory, base, camera) {
+            continue;
+        }
         let (Some(y), Some(p)) = (
             resolve(memory, base, &camera.yaw),
             resolve(memory, base, &camera.pitch),
@@ -155,9 +197,13 @@ pub(super) fn turn(
         if counts == (0, 0) {
             continue;
         }
-        let (yaw, pitch) = turned(camera, (yaw, pitch), counts, scale, invert_y);
-        memory.write(y, &yaw.to_le_bytes());
-        memory.write(p, &pitch.to_le_bytes());
+        let (new_yaw, new_pitch) = turned(camera, (yaw, pitch), counts, scale, invert_y);
+        memory.write(y, &new_yaw.to_le_bytes());
+        memory.write(p, &new_pitch.to_le_bytes());
+        // The copies move by the unwrapped turn and the clamped tilt.
+        let by_yaw = counts.0 as f32 * camera.yaw_per_count * scale;
+        shift(memory, base, &camera.yaw_copies, by_yaw, camera.wrap);
+        shift(memory, base, &camera.pitch_copies, new_pitch - pitch, 0.0);
     }
     found
 }
@@ -278,6 +324,10 @@ mod tests {
             pitch_min: -1.0,
             pitch_max: 1.0,
             wrap: std::f32::consts::TAU,
+            object: Vec::new(),
+            kind: None,
+            yaw_copies: Vec::new(),
+            pitch_copies: Vec::new(),
         }
     }
 
@@ -322,6 +372,34 @@ mod tests {
         // A null pointer is no camera, and nothing is written.
         m.put(base + 0x100, &0_u64.to_le_bytes());
         assert!(!turn(&m, base, &[camera()], (100, 100), 1.0, false));
+    }
+
+    #[test]
+    fn kinds_are_checked_and_copies_move_together() {
+        let m = Fake::default();
+        let base = 0x1000_0000;
+        m.put(base + 0x100, &0x2000_0000_u64.to_le_bytes());
+        m.put(0x2000_0000, &(base + 0x5000).to_le_bytes());
+        for (at, v) in [(0x10, 3.1_f32), (0x14, 0.9), (0x20, 3.0), (0x24, 0.5)] {
+            m.put(0x2000_0000 + at, &v.to_le_bytes());
+        }
+        let c = Camera {
+            object: vec![0x100, 0],
+            kind: Some(0x5000),
+            yaw_copies: vec![vec![0x100, 0x20], vec![0x300, 0x20]],
+            pitch_copies: vec![vec![0x100, 0x24]],
+            ..camera()
+        };
+        // 100 counts: +0.1 yaw (wrapping past π), pitch up to its limit: +0.1 of the asked 0.2.
+        assert!(turn(&m, base, std::slice::from_ref(&c), (100, -200), 1.0, false));
+        assert!((m.f32(0x2000_0010) - (3.2 - std::f32::consts::TAU)).abs() < 1e-5);
+        assert!((m.f32(0x2000_0020) - 3.1).abs() < 1e-5);
+        assert!((m.f32(0x2000_0014) - 1.0).abs() < 1e-6);
+        assert!((m.f32(0x2000_0024) - 0.6).abs() < 1e-5);
+        // Another kind of object there: not this camera, nothing written.
+        m.put(0x2000_0000, &(base + 0x6000).to_le_bytes());
+        assert!(!turn(&m, base, std::slice::from_ref(&c), (100, 0), 1.0, false));
+        assert!((m.f32(0x2000_0020) - 3.1).abs() < 1e-5);
     }
 
     #[test]
