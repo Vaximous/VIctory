@@ -2100,6 +2100,24 @@ fn land_echo() -> bool {
     crate::toggled!("VICTORY_LAND_ECHO")
 }
 
+/// Whether a refresh of a copy in the card's memory whose title memory is
+/// not watched (neither the write watch nor the guards see it: every
+/// refresh takes it whole) sends up only the 4 KiB parts that differ from
+/// its CPU side (`VICTORY_WHOLE_CHANGED=1`; off: all of it, as before).
+/// FSR4's 20 MB buffer is such a copy: shaders write all of it, it is
+/// fetched and landed, then every refresh took it whole and sent the same
+/// bytes back up, 21 MB a frame. It rests on what every send up rests on:
+/// outside ranges shaders may be writing, a copy's CPU side holds what its
+/// card side holds (`VICTORY_UPCOPY_CHECK=1` looks at that at rest).
+fn whole_changed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_CHANGED").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, of [`whole_changed`] refreshes: bytes
+/// found as the CPU's side held them (left), and bytes taken and sent up.
+pub(crate) static WHOLE_CHANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -3852,10 +3870,76 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        if self.card.is_some() && !self.window && whole_changed() {
+            self.copy_changed(from, to);
+        } else {
+            self.copy(from, to);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// [`whole_changed`]: [`Shadow::copy`] of `[from, to)` (inside the
+    /// buffer) for a copy in the card's memory whose title memory is not
+    /// watched, that takes, and sends up, only the 4 KiB parts in which
+    /// title memory differs from the CPU's side. On several threads if long.
+    fn copy_changed(&self, from: usize, to: usize) {
+        const LONG: usize = 1 << 20;
+        const PART: usize = 256 << 10;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        if to - from < LONG {
+            self.copy_changed_part(from, to);
+            return;
+        }
+        let parts: Vec<(usize, usize)> = (from..to).step_by(PART).map(|a| (a, (a + PART).min(to))).collect();
+        let this = std::ptr::from_ref(self) as usize;
+        wide_each(parts.len(), move |i| {
+            // SAFETY: `wide_each` returns when every part is done, before
+            // the borrow of `self` ends. The parts lie apart.
+            let this = unsafe { &*(this as *const Shadow) };
+            let (a, b) = parts[i];
+            this.copy_changed_part(a, b);
+        });
+    }
+
+    /// [`Shadow::copy_changed`] of one part, on this thread.
+    fn copy_changed_part(&self, from: usize, to: usize) {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let (mut same, mut new) = (0u64, 0u64);
+        TITLE.with_borrow_mut(|title| {
+            title.resize(KERNEL_PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                let n = next - at;
+                let title = &mut title[..n];
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // nothing else reads or writes there: no shader's range holds
+                // it (`update_free`), and the parts lie apart.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                if title == held {
+                    same += n as u64;
+                } else {
+                    new += n as u64;
+                    held.copy_from_slice(title);
+                    self.changed(at - start, next - start);
+                    self.card_changed(at - start, next - start);
+                }
+                at = next;
+            }
+        });
+        WHOLE_CHANGED[0].fetch_add(same, Ordering::Relaxed);
+        WHOLE_CHANGED[1].fetch_add(new, Ordering::Relaxed);
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
