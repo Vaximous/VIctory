@@ -1733,6 +1733,27 @@ pub(crate) fn targets_room_kept() -> u64 {
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    // Once they have not grown by 64 MiB for 30 seconds, nothing more is
+    // kept (`VICTORY_TARGETS_ROOM_SETTLES=0`: kept for the whole run): on a
+    // Series S the targets came to 1,300 MB and the rest of the 3,072 MB
+    // stayed kept for the whole run, the textures had no room, and 4 GB of
+    // the pool's blocks lay free beside them (run fox-lap 9o1).
+    const GROWTH: u64 = 64 << 20;
+    const SETTLED_MS: u64 = 30_000;
+    // The bytes at the last growth, and when.
+    static GREW: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    if crate::toggled!("VICTORY_TARGETS_ROOM_SETTLES") {
+        let now = crate::host::now_ms();
+        let mut grew = GREW.lock().unwrap_or_else(|e| e.into_inner());
+        if targets > grew.0 + GROWTH || grew.1 == 0 {
+            *grew = (targets, now);
+        } else if targets < grew.0 {
+            grew.0 = targets;
+        }
+        if now.saturating_sub(grew.1) > SETTLED_MS && targets >= 256 << 20 {
+            return 0;
+        }
+    }
     most.saturating_sub(targets)
 }
 
@@ -2092,21 +2113,16 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
-        if bytes >= most {
-            break;
-        }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
+    // Lets go of the host copy of `at` if nothing has used it for
+    // `idle_ms` and no list or slot holds it: its bytes.
+    let let_go = |at: usize, idle_ms: u64| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
         if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
+            return None;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2125,17 +2141,66 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
-            }
-            crate::host::retire(host);
+        let (host, _) = gone?;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        let bytes = host.bytes;
+        crate::host::retire(host);
+        Some(bytes)
+    };
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
+        if bytes >= most {
+            break;
         }
+        looked += 1;
+        if part == PART {
+            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        }
+        if let Some(b) = let_go(at, idle_ms) {
+            went += 1;
+            bytes += b;
+            first.get_or_insert(at);
+        }
+    }
+    // The card past its budget with the pool's blocks full of holes: the
+    // textures of the emptiest blocks go although they were used a second
+    // ago (`compact_bytes`), so those blocks empty and go; shown again,
+    // each comes back into a fuller block (`crate::draw`'s textures wanted
+    // back). Without it the blocks of run fox-lap 9o1 held 4,100 MB free
+    // in holes over the whole run beside 4,500 MB of textures, all of them
+    // on the card, which stood 1.1 GB past its budget.
+    let compact = compact_bytes(memory);
+    if compact > 0 {
+        let mut sparse: Vec<(u64, usize)> = Vec::new();
+        for &at in all.iter() {
+            // SAFETY: as in `let_go`.
+            let r = unsafe { &*(at as *const Resource) };
+            let used = r.host.used.load(Relaxed);
+            if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, COMPACT_IDLE_MS, IDLE_FRAMES) {
+                continue;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = made.as_ref().and_then(|(host, _)| crate::pool::block_held(&host.texture))
+                && held < crate::pool::BLOCK / 2
+            {
+                sparse.push((held, at));
+            }
+        }
+        sparse.sort_unstable();
+        let mut moved = 0u64;
+        for &(_, at) in &sparse {
+            if moved >= compact {
+                break;
+            }
+            if let Some(b) = let_go(at, COMPACT_IDLE_MS) {
+                went += 1;
+                moved += b;
+                first.get_or_insert(at);
+            }
+        }
+        bytes += moved;
+        COMPACTED.fetch_add(moved, Relaxed);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -2149,6 +2214,37 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// How long a texture must have gone unused before [`let_go_idle`] lets it
+/// go to empty a block (at least the frames of the lists in the air).
+#[cfg(windows)]
+const COMPACT_IDLE_MS: u64 = 1000;
+
+/// Bytes of textures [`let_go_idle`] lets go of since the start to empty
+/// the pool's blocks, for the memory line.
+#[cfg(windows)]
+pub(crate) static COMPACTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many bytes of textures in the emptiest blocks of the pool a look of
+/// [`let_go_idle`] lets go of: while the card is past 97 % of its budget
+/// and the blocks hold more than 256 MiB free, up to 128 MiB a look, none
+/// beyond what is free (`VICTORY_POOL_COMPACT=0`: none).
+#[cfg(windows)]
+fn compact_bytes(memory: Option<[u64; 4]>) -> u64 {
+    const SLACK: u64 = 256 << 20;
+    const A_LOOK: u64 = 128 << 20;
+    if !crate::toggled!("VICTORY_POOL_COMPACT") {
+        return 0;
+    }
+    let Some([budget, used, ..]) = memory else {
+        return 0;
+    };
+    let free = crate::pool::texture_room();
+    if used <= budget / 100 * 97 || free <= SLACK {
+        return 0;
+    }
+    (free - SLACK).min(A_LOOK)
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the

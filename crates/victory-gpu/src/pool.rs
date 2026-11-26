@@ -27,7 +27,7 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
-const BLOCK: u64 = 64 << 20;
+pub(crate) const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.

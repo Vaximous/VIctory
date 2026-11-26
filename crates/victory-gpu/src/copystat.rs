@@ -827,6 +827,11 @@ fn log_memory() {
             buffers >> 20,
             used.saturating_sub(named) >> 20
         );
+        tracing::info!(
+            "textures let go to empty the pool's blocks since the start (VICTORY_POOL_COMPACT): {} MB; room kept              for render targets now: {} MB",
+            crate::resource::COMPACTED.load(Relaxed) >> 20,
+            crate::resource::targets_room_kept() >> 20
+        );
         let [all, shared, spanned] = crate::resource::targets_shared();
         tracing::info!(
             "render targets with a host copy: {} MB; of them {} MB in title memory other targets overlap; the title              memory they span: {} MB (what they would take laid over each other as the title lays them)",
