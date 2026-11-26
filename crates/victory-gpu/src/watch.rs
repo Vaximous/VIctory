@@ -1475,11 +1475,14 @@ fn guards_bare() -> std::sync::MutexGuard<'static, Guards> {
 /// lock let go ([`guard`]): the lock is taken to choose them and to note
 /// them, and the protection is changed between, beside the title's faults
 /// and the other refreshes (some 23 ms a frame of all threads' waiting for
-/// the lock, most of it behind such changes). `VICTORY_GUARD_APART=0`: under
-/// the lock, as before.
+/// the lock, most of it behind such changes). Off by default
+/// (`VICTORY_GUARD_APART=1` turns it on): in a moving open-world run it made
+/// the frames slower, not faster (1,080 blocks made read-only a frame
+/// instead of about 600, and longer waits for the lock: blocks a fault notes
+/// are not clean, and are taken again).
 fn guard_apart() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_APART").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_APART").is_some_and(|v| v == "1"))
 }
 
 /// Blocks being made read-only with the lock let go ([`guard_apart`]): set
