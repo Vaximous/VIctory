@@ -387,6 +387,8 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     pages: usize,
+    /// Made with `SEC_COMMIT`: every page is committed already.
+    whole: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -420,6 +422,9 @@ impl Section {
         if base == 0 {
             return None;
         }
+        if self.whole {
+            return Some(base + index * PAGE);
+        }
         let missing = |page: usize| self.committed[page / 64].load(Ordering::Acquire) >> (page % 64) & 1 == 0;
         let mut page = index;
         while page < index + n {
@@ -448,6 +453,9 @@ impl Section {
     /// all of them are ([`lean`]): committed for one view is for all.
     fn commit_shown(&self, index: usize, base: usize, len: usize) -> bool {
         use std::sync::atomic::Ordering;
+        if self.whole {
+            return true;
+        }
         let pages = index..(index + len / PAGE).min(self.pages);
         let bit = |p: usize| (&self.committed[p / 64], 1 << (p % 64));
         let done = || {
@@ -642,55 +650,65 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    // With the pool committed (`victory_gpu::pool_committed`, for title
+    // memory in place) the pages are cut into sections of
+    // `pool_chunk_pages` each, so that the GPU side opens as a heap only
+    // the sections that hold something it reads in place; one view never
+    // crosses two sections (`XMemMapPhysicalPages` cuts its runs there).
+    let committed_pool = victory_gpu::pool_committed() && !on_wine();
+    let chunk = if committed_pool { pool_chunk_pages().min(n) } else { n };
+    let mut sections: Vec<Arc<Section>> = Vec::with_capacity(n.div_ceil(chunk));
+    let mut from = 0;
+    while from < n {
+        let pages_here = chunk.min(n - from);
+        let size = pages_here * PAGE;
+        // Committed only while the host keeps its headroom after it.
+        let whole = on_wine() || committed_pool && commit_headroom(size);
+        let Some(handle) = section_of(size, whole) else {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // Sections made so far are dropped with the vector.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        // For the GPU side's in-place census: only a committed section can
+        // be opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, size as u64, whole);
+        sections.push(Arc::new(Section {
+            handle,
+            pages: pages_here,
+            whole,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages_here.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }));
+        from += pages_here;
+    }
+    if committed_pool {
+        let made = sections.iter().filter(|s| s.whole).count();
+        tracing::info!(
+            n,
+            sections = sections.len(),
+            committed = made,
+            commit = %commit_numbers(),
+            "physical pages: the pool's sections made committed while the host keeps its headroom (VICTORY_POOL_COMMIT)"
+        );
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index / chunk].clone(),
+            index: index % chunk,
         };
         table.pages.insert(first + index * FRAMES, slice);
     }
@@ -702,6 +720,73 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
+}
+
+/// A pagefile-backed section of `size` bytes: committed whole (`whole`), or
+/// reserved, its pages committed when first mapped or written (`commit`):
+/// the title asks for 6.1 GiB at once, which a busy host often cannot
+/// commit (error 1450). Under Wine a committed section is a sparse file,
+/// free until touched, and committing a reserved one page by page costs a
+/// wineserver request each that scans every range committed so far, so
+/// there it is always whole. A committed section the host refuses is made
+/// reserved instead.
+fn section_of(size: usize, whole: bool) -> Option<HANDLE> {
+    let make = |kind: u32| {
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | kind,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        (!handle.is_null()).then_some(handle)
+    };
+    if whole {
+        if let Some(handle) = make(SEC_COMMIT) {
+            return Some(handle);
+        }
+        tracing::warn!(size, error = %std::io::Error::last_os_error(), "a committed section of physical pages was refused: reserved instead");
+    }
+    make(SEC_RESERVE)
+}
+
+/// Pages per section of a committed pool (`VICTORY_POOL_CHUNK_MB`, 256).
+fn pool_chunk_pages() -> usize {
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_POOL_CHUNK_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(256);
+        (mb.max(1) * MIB / PAGE).max(1)
+    });
+    *PAGES
+}
+
+/// The host's commit: in use and limit, in bytes.
+fn commit_now() -> Option<(u64, u64)> {
+    let mut info = PERFORMANCE_INFORMATION { cb: size_of::<PERFORMANCE_INFORMATION>() as u32, ..Default::default() };
+    // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+    let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+    queried.then(|| ((info.CommitTotal * info.PageSize) as u64, (info.CommitLimit * info.PageSize) as u64))
+}
+
+/// "in use of limit" in MB, for the log.
+fn commit_numbers() -> String {
+    match commit_now() {
+        Some((total, limit)) => format!("{} MB of {} MB committed on the host", total >> 20, limit >> 20),
+        None => "host commit unknown".to_owned(),
+    }
+}
+
+/// Whether committing `size` bytes more leaves the host at least
+/// `VICTORY_POOL_COMMIT_FREE_MB` (8192) under its commit limit: a run that
+/// came near the limit froze the whole PC.
+fn commit_headroom(size: usize) -> bool {
+    static FREE: LazyLock<u64> = LazyLock::new(|| {
+        std::env::var("VICTORY_POOL_COMMIT_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8192) << 20
+    });
+    commit_now().is_some_and(|(total, limit)| total + size as u64 + *FREE <= limit)
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of

@@ -5019,8 +5019,24 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// goes when no list and no slot holds it any more. Returns how many.
 pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
+    // Looked at under the readers' locks first: the title maps pages
+    // hundreds of times a frame, and taking the buffers' map to be changed
+    // makes every recording thread forget what it found there ([`FOUND`]).
+    let in_loose = LOOSE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+        .any(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at);
+    let in_buffers = buffers_read()
+        .range(..(end, 0))
+        .rev()
+        .take(256)
+        .any(|(_, entry)| entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()));
+    if !in_loose && !in_buffers {
+        return 0;
+    }
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
-    {
+    if in_loose {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
@@ -5029,7 +5045,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
-    {
+    if in_buffers {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
@@ -5139,7 +5155,23 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        // With in-place level 3: also those up to `VICTORY_INPLACE_CARD_KB`
+        // that would have a card copy (none by default: the card reads its
+        // own memory faster than the PC's over the bus).
+        let small = big && crate::inplace::level() >= 3 && size <= inplace_card_most();
+        if (!big || small) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
+        let on_card = card_for(size);
+        // Level 3: a buffer the card had no room for is in place, not a
+        // copy in the PC's memory, which the card would read over the bus
+        // all the same.
+        if on_card.is_none()
+            && big
+            && crate::inplace::level() >= 3
+            && let Some(placed) = crate::inplace::place_for(key.0, len, false)
+        {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
@@ -5147,7 +5179,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -5394,6 +5426,14 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     Some(shadow)
+}
+
+/// With in-place level 3, title buffers up to this many bytes are in place
+/// even where they would have a copy in the card's memory
+/// (`VICTORY_INPLACE_CARD_KB`; 0, none, by default).
+fn inplace_card_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_CARD_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 10)
 }
 
 /// Copies of title memory outside buffers, by (start, length).
