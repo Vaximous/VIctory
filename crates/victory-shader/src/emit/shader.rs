@@ -586,7 +586,7 @@ impl Shader {
         let at = self.m.bin(block, super::bitcode::Bin::Shl, at, two);
         let fu = self.m.undef(f32t);
         let (void, mask) = (self.t.void, self.m.i8(1));
-        self.op(
+        let store = self.op(
             block,
             "rawBufferStore.f32",
             Attr::NoUnwind,
@@ -594,6 +594,9 @@ impl Shader {
             140,
             &[touched, at, iu, frame, fu, fu, fu, mask, align],
         );
+        // (Only these stores write there, all the same epoch: one that every path has
+        // made already is left out.)
+        self.m.tag(store, super::bitcode::Tag::Repeat);
     }
 
     /// The finished container.

@@ -14,7 +14,7 @@ pub mod opt;
 pub(crate) struct Ty(u32);
 
 /// What the lowering made an instruction for, where it says so (counted by
-/// [`census`], nothing else reads it).
+/// [`census`]; the optimiser reads [`Tag::Repeat`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tag {
     /// The select that keeps a register's old value in lanes a guard masks.
@@ -23,6 +23,9 @@ pub(crate) enum Tag {
     Clamp,
     /// The iteration counter and limit test the translation adds to a loop.
     Counter,
+    /// A store that, repeated with the same operands, changes nothing (nothing else
+    /// writes there): the optimiser drops one below another in the dominator tree.
+    Repeat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -377,10 +380,10 @@ impl Module {
     }
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
-    /// are counted.
+    /// are counted, or for the optimiser.
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (tag == Tag::Repeat || census::enabled())
         {
             self.tags.insert(i, tag);
         }

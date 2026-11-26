@@ -15,7 +15,8 @@
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
 //!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   again, a register read as a float again). So does a store tagged
+//!   `Tag::Repeat` (one that changes nothing when made again): it is left out.
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
@@ -33,7 +34,7 @@
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
+    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Tag, Term, Ty, TypeDef, V, for_each_operand, pred,
     successors,
 };
 
@@ -893,6 +894,19 @@ impl Module {
                     repl[i as usize] = Some(v);
                     changed = true;
                     continue;
+                }
+                // A store that changes nothing when repeated: the same one every
+                // path here has made already.
+                if passes & REUSE != 0
+                    && self.tags.get(&i) == Some(&Tag::Repeat)
+                    && let Some(key) = self.key(i)
+                {
+                    if known.contains_key(&key) {
+                        changed = true;
+                        continue;
+                    }
+                    known.insert(key.clone(), V::Inst(i));
+                    added.push(key);
                 }
                 let class = self.class(&effects, i);
                 if passes & REUSE != 0
