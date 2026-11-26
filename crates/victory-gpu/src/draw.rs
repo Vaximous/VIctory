@@ -3170,7 +3170,15 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // A native replacement checked against its translation
+        // (`crate::native`): what the binding declares written is saved.
+        let checked = p.translated_twin.is_some() && crate::native::check_due(&p.name);
+        let (bound, writes) = if checked {
+            crate::native::collecting(|| self.bind(list, p, true))
+        } else {
+            (self.bind(list, p, true), Vec::new())
+        };
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3203,8 +3211,36 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        let check = match &p.translated_twin {
+            Some(twin) if checked && size.is_none() => {
+                crate::native::Check::begin(list, &p.name, [x, y, z], writes).and_then(|c| {
+                    // The translation first, on the same input, then the
+                    // input put back for the replacement.
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    if !self.bind(list, p, true) {
+                        return None;
+                    }
+                    // SAFETY: an open list; the twin has the same root signature.
+                    unsafe {
+                        list.list.SetPipelineState(twin);
+                        list.list.Dispatch(x, y, z);
+                    }
+                    c.translated_ran(list);
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    self.bind(list, p, true).then_some(c)
+                })
+            }
+            _ => None,
+        };
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if let Some(c) = check {
+            c.native_ran(list);
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)

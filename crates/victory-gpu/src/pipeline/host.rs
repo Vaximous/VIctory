@@ -398,6 +398,9 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// With a native replacement in check mode (`crate::native`): the same
+    /// compute pipeline with the translated code, run beside it once.
+    pub(crate) translated_twin: Option<ID3D12PipelineState>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -415,6 +418,26 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        // Native replacements (`crate::native`): made with them first; a
+        // pipeline the host refuses with them is made from the translations.
+        let native = crate::native::on()
+            && shaders.iter().any(|s| s.translated().is_some_and(|t| t.native.is_some()));
+        if native {
+            match Self::make(shaders, g, true) {
+                Some(mut p) => {
+                    tracing::info!(?shaders, "host pipeline with native replacements");
+                    if p.compute && crate::native::check() {
+                        p.translated_twin = Self::make(shaders, g, false).map(|t| t.pso);
+                    }
+                    return Some(p);
+                }
+                None => tracing::warn!(?shaders, "host pipeline refused with native replacements; made from the translations"),
+            }
+        }
+        Self::make(shaders, g, false)
+    }
+
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, native: bool) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -602,9 +625,12 @@ impl HostPipeline {
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                |t| {
+                    let dxil = match &t.native {
+                        Some(n) if native => &n[..],
+                        _ => &t.host.dxil[..],
+                    };
+                    D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }
                 },
             )
         };
@@ -644,6 +670,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                translated_twin: None,
             });
         }
         let Some(g) = g else {
@@ -697,6 +724,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                translated_twin: None,
             });
         }
 
@@ -840,6 +868,7 @@ impl HostPipeline {
                     b.RenderTargetWriteMask
                 )
             },
+            translated_twin: None,
         })
     }
 }

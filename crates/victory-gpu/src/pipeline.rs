@@ -139,6 +139,9 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// A native replacement of `host.dxil` with the same bindings
+    /// (`crate::native`), when one is in the native directory.
+    pub(crate) native: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 #[cfg(windows)]
@@ -148,7 +151,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container).map(|mut t| {
+                    t.native = crate::native::replacement(self.stage, &self.hash);
+                    t
+                });
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -232,6 +238,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         stores,
         stores_by_address,
         picks: Default::default(),
+        native: None,
     })
 }
 

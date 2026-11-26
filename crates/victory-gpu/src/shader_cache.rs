@@ -24,6 +24,7 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
+    crate::native::beside_cache(&dir);
     match Cache::open(dir) {
         Ok(cache) => {
             let _ = CACHE.set(cache);
