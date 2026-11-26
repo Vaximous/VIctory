@@ -87,16 +87,18 @@ fn chain_priority() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_CHAIN_PRIORITY"))
 }
 
-/// `VICTORY_CCD_SPLIT=1`, on a processor whose cores share two or more last
-/// caches (dies): the title's threads and ours a frame waits for one by one
-/// keep to the first die, the pools of ours (lists translated, landing,
-/// views, the wide jobs) to the others. A preference the system keeps
-/// unless nothing of it is free.
+/// On a processor whose cores share two or more last caches (dies): the
+/// title's threads and ours a frame waits for one by one keep to the first
+/// die, the pools of ours (lists translated, landing, views, the wide jobs)
+/// to the others (`VICTORY_CCD_SPLIT=0`: anywhere, as before). A preference
+/// the system keeps unless nothing of it is free. On a 7900X, frames
+/// 1000-3000 of the same scene: preparing 46 to 35 ms, frames 55.4 to 53.2
+/// ms in two pairs of runs each on two builds.
 fn split() -> Option<&'static (Vec<u32>, Vec<u32>)> {
     static SPLIT: std::sync::OnceLock<Option<(Vec<u32>, Vec<u32>)>> = std::sync::OnceLock::new();
     SPLIT
         .get_or_init(|| {
-            if !crate::switch::on("VICTORY_CCD_SPLIT") {
+            if std::env::var_os("VICTORY_CCD_SPLIT").is_some_and(|v| v == "0") {
                 return None;
             }
             let sets = cpu_sets_with_cache();
