@@ -760,6 +760,25 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// ([`HostHeap::evict_untouched`]), and their textures' bytes.
 pub(crate) static EVICTED_UNTOUCHED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Frames of few draws (a loading screen, the menus before the world):
+/// the texture pass then takes four times the bytes and time a frame, and
+/// textures get their finer levels back faster (`crate::resource`), so the
+/// world starts with what it shows uploaded. `VICTORY_LOAD_STREAM=0`: no.
+static LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The frame line's draws a frame, for [`loading`]: under 1,500 counts
+/// as loading (the world draws 3,000 and more).
+pub(crate) fn set_loading(draws: f64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_LOAD_STREAM").is_none_or(|v| v != "0"));
+    LOADING.store(on && draws < 1500.0, Ordering::Relaxed);
+}
+
+/// Whether frames are a loading screen's ([`set_loading`]).
+pub(crate) fn loading() -> bool {
+    LOADING.load(Ordering::Relaxed)
+}
+
 /// Textures smaller than this keep their host copies (the smallest levels
 /// of what is evicted stay on the card as small textures do).
 const EVICT_KEEP: u64 = 256 << 10;
@@ -2719,6 +2738,7 @@ impl State {
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let (per_frame, span) = if loading() { (per_frame * 4, span * 4) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)

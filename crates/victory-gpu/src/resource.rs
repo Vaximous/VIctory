@@ -1232,6 +1232,8 @@ struct Hosted {
     floor: std::sync::atomic::AtomicU32,
     shed_at: std::sync::atomic::AtomicU64,
     guard_ms: std::sync::atomic::AtomicU64,
+    /// Its first host copy was capped to its coarse levels ([`coarse_first`]).
+    capped: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1404,11 +1406,13 @@ fn shed_levels(memory: Option<[u64; 4]>) {
         return;
     }
     let used = used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
-    const HIGH: u64 = 92;
-    const LOW: u64 = 85;
-    const BACK: u64 = 80;
+    // A steady band, not a reaction to a full card: finest levels go above
+    // 80% (down to 77%), and come back level by level under 75%.
+    const HIGH: u64 = 80;
+    const LOW: u64 = 77;
+    const BACK: u64 = 75;
     const SHED_MOST: u64 = 512 << 20;
-    const BACK_MOST: u64 = 256 << 20;
+    let back_most: u64 = if crate::draw::loading() { 1024 << 20 } else { 256 << 20 };
     const KEEP: u64 = 256 << 10;
     const GUARD_MS: u64 = 10_000;
     const GUARD_MOST_MS: u64 = 160_000;
@@ -1477,7 +1481,7 @@ fn shed_levels(memory: Option<[u64; 4]>) {
     } else {
         // The most lately used first.
         found.sort_unstable_by(|a, b| b.cmp(a));
-        let room = (budget * BACK / 100).saturating_sub(used).min(BACK_MOST);
+        let room = (budget * BACK / 100).saturating_sub(used).min(back_most);
         for &(_, at) in &found {
             if moved >= room {
                 break;
@@ -1486,7 +1490,9 @@ fn shed_levels(memory: Option<[u64; 4]>) {
             let r = unsafe { &*(at as *const Resource) };
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let bytes = made.as_ref().map_or(0, |(host, _)| host.bytes);
-            r.host.floor.store(0, Relaxed);
+            // One level finer at a time: coarse to fine.
+            let floor = r.host.floor.load(Relaxed);
+            r.host.floor.store(floor.saturating_sub(1), Relaxed);
             // Back soon after it was shed: kept longer next time.
             let guard = r.host.guard_ms.load(Relaxed);
             let soon = now_ms < r.host.shed_at.load(Relaxed) + guard.max(GUARD_MS) * 2;
@@ -1503,11 +1509,30 @@ fn shed_levels(memory: Option<[u64; 4]>) {
             }
             drop(made);
             crate::descriptor::host::levels_changed(r.data() as u64);
-            // About what the whole one takes again.
+            // A level finer takes about four times the bytes.
             moved += bytes * 3;
             SHED[2].fetch_add(1, Relaxed);
         }
     }
+}
+
+/// The first level a placed texture's first host copy holds, from `base`
+/// on: its coarse levels, up to 512 by 512 texels, and finer ones only as the
+/// card has room for them ([`shed_levels`]): the chain whole for every
+/// texture filled the card at once (`VICTORY_COARSE_FIRST=0`: whole, as
+/// before).
+#[cfg(windows)]
+fn coarse_first(desc: &ResourceDesc, base: u32) -> u32 {
+    const MOST: u64 = 512 * 512;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_COARSE_FIRST").is_none_or(|v| v != "0")) {
+        return base;
+    }
+    let mut level = base;
+    while (desc.width >> level) * u64::from(desc.height >> level) > MOST && base_level(desc, level + 1) == level + 1 {
+        level += 1;
+    }
+    level
 }
 
 /// Since the start: host copies that gave up their finest level
@@ -1769,6 +1794,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
+            }
+            // A texture's first host copy holds its coarse levels alone
+            // ([`coarse_first`]); the finer come with room ([`shed_levels`]).
+            if !r.host.capped.swap(true, Relaxed) {
+                let coarse = coarse_first(&r.desc, base);
+                if coarse > base {
+                    r.host.floor.fetch_max(coarse, Relaxed);
+                }
             }
             // Shed levels stay shed ([`shed_levels`]).
             let floor = r.host.floor.load(Relaxed);
@@ -3105,6 +3138,7 @@ fn hand_out_resource(
             floor: std::sync::atomic::AtomicU32::new(0),
             shed_at: std::sync::atomic::AtomicU64::new(0),
             guard_ms: std::sync::atomic::AtomicU64::new(0),
+            capped: std::sync::atomic::AtomicBool::new(false),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
     });
