@@ -70,7 +70,8 @@ pub const SLOT_TOUCHED: u8 = 251;
 /// View-heap slots [`SLOT_TOUCHED`] has a dword for.
 pub const SLOT_TOUCHED_SLOTS: u32 = 1 << 20;
 
-/// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 (default) every stage notes the view-heap slots it
+/// `VICTORY_SLOT_FEEDBACK`: 0 off (the default: nothing uses it while eviction by it is off,
+/// and a moving open-world run was slower with it); 1 every stage notes the view-heap slots it
 /// reads through ([`SLOT_TOUCHED`]); 2 every stage but pixel programs (a store in a pixel
 /// program may cost the early depth test). Off by default in this crate's own tests,
 /// whose runners bind no buffer there.
@@ -80,8 +81,7 @@ pub fn slot_feedback() -> u8 {
         Ok("0") => 0,
         Ok("1") => 1,
         Ok("2") => 2,
-        _ if cfg!(test) => 0,
-        _ => 1,
+        _ => 0,
     })
 }
 

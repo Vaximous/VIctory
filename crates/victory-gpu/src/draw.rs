@@ -765,10 +765,13 @@ pub(crate) static EVICTED_UNTOUCHED: [AtomicU64; 2] = [AtomicU64::new(0), Atomic
 const EVICT_KEEP: u64 = 256 << 10;
 
 /// Whether textures no shader reads are evicted without room
-/// (`VICTORY_EVICT_UNTOUCHED=0`: no).
+/// (`VICTORY_EVICT_UNTOUCHED=1`, with `VICTORY_SLOT_FEEDBACK` on). Off by
+/// default: in a moving open-world run it emptied 18,000 slots (17.8 GB) in
+/// five minutes and made most of them again, 1,100 uploads (395 MB) a frame:
+/// slots in use looked unread to the feedback.
 fn evict_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_UNTOUCHED").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_UNTOUCHED").is_some_and(|v| v == "1"))
 }
 
 /// Feedback epochs a slot goes unread before it is evicted
