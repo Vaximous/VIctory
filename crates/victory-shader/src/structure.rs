@@ -249,6 +249,11 @@ impl Bools {
 
     /// [`Self::meet_seen`] with `budget` case splits.
     fn meet_within(&self, all: &[(Bool, bool)], mut budget: usize, seen: &mut Meets) -> bool {
+        // A condition asked to hold and to fail: no lane, whatever the search's budget (a
+        // large function would use it up and answer "maybe" for `x and not x`).
+        if all.iter().any(|&(b, holds)| all.iter().any(|&(c, other)| c == b && other != holds)) {
+            return false;
+        }
         let mut work = all
             .iter()
             .map(|&(b, holds)| b.0 << 1 | u32::from(holds))
@@ -1522,7 +1527,9 @@ mod tests {
                         assert_eq!(mine, left, "{all:?} within {budget}");
                     }
                 }
-                assert_eq!(b.meet_within(&all, budget, &mut seen), anew);
+                // (A condition asked to hold and to fail is answered whatever the budget.)
+                let contradiction = all.iter().any(|&(x, h)| all.contains(&(x, !h)));
+                assert_eq!(b.meet_within(&all, budget, &mut seen), anew && !contradiction);
                 if !anew {
                     none += 1;
                 } else if meet_anew(&b, all.clone(), &mut usize::MAX.clone()) {

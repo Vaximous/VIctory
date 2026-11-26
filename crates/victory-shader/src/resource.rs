@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
@@ -363,10 +363,20 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                out.waterfall.loads.extend(loads);
+            }
+            Err(why) => {
+                if std::env::var_os("VICTORY_WATERFALL_WHY").is_some() {
+                    eprintln!(
+                        "WATERFALL-WHY at {:#x}: {why}",
+                        t.inst((block, accesses[0])).machine.offset
+                    );
+                }
+            }
         }
     }
     out.lane_copied = t.lane_copied.take();
@@ -378,6 +388,13 @@ pub fn track(
         .filter_map(|d| t.root_indexed_view(d, &out.scalar))
         .collect();
     Ok(out)
+}
+
+/// `VICTORY_WATERFALL_FORM=0`: a waterfall loop's retry is proven by the lane
+/// masks alone, as before (a loop inside a lane branch then stays a loop).
+fn retry_by_form() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATERFALL_FORM").is_none_or(|v| v != "0"))
 }
 
 /// A dword after copy propagation.
@@ -2070,6 +2087,7 @@ impl<'a> Tracer<'a> {
         let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
+        let mut narrowed = false;
         for (i, inst) in block.insts[..access].iter().enumerate() {
             let Fields::Valu(f) = &inst.fields else {
                 continue;
@@ -2114,6 +2132,7 @@ impl<'a> Tracer<'a> {
             let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
                 continue;
             };
+
             if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
                 let code = if inst.name().starts_with("v_cmpx_") {
                     EXEC
@@ -2128,6 +2147,21 @@ impl<'a> Tracer<'a> {
                 if meet(&[reach, (selected, true), (matched, false)]) {
                     continue;
                 }
+                // By the code's form: a `v_cmpx` that narrows the EXEC of the
+                // first-lane reads to the matches, and the access runs under
+                // what it leaves. Then the access is exactly the remaining
+                // lanes that match, which the search over large masks may not
+                // find out within its budget.
+                let words: u8 = if self.p.wave64 { 2 } else { 1 };
+                let read_exec = |at: &Inst| (0..words).map(|k| at.read(Reg::S(EXEC + k))).collect::<Option<Vec<_>>>();
+                if retry_by_form()
+                    && inst.name().starts_with("v_cmpx_")
+                    && matched == selected
+                    && read_exec(inst).is_some()
+                    && read_exec(inst) == read_exec(self.inst(first))
+                {
+                    narrowed = true;
+                }
                 required.push((matched, true));
                 out.compares.push((b, i));
                 for x in xs {
@@ -2137,18 +2171,28 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
+        // (one compare: the lanes match on the one dword it reads)
+        let narrowed = narrowed && out.compares.len() == 1;
         if reads.iter().any(|v| !out.reads.contains(v))
-            || meet(&[reach, (selected, true), (remaining, false)])
+            || !narrowed && meet(&[reach, (selected, true), (remaining, false)])
         {
             return Err(SELECT);
         }
         // The access must take every match.
         required.extend([reach, (selected, false)]);
-        if meet(&required) {
+        if !narrowed && meet(&required) {
             return Err(SELECT);
         }
         // The retry must keep exactly the lanes that were eligible but did
         // not perform the access.
+        // By the code's form first: the retry clears the access's lanes from
+        // a "to do" mask that is EXEC itself on every pass (both joins at the
+        // loop's head take the same mask on entry and the retry's on the back
+        // edge). The lane masks cannot say that where the loop sits in a
+        // lane branch: its two joins are two unknowns there.
+        if retry_by_form() && self.todo_is_exec(b, access, first) {
+            return Ok(out);
+        }
         if meet(&[reach, (retry, true), (remaining, false)])
             || meet(&[reach, (retry, true), (selected, true)])
             || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
@@ -2156,6 +2200,116 @@ impl<'a> Tracer<'a> {
             return Err(RETRY);
         }
         Ok(out)
+    }
+
+    /// Whether the waterfall loop that is block `b` (one block, closed by
+    /// `s_cbranch_execnz` back to itself) retries with exactly the lanes that
+    /// were active at its first-lane read `first` and did not take the access
+    /// at `access`: EXEC is set by `s_andn2_wrexec todo, todo` (or
+    /// `s_andn2 todo, todo, exec` and `s_mov exec, todo`) under the access's
+    /// EXEC, and `todo` and EXEC are joins at the loop's head with the same
+    /// value on every edge into the loop and the retry's on the back edge.
+    fn todo_is_exec(&self, b: usize, access: usize, first: Site) -> bool {
+        let block = &self.p.blocks[b];
+        let n = block.insts.len();
+        if n < 2 || first.0 != b {
+            return false;
+        }
+        let words: u8 = if self.p.wave64 { 2 } else { 1 };
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let exec_at = |i: usize| -> Option<Vec<Value>> {
+            (0..words).map(|k| block.insts[i].read(Reg::S(EXEC + k))).collect()
+        };
+        // The retry: its EXEC write and the "to do" register.
+        let last = n - 2;
+        let (w, todo) = {
+            let inst = &block.insts[last];
+            let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), src, .. } = &inst.fields else {
+                return false;
+            };
+            if inst.name() == format!("s_andn2_wrexec{width}")
+                && matches!(src.first(), Some(&Operand::Scalar { code: s, .. }) if s == *code)
+            {
+                (last, *code)
+            } else if inst.name() == format!("s_mov{width}")
+                && *code == EXEC
+                && last > 0
+                && let Some(&Operand::Scalar { code: t, .. }) = src.first()
+                && let andn2 = &block.insts[last - 1]
+                && andn2.name() == format!("s_andn2{width}")
+                && let Fields::Sop { dst: Some(Operand::Scalar { code: d, .. }), src: s2, .. } = &andn2.fields
+                && *d == t
+                && matches!(s2.first(), Some(&Operand::Scalar { code: a, .. }) if a == t)
+                && matches!(s2.get(1), Some(&Operand::Scalar { code: e, .. }) if e == EXEC)
+            {
+                // the EXEC the clear reads is the one the access ran under
+                if exec_at(last - 1) != exec_at(access) {
+                    return false;
+                }
+                (last, t)
+            } else {
+                return false;
+            }
+        };
+        let retry = &block.insts[w];
+        // Nothing between the access and the retry changes EXEC.
+        let wrexec = retry.name().contains("wrexec");
+        let clear_at = if wrexec { w } else { w - 1 };
+        if exec_at(clear_at) != exec_at(access) || access >= clear_at {
+            return false;
+        }
+        let first_exec = (0..words)
+            .map(|k| self.inst(first).read(Reg::S(EXEC + k)))
+            .collect::<Option<Vec<_>>>();
+        let Some(first_exec) = first_exec else {
+            return false;
+        };
+        let clear = &block.insts[clear_at];
+        for k in 0..words {
+            let Some(todo_in) = clear.read(Reg::S(todo + k)) else {
+                return false;
+            };
+            let phi = |v: Value, reg: Reg| block.phis.iter().find(|p| p.value == v && p.reg == reg);
+            let (Some(tp), Some(ep)) = (phi(todo_in, Reg::S(todo + k)), phi(first_exec[k as usize], Reg::S(EXEC + k)))
+            else {
+                return false;
+            };
+            let (Some(back_todo), Some(back_exec)) = (retry.write(Reg::S(todo + k)), retry.write(Reg::S(EXEC + k)))
+            else {
+                // (the s_mov form writes EXEC only; the "to do" mask is the clear's)
+                if wrexec {
+                    return false;
+                }
+                let (Some(bt), Some(be)) = (clear.write(Reg::S(todo + k)), retry.write(Reg::S(EXEC + k))) else {
+                    return false;
+                };
+                if !self.joins_agree(block, tp, ep, b, bt, be) {
+                    return false;
+                }
+                continue;
+            };
+            if !self.joins_agree(block, tp, ep, b, back_todo, back_exec) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Joins `todo` and `exec` at the head of loop block `b`: the same mask
+    /// on every edge from outside, `back_todo` and `back_exec` (the same
+    /// mask) on the back edge.
+    fn joins_agree(&self, block: &Block, todo: &Phi, exec: &Phi, b: usize, back_todo: Value, back_exec: Value) -> bool {
+        if block.preds.is_empty() || todo.args.len() != block.preds.len() || exec.args.len() != block.preds.len() {
+            return false;
+        }
+        block.preds.iter().enumerate().all(|(k, &p)| {
+            let (t, e) = (todo.args[k], exec.args[k]);
+            if p == b {
+                t == back_todo && e == back_exec
+            } else {
+                t == e || self.origin(t) == Term::Value(e) || self.origin(t) == self.origin(e)
+            }
+        })
     }
 
     /// Consecutive dwords of one scalar load.
@@ -3410,6 +3564,29 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] inside a lane branch (lanes below 16),
+    /// as the title's decal classifier has a dozen of them: the loop's "to do"
+    /// mask and EXEC are two joins at its head that the lane masks cannot
+    /// relate, so the retry is proven by the code's form.
+    #[test]
+    fn the_console_waterfall_inside_a_lane_branch_is_one() {
+        let base = WATERFALL_INDEXED_WAVE32;
+        let wait = word_at(base, 0xBF8C_C07F);
+        let restore = word_at(base, 0xBEFE_0317);
+        let mut words = base[..=wait].to_vec();
+        words.extend([
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE98_3C6A, // s_and_saveexec_b32 s24, vcc_lo
+        ]);
+        words.extend(&base[wait + 1..=restore]);
+        words.push(0x887E_187E); // s_or_b32 exec_lo, exec_lo, s24
+        words.extend(&base[restore + 1..]);
+        let r = waterfall(&words, false).unwrap();
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads.len(), 1);
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
