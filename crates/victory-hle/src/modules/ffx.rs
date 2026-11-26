@@ -10,10 +10,12 @@
 //! - an upscale dispatch records `victory_gpu::upscale` instead, from the
 //!   colour the title hands over to the output it names, at the sizes it
 //!   names; any other dispatch goes to the title's DLL.
-//! - the query for the camera's jitter answers no jitter: without a
-//!   temporal upscaler the sub-texel offsets the title would put on its
-//!   camera only make the picture shake. (`VICTORY_UPSCALER_JITTER=1`
-//!   keeps them.)
+//! - the camera's jitter is stopped: without a temporal upscaler the
+//!   sub-texel offsets the title puts on its camera only make the picture
+//!   shake. The title asks the upscaler how many phases its jitter sequence
+//!   has and works the offsets out itself: it is told one, so every frame
+//!   has the same offset. (A query for an offset answers none.)
+//!   `VICTORY_UPSCALER_JITTER=1` keeps the jitter.
 //!
 //! The title still creates its upscaler (its pipelines are made only when a
 //! dispatch uses them, which none does now). The render size stays the
@@ -161,7 +163,17 @@ struct QueryJitterOffset {
     out_y: *mut f32,
 }
 
+/// `ffxQueryDescUpscaleGetJitterPhaseCount`.
+#[repr(C)]
+struct QueryJitterPhases {
+    header: Header,
+    render_width: u32,
+    display_width: u32,
+    out_phases: *mut i32,
+}
+
 const DISPATCH_UPSCALE: u64 = 0x0001_0001;
+const QUERY_JITTER_PHASES: u64 = 0x0001_0004;
 const QUERY_JITTER_OFFSET: u64 = 0x0001_0005;
 const RETURN_OK: u32 = 0;
 
@@ -193,6 +205,11 @@ unsafe extern "C" fn ffx_dispatch(context: *mut c_void, desc: *mut Header) -> u3
     if kind == DISPATCH_UPSCALE {
         // SAFETY: an upscale dispatch's description.
         let d = unsafe { &*desc.cast::<DispatchUpscale>() };
+        static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+        let n = DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        if matches!(n, 300..=303) {
+            tracing::info!(n, jitter = ?d.jitter, "the title's jitter at its upscale dispatch");
+        }
         if first(kind, "dispatch") {
             tracing::info!(
                 list = ?d.command_list,
@@ -246,6 +263,24 @@ unsafe extern "C" fn ffx_query(context: *mut c_void, desc: *mut Header) -> u32 {
             result,
             "a FidelityFX query"
         );
+    }
+    if kind == QUERY_JITTER_PHASES && result == RETURN_OK && !keep_jitter() {
+        // SAFETY: a phase-count query's description; its out pointer is the
+        // title's or null.
+        unsafe {
+            let q = &*desc.cast::<QueryJitterPhases>();
+            if let Some(phases) = q.out_phases.as_mut() {
+                if first(u64::MAX - 1, "query") {
+                    tracing::info!(
+                        phases = *phases,
+                        render = q.render_width,
+                        display = q.display_width,
+                        "the title's jitter phases (made one)"
+                    );
+                }
+                *phases = 1;
+            }
+        }
     }
     if kind == QUERY_JITTER_OFFSET && result == RETURN_OK && !keep_jitter() {
         // SAFETY: a jitter query's description; its out pointers are the
@@ -301,5 +336,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(DispatchUpscale, render_size), 376);
         assert_eq!(std::mem::offset_of!(DispatchUpscale, upscale_size), 384);
         assert_eq!(std::mem::offset_of!(QueryJitterOffset, out_x), 24);
+        assert_eq!(std::mem::offset_of!(QueryJitterPhases, out_phases), 24);
     }
 }
