@@ -2182,7 +2182,7 @@ pub(crate) fn let_go_idle() {
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(held) = made.as_ref().and_then(|(host, _)| crate::pool::block_held(&host.texture))
-                && held < crate::pool::BLOCK / 2
+                && held < crate::pool::texture_block() / 2
             {
                 sparse.push((held, at));
             }
