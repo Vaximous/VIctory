@@ -10,7 +10,8 @@
 //! from this frame's colour alone (no history, so nothing trails).
 //!
 //! - `none`: bilinear from render size to output size.
-//! - `fxaa`: FXAA at render size into a texture of ours, then bilinear.
+//! - `fxaa`: FXAA on the render-size texels, evaluated where each output
+//!   pixel falls (one pass, nothing kept between frames).
 
 use std::sync::Mutex;
 
@@ -86,9 +87,11 @@ float luma(float2 uv) {
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void fxaa(uint3 at : SV_DispatchThreadID) {
-    if (at.x >= src_w || at.y >= src_h) return;
+    if (at.x >= out_w || at.y >= out_h) return;
     float2 px = 1.0 / float2(tex_w, tex_h);
-    float2 uv = (float2(at.xy) + 0.5) * px;
+    // Where the output pixel lies in the source: the edge search runs on
+    // the source's texels from there.
+    float2 uv = (float2(at.xy) + 0.5) / float2(out_w, out_h) * float2(src_w, src_h) * px;
     float4 centre = at_uv(uv);
     float lM = luma(uv);
     float lN = luma(uv + float2(0, -px.y)), lS = luma(uv + float2(0, px.y));
@@ -97,7 +100,7 @@ void fxaa(uint3 at : SV_DispatchThreadID) {
     float least = min(lM, min(min(lN, lS), min(lE, lW)));
     float range = most - least;
     if (range < max(0.0312, most * 0.125)) {
-        dst[at.xy] = centre;
+        dst[at.xy] = float4(max(centre.rgb, 0.0), centre.a);
         return;
     }
     float lNW = luma(uv - px), lSE = luma(uv + px);
@@ -137,7 +140,7 @@ void fxaa(uint3 at : SV_DispatchThreadID) {
     float2 to = uv;
     if (flat) to.y += shift * step; else to.x += shift * step;
     float4 c = at_uv(to);
-    dst[at.xy] = float4(c.rgb, centre.a);
+    dst[at.xy] = float4(max(c.rgb, 0.0), centre.a);
 }
 #endif
 "#;
@@ -233,65 +236,6 @@ fn writable(f: DXGI_FORMAT) -> DXGI_FORMAT {
     }
 }
 
-/// The texture FXAA writes into, at render size.
-struct Between {
-    size: (u32, u32),
-    texture: ID3D12Resource,
-}
-// SAFETY: D3D12 objects are free-threaded.
-unsafe impl Send for Between {}
-
-fn between(size: (u32, u32)) -> Option<ID3D12Resource> {
-    static BETWEEN: Mutex<Option<Between>> = Mutex::new(None);
-    let mut kept = BETWEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(b) = kept.as_ref()
-        && b.size == size
-    {
-        return Some(b.texture.clone());
-    }
-    let host = host()?;
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        Width: u64::from(size.0),
-        Height: size.1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        ..Default::default()
-    };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; it starts in the state every use leaves it in.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            &desc,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            None,
-            &mut texture,
-        )
-    };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, ?size, "no texture for FXAA");
-        return None;
-    }
-    let texture = texture?;
-    *kept = Some(Between {
-        size,
-        texture: texture.clone(),
-    });
-    Some(texture)
-}
-
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     let barrier = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -299,6 +243,79 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
     };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
+}
+
+/// The pass, recorded in open list `l` with `from` readable and `to` in the
+/// unordered access state; sizes as in [`record`] and the source texture's.
+/// Leaves the states so.
+///
+/// # Safety
+/// `l` is open; the textures live until it has run.
+unsafe fn dispatches(
+    device: &ID3D12Device,
+    l: &ID3D12GraphicsCommandList,
+    pass: &Pass,
+    mode: Mode,
+    from: (&ID3D12Resource, DXGI_FORMAT),
+    to: (&ID3D12Resource, DXGI_FORMAT),
+    [render, tex, out]: [(u32, u32); 3],
+) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // SAFETY: as the caller promises; slots no list in flight reads; our
+    // objects live as long as the process.
+    unsafe {
+        let cpu = pass.heap.GetCPUDescriptorHandleForHeapStart();
+        let gpu = pass.heap.GetGPUDescriptorHandleForHeapStart();
+        let slot = |i: u32| {
+            (
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu.ptr + (i * pass.step) as usize,
+                },
+                D3D12_GPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu.ptr + u64::from(i * pass.step),
+                },
+            )
+        };
+        let srv = |texture: &ID3D12Resource, format: DXGI_FORMAT, at| {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: readable(format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MipLevels: 1,
+                        ..Default::default()
+                    },
+                },
+            };
+            device.CreateShaderResourceView(texture, Some(&desc), at);
+        };
+        let uav = |texture: &ID3D12Resource, format: DXGI_FORMAT, at| {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: writable(format),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            device.CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&desc), at);
+        };
+        let words = [render.0, render.1, tex.0, tex.1, out.0, out.1, 0, 0];
+        uav_barrier(l);
+        l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        let first = NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % SLOTS;
+        let (s0, g0) = slot(first);
+        let (s1, _) = slot(first + 1);
+        srv(from.0, from.1, s0);
+        uav(to.0, to.1, s1);
+        l.SetComputeRoot32BitConstants(0, 8, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, g0);
+        l.SetPipelineState(match mode {
+            Mode::Plain => &pass.scale,
+            Mode::Fxaa => &pass.fxaa,
+        });
+        l.Dispatch(out.0.div_ceil(8), out.1.div_ceil(8), 1);
+        uav_barrier(l);
+    }
 }
 
 /// Writes title texture `output` (its `out` part) from title texture `color`
@@ -360,13 +377,6 @@ pub(crate) fn record(
             );
         }
     }
-    let fxaa_into = match mode {
-        Mode::Fxaa => match between(render) {
-            Some(t) => Some(t),
-            None => return false,
-        },
-        Mode::Plain => None,
-    };
 
     // The colour is read: what the title filled itself goes up first, and a
     // depth twin is settled, as for any read (`crate::draw`).
@@ -382,92 +392,19 @@ pub(crate) fn record(
         crate::list::ensure_state(list, output, UNORDERED_ACCESS);
     }
 
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let device = &host().expect("a pass means a host").device;
-    let l = &list.list;
-    // SAFETY: an open list; live textures in the states the views need; slots
-    // no list in flight reads; our objects live as long as the process.
+    // SAFETY: an open list; live textures in the states the views need.
     unsafe {
-        let cpu = pass.heap.GetCPUDescriptorHandleForHeapStart();
-        let gpu = pass.heap.GetGPUDescriptorHandleForHeapStart();
-        let slot = |i: u32| {
-            (
-                D3D12_CPU_DESCRIPTOR_HANDLE {
-                    ptr: cpu.ptr + (i * pass.step) as usize,
-                },
-                D3D12_GPU_DESCRIPTOR_HANDLE {
-                    ptr: gpu.ptr + u64::from(i * pass.step),
-                },
-            )
-        };
-        let srv = |texture: &ID3D12Resource, format: DXGI_FORMAT, at| {
-            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: readable(format),
-                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Texture2D: D3D12_TEX2D_SRV {
-                        MipLevels: 1,
-                        ..Default::default()
-                    },
-                },
-            };
-            device.CreateShaderResourceView(texture, Some(&desc), at);
-        };
-        let uav = |texture: &ID3D12Resource, format: DXGI_FORMAT, at| {
-            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                Format: writable(format),
-                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            };
-            device.CreateUnorderedAccessView(texture, None::<&ID3D12Resource>, Some(&desc), at);
-        };
-        let mut words = [render.0, render.1, tex.0, tex.1, out.0, out.1, 0, 0];
-        uav_barrier(l);
-        l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
-        l.SetComputeRootSignature(&pass.root);
-        let source = if let Some(between) = &fxaa_into {
-            list.keep(between);
-            let first = NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % SLOTS;
-            let (s0, g0) = slot(first);
-            let (s1, _) = slot(first + 1);
-            srv(from, fd.Format, s0);
-            uav(between, DXGI_FORMAT_R16G16B16A16_FLOAT, s1);
-            l.SetComputeRoot32BitConstants(0, 8, words.as_ptr().cast(), 0);
-            l.SetComputeRootDescriptorTable(1, g0);
-            l.SetPipelineState(&pass.fxaa);
-            l.Dispatch(render.0.div_ceil(8), render.1.div_ceil(8), 1);
-            let to_read = crate::host::transition(
-                between,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            );
-            l.ResourceBarrier(&[to_read]);
-            words[2] = render.0;
-            words[3] = render.1;
-            (between, DXGI_FORMAT_R16G16B16A16_FLOAT)
-        } else {
-            (from, fd.Format)
-        };
-        let first = NEXT.fetch_add(2, std::sync::atomic::Ordering::Relaxed) % SLOTS;
-        let (s0, g0) = slot(first);
-        let (s1, _) = slot(first + 1);
-        srv(source.0, source.1, s0);
-        uav(to, td.Format, s1);
-        l.SetComputeRoot32BitConstants(0, 8, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, g0);
-        l.SetPipelineState(&pass.scale);
-        l.Dispatch(out.0.div_ceil(8), out.1.div_ceil(8), 1);
-        if let Some(between) = &fxaa_into {
-            let back = crate::host::transition(
-                between,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            );
-            l.ResourceBarrier(&[back]);
-        }
-        uav_barrier(l);
-    }
+        dispatches(
+            device,
+            &list.list,
+            pass,
+            mode,
+            (from, fd.Format),
+            (to, td.Format),
+            [render, tex, out],
+        )
+    };
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!("upscaler stand-in {mode:?} {color:?} {render:?} to {output:?} {out:?}")
@@ -509,5 +446,237 @@ mod tests {
             return;
         };
         make(&host.device).expect("the passes");
+    }
+
+    fn half(v: f32) -> u16 {
+        // Normal positive values only (as the test uses).
+        let b = v.to_bits();
+        let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        if v <= 0.0 || e <= 0 {
+            return 0;
+        }
+        ((e as u16) << 10) | ((b >> 13) & 0x3ff) as u16
+    }
+
+    fn unhalf(h: u16) -> f32 {
+        let e = i32::from((h >> 10) & 0x1f);
+        if e == 0 {
+            return 0.0;
+        }
+        f32::from_bits((((e - 15 + 127) as u32) << 23) | (u32::from(h & 0x3ff) << 13))
+    }
+
+    fn texture(
+        device: &ID3D12Device,
+        w: u32,
+        h: u32,
+        state: D3D12_RESOURCE_STATES,
+    ) -> ID3D12Resource {
+        let mut t: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: u64::from(w),
+                    Height: h,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                state,
+                None,
+                &mut t,
+            )
+        }
+        .unwrap();
+        t.unwrap()
+    }
+
+    fn buffer(device: &ID3D12Device, bytes: u64, kind: D3D12_HEAP_TYPE) -> ID3D12Resource {
+        let mut b: Option<ID3D12Resource> = None;
+        let state = if kind == D3D12_HEAP_TYPE_UPLOAD {
+            D3D12_RESOURCE_STATE_GENERIC_READ
+        } else {
+            D3D12_RESOURCE_STATE_COPY_DEST
+        };
+        // SAFETY: plain creation.
+        unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: kind,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: bytes,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                state,
+                None,
+                &mut b,
+            )
+        }
+        .unwrap();
+        b.unwrap()
+    }
+
+    /// Both modes on a smooth gradient: the output keeps it (no banding),
+    /// at the output size.
+    #[test]
+    fn a_gradient_stays_smooth() {
+        let Some(host) = host() else {
+            return;
+        };
+        let device = &host.device;
+        let pass = make(device).expect("the passes");
+        let (sw, sh, ow, oh) = (64u32, 36u32, 96u32, 54u32);
+        let footprint = |t: &ID3D12Resource| {
+            let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: plain query.
+            unsafe {
+                device.GetCopyableFootprints(&t.GetDesc(), 0, 1, 0, Some(&mut f), None, None, None)
+            };
+            f
+        };
+        for mode in [Mode::Plain, Mode::Fxaa] {
+            let src = texture(device, sw, sh, D3D12_RESOURCE_STATE_COPY_DEST);
+            let dst = texture(device, ow, oh, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let (fs, fd) = (footprint(&src), footprint(&dst));
+            let up = buffer(
+                device,
+                u64::from(fs.Footprint.RowPitch * sh),
+                D3D12_HEAP_TYPE_UPLOAD,
+            );
+            let down = buffer(
+                device,
+                u64::from(fd.Footprint.RowPitch * oh),
+                D3D12_HEAP_TYPE_READBACK,
+            );
+            let mut values = Vec::new();
+            // SAFETY: mapped memory of the buffers' sizes; a list run to its end
+            // and waited for; the resources outlive it.
+            unsafe {
+                let mut at = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut at)).unwrap();
+                for y in 0..sh {
+                    let row = at
+                        .cast::<u8>()
+                        .add((y * fs.Footprint.RowPitch) as usize)
+                        .cast::<u16>();
+                    for x in 0..sw {
+                        let v = 0.05 + 2.0 * (x + y * sw) as f32 / (sw * sh) as f32;
+                        for c in 0..4 {
+                            row.add((x * 4 + c) as usize).write(half(v));
+                        }
+                    }
+                }
+                up.Unmap(0, None);
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let l: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap();
+                let place = |r: &ID3D12Resource, f| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(r),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                };
+                let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(r),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                l.CopyTextureRegion(&sub(&src), 0, 0, 0, &place(&up, fs), None);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &src,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                dispatches(
+                    device,
+                    &l,
+                    &pass,
+                    mode,
+                    (&src, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                    (&dst, DXGI_FORMAT_R16G16B16A16_FLOAT),
+                    [(sw, sh), (sw, sh), (ow, oh)],
+                );
+                l.ResourceBarrier(&[crate::host::transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyTextureRegion(&place(&down, fd), 0, 0, 0, &sub(&dst), None);
+                l.Close().unwrap();
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&l).unwrap())]);
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                while fence.GetCompletedValue() < 1 {
+                    std::thread::yield_now();
+                }
+                let mut at = std::ptr::null_mut();
+                down.Map(0, None, Some(&mut at)).unwrap();
+                for y in 0..oh {
+                    let row = at
+                        .cast::<u8>()
+                        .add((y * fd.Footprint.RowPitch) as usize)
+                        .cast::<u16>();
+                    for x in 0..ow {
+                        values.push(unhalf(row.add((x * 4) as usize).read()));
+                    }
+                }
+                down.Unmap(0, None);
+            }
+            // A gradient over 2.0 in 2,304 texels, spread over 5,184 pixels:
+            // most of them distinct, none outside the source's range.
+            let mut distinct: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert!(
+                distinct.len() > 1500,
+                "{mode:?}: {} distinct values",
+                distinct.len()
+            );
+            assert!(
+                values.iter().all(|v| (0.04..2.1).contains(v)),
+                "{mode:?}: out of range"
+            );
+            // Left to right along a row it only rises.
+            let row = &values[(oh / 2 * ow) as usize..((oh / 2 + 1) * ow) as usize];
+            assert!(
+                row.windows(2).all(|w| w[1] >= w[0] - 1e-3),
+                "{mode:?}: {row:?}"
+            );
+        }
     }
 }
