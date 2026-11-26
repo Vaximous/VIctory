@@ -88,6 +88,10 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// A discard, or a store or atomic to memory other than the slot feedback's (a
+    /// store or atomic tagged `Tag::Repeat` or `Tag::FirstLane`): what a pixel
+    /// program forced to test depth early would change.
+    pub late_effects: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1115,7 +1119,19 @@ impl Module {
                     }
                 } else if name == "annotateHandle" {
                     u.rovs |= annotation(V::Inst(i)).is_some_and(|(kind, _)| kind & 0x2000 != 0);
-                } else if name.starts_with("atomic") && name.ends_with(".i64") {
+                }
+                let feedback = matches!(self.tags.get(&i), Some(Tag::Repeat | Tag::FirstLane));
+                if !feedback
+                    && (name == "discard"
+                        || name.starts_with("atomic")
+                        || name.starts_with("textureStore")
+                        || name.starts_with("bufferStore")
+                        || name.starts_with("rawBufferStore")
+                        || name.starts_with("writeSamplerFeedback"))
+                {
+                    u.late_effects = true;
+                }
+                if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(

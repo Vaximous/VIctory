@@ -164,7 +164,7 @@ impl Module {
                     Some(Tag::Guard) => c.counts[k("guard_select")] += 1,
                     Some(Tag::Clamp) => c.counts[k("clamp")] += 1,
                     Some(Tag::Counter) => c.counts[k("loop_counter")] += 1,
-                    Some(Tag::Repeat) => {}
+                    Some(Tag::Repeat | Tag::FirstLane) => {}
                     None => {}
                 }
                 let _ = V::Inst(i);

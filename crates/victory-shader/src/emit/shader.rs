@@ -62,18 +62,22 @@ pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// The root UAV `u<SLOT_TOUCHED>` in [`ROOT_CBV_SPACE`] (`VICTORY_SLOT_FEEDBACK`): which
-/// view-heap slots shaders read through. Dword 0 holds the host's frame number; a shader
-/// that makes a handle from view-heap slot `i` stores that number into dword `1 + i` (`i`
+/// view-heap slots shaders read through. Dword 0 holds the host's epoch; a shader that
+/// makes a handle from view-heap slot `i` stores that number into dword `1 + i` (`i`
 /// clamped to [`SLOT_TOUCHED_SLOTS`] - 1). A plain store of one value, the same in every
 /// lane that names the slot: no atomics, and a wave's stores to one slot are one write.
-/// One store per handle the optimiser keeps (`Tag::Repeat`).
+/// One store per handle the optimiser keeps (`Tag::Repeat`). Dword `1 + SLOTS + i` takes
+/// the finest level samples through slot `i` asked for in the epoch
+/// ([`Shader::note_lod`]): `epoch << 4 | 15 - level`, by atomic maximum.
 pub const SLOT_TOUCHED: u8 = 251;
 /// View-heap slots [`SLOT_TOUCHED`] has a dword for.
 pub const SLOT_TOUCHED_SLOTS: u32 = 1 << 20;
 
-/// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 every stage notes the view-heap slots it reads
-/// through ([`SLOT_TOUCHED`]); 2 (default) every stage but pixel programs (a store in a
-/// pixel program may cost the early depth test). Off by default in this crate's own tests,
+/// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 (default) every stage notes the view-heap slots it
+/// reads through ([`SLOT_TOUCHED`]); 2 every stage but pixel programs; 3 as 1, but a pixel
+/// program that cannot test depth before it runs (a discard, a depth output, stores of
+/// its own) notes nothing. A pixel program that can is marked `[earlydepthstencil]`, so
+/// its stores do not hold back the depth test. Off by default in this crate's own tests,
 /// whose runners bind no buffer there.
 pub fn slot_feedback() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -81,8 +85,9 @@ pub fn slot_feedback() -> u8 {
         Ok("0") => 0,
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ if cfg!(test) => 0,
-        _ => 2,
+        _ => 1,
     })
 }
 
@@ -128,6 +133,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// `[earlydepthstencil]`.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -261,6 +268,9 @@ pub(crate) struct Shader {
     touched_frame: Option<V>,
     /// Slots noted already, by block and index ([Shader::touch]).
     touched: std::collections::HashSet<(usize, V)>,
+    /// Of each view-heap handle that is noted: the slot (clamped index) and whether the
+    /// index is the same in every lane ([Shader::note_lod]).
+    touched_slot: std::collections::HashMap<V, (V, bool)>,
     main: V,
     pub entry: usize,
 }
@@ -316,6 +326,7 @@ impl Shader {
             lds: None,
             touched_frame: None,
             touched: Default::default(),
+            touched_slot: Default::default(),
             main,
             entry,
         }
@@ -555,30 +566,101 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        let mode = slot_feedback();
-        if !sampler && (mode == 1 || mode == 2 && !self.pixel) && self.touched.insert((block, asked)) {
+        let noted = !sampler && self.notes_slots();
+        if noted && self.touched.insert((block, asked)) {
             self.touch(block, index);
         }
-        self.annotate(block, h, props.0, props.1)
+        let annotated = self.annotate(block, h, props.0, props.1);
+        if noted {
+            self.touched_slot.insert(annotated, (index, !nonuniform));
+        }
+        annotated
+    }
+
+    /// Whether this program notes the view-heap slots it reads through ([`slot_feedback`]).
+    fn notes_slots(&self) -> bool {
+        match slot_feedback() {
+            1 | 3 => true,
+            2 => !self.pixel,
+            _ => false,
+        }
+    }
+
+    /// The level of detail a sample through `handle` (a view-heap handle) asks for, `lod`
+    /// (a float, unclamped): the finest one of the epoch per slot goes into the second
+    /// half of [`SLOT_TOUCHED`] (`VICTORY_SLOT_LOD=0`: not). One atomic maximum of
+    /// `epoch << 4 | 15 - level` (the level 0..=15, rounded down); a handle the same in
+    /// every lane takes the wave's maximum and stores from its first lane (`Tag::FirstLane`).
+    pub fn note_lod(&mut self, block: usize, handle: V, lod: V) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_SLOT_LOD").as_deref().map(str::trim) != Ok("0")) {
+            return;
+        }
+        let Some(&(index, uniform)) = self.touched_slot.get(&handle) else {
+            return;
+        };
+        let (i32t, f32t) = (self.t.i32, self.t.f32);
+        let touched = self.root_uav_handle(SLOT_TOUCHED);
+        let frame = self.touched_frame(touched);
+        let epoch = self.m.cast(block, super::bitcode::Cast::Bitcast, frame, i32t);
+        // round down, then 0..=15 (fmax 35, fmin 36, round_ni 27)
+        let level = self.op(block, "unary.f32", Attr::ReadNone, f32t, 27, &[lod]);
+        let (zero, fifteen) = (self.m.f32(0), self.m.f32(15f32.to_bits()));
+        let level = self.op(block, "binary.f32", Attr::ReadNone, f32t, 35, &[level, zero]);
+        let level = self.op(block, "binary.f32", Attr::ReadNone, f32t, 36, &[level, fifteen]);
+        let level = self.m.cast(block, super::bitcode::Cast::FpToUi, level, i32t);
+        let (four, k15) = (self.m.i32(4), self.m.i32(15));
+        let high = self.m.bin(block, super::bitcode::Bin::Shl, epoch, four);
+        let low = self.m.bin(block, super::bitcode::Bin::Sub, k15, level);
+        let mut value = self.m.bin(block, super::bitcode::Bin::Or, high, low);
+        if uniform {
+            // waveActiveOp: maximum (3), unsigned (1)
+            let (max, unsigned) = (self.m.i8(3), self.m.i8(1));
+            value = self.op(block, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[value, max, unsigned]);
+        }
+        let last = self.m.i32(SLOT_TOUCHED_SLOTS - 1);
+        let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        let base = self.m.i32(SLOT_TOUCHED_SLOTS + 1);
+        let at = self.m.bin(block, super::bitcode::Bin::Add, at, base);
+        let two = self.m.i32(2);
+        let at = self.m.bin(block, super::bitcode::Bin::Shl, at, two);
+        let iu = self.m.undef(i32t);
+        // atomicBinOp: unsigned maximum (7)
+        let umax = self.m.i32(7);
+        let atomic = self.op(
+            block,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[touched, umax, at, iu, iu, value],
+        );
+        // (A maximum made again with the same operands changes nothing either.)
+        let tag = if uniform { super::bitcode::Tag::FirstLane } else { super::bitcode::Tag::Repeat };
+        self.m.tag(atomic, tag);
+    }
+
+    /// The epoch dword of [`SLOT_TOUCHED`], loaded once in the entry block (as a float).
+    fn touched_frame(&mut self, touched: V) -> V {
+        if let Some(v) = self.touched_frame {
+            return v;
+        }
+        let (e, zero, one) = (self.entry, self.m.i32(0), self.m.i8(1));
+        let (res, align) = (self.t.res_ret, self.m.i32(4));
+        let iu = self.m.undef(self.t.i32);
+        let r = self.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[touched, zero, iu, one, align]);
+        let v = self.m.extract(e, r, 0);
+        self.touched_frame = Some(v);
+        v
     }
 
     /// Notes in [`SLOT_TOUCHED`] that view-heap slot `index` is read through.
     fn touch(&mut self, block: usize, index: V) {
-        let res = self.t.res_ret;
         let f32t = self.t.f32;
         let touched = self.root_uav_handle(SLOT_TOUCHED);
         let (i32t, align) = (self.t.i32, self.m.i32(4));
         let iu = self.m.undef(i32t);
-        let frame = match self.touched_frame {
-            Some(v) => v,
-            None => {
-                let (e, zero, one) = (self.entry, self.m.i32(0), self.m.i8(1));
-                let r = self.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[touched, zero, iu, one, align]);
-                let v = self.m.extract(e, r, 0);
-                self.touched_frame = Some(v);
-                v
-            }
-        };
+        let frame = self.touched_frame(touched);
         let last = self.m.i32(SLOT_TOUCHED_SLOTS - 1);
         let at = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
         self.m.tag(at, super::bitcode::Tag::Clamp);
@@ -628,6 +710,19 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
+        // A pixel program that notes its slots stores to memory, which would have the
+        // depth test wait for it: it tests depth first when nothing else would change by
+        // that (no discard, depth, coverage or stencil output, no store of its own). One
+        // that cannot keeps its stores (`VICTORY_SLOT_FEEDBACK=3`: leaves them out).
+        if self.pixel && self.touched_frame.is_some() {
+            let late = self.m.usage().late_effects
+                || self.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20));
+            if !late {
+                self.flags |= flags::EARLY_DEPTH;
+            } else if slot_feedback() == 3 {
+                self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
+            }
+        }
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
             self.m.optimise(passes);
@@ -645,6 +740,10 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        // The slot feedback's atomics of one value per wave: from its first lane alone.
+        if self.m.first_lane_only() > 0 {
+            self.flags |= flags::WAVE_OPS;
         }
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views

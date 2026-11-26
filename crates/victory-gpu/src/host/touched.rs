@@ -17,8 +17,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::{Host, host, name, transition};
 
-/// Bytes of the buffer: dword 0 the epoch, then a dword per slot.
-const BYTES: u64 = (SLOT_TOUCHED_SLOTS as u64 + 1) * 4;
+/// Bytes of the buffer: dword 0 the epoch, then a dword per slot (its last epoch), then
+/// another (the finest level asked for: `epoch << 4 | 15 - level`).
+const BYTES: u64 = (2 * SLOT_TOUCHED_SLOTS as u64 + 1) * 4;
 
 /// `VICTORY_SLOT_FEEDBACK_FRAMES`: frames an epoch lasts (8 by default).
 pub fn frames_per_epoch() -> u64 {
@@ -51,6 +52,9 @@ struct Feedback {
     /// copy that ran), and that copy's epoch.
     seen: Arc<Vec<u32>>,
     seen_epoch: u32,
+    /// Per slot, as brought back: `epoch << 4 | 15 - level` of the finest level a
+    /// sample through it asked for in its last epoch (0: none).
+    levels: Arc<Vec<u32>>,
     /// The last list sent copied the buffer back.
     copied: bool,
 }
@@ -118,8 +122,10 @@ pub(crate) fn tick(frame: u64) {
             return;
         }
         if fb.copied {
-            let words = std::slice::from_raw_parts(fb.mapped, SLOT_TOUCHED_SLOTS as usize + 1);
-            fb.seen = Arc::new(words[1..].to_vec());
+            let n = SLOT_TOUCHED_SLOTS as usize;
+            let words = std::slice::from_raw_parts(fb.mapped, 2 * n + 1);
+            fb.seen = Arc::new(words[1..=n].to_vec());
+            fb.levels = Arc::new(words[n + 1..].to_vec());
             fb.seen_epoch = words[0];
             fb.copied = false;
         }
@@ -191,6 +197,39 @@ pub fn touched_slots(epochs: u32) -> Option<Vec<u64>> {
     Some(bits)
 }
 
+/// Per view-heap slot, the finest mip level (0 the largest) a sample through it asked
+/// for in the last epochs epochs before the last copy brought back, 255 where none
+/// did (a slot only loaded from, or not read at all). The level is the one the
+/// sample's derivatives select in a pixel program (bias and least level left out),
+/// the one named elsewhere; 15 stands for 15 or coarser. Within an epoch the finest
+/// wins; a later epoch's level replaces an earlier one's. None as for
+/// [slot_epochs] (and with VICTORY_SLOT_LOD=0 every slot reads 255).
+pub fn slot_min_lod(epochs: u32) -> Option<Vec<u8>> {
+    WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let levels = {
+        let f = FEEDBACK.lock().unwrap_or_else(|e| e.into_inner());
+        let fb = f.as_ref()?.as_ref()?;
+        if fb.seen_epoch == 0 {
+            return None;
+        }
+        (fb.seen_epoch, fb.levels.clone())
+    };
+    let (now, levels) = levels;
+    let from = now.saturating_sub(epochs.max(1));
+    Some(
+        levels
+            .iter()
+            .map(|&v| {
+                if v >> 4 > from {
+                    15 - (v & 15) as u8
+                } else {
+                    255
+                }
+            })
+            .collect(),
+    )
+}
+
 impl Host {
     fn make_feedback(&self) -> windows::core::Result<Feedback> {
         let empty = || windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY);
@@ -226,6 +265,7 @@ impl Host {
                 began: 0,
                 seen: Arc::new(Vec::new()),
                 seen_epoch: 0,
+                levels: Arc::new(Vec::new()),
                 copied: false,
             })
         }

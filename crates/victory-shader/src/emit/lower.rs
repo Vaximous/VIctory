@@ -11709,6 +11709,28 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // The level the sample asks for, for the slot feedback: from the screen
+            // derivatives in a pixel program, as named otherwise (shortcut: a bias and a
+            // least level are left out of it; explicit gradients and gathers note none).
+            let asked = match op {
+                60 | 61 if self.s.pixel => {
+                    let (f32t, no) = (self.s.t.f32, self.s.m.bool(false));
+                    // (the coordinates the size divides alone: not an array's layer)
+                    let used = if kind == 5 { 3 } else { spatial };
+                    let at: Vec<V> = (0..3).map(|k| if k < used { cs[k] } else { fu }).collect();
+                    Some(self.s.op(c, "calculateLOD.f32", Attr::ReadOnly, f32t, 81, &[h, sh, at[0], at[1], at[2], no]))
+                }
+                60 | 61 | 65 => Some(self.s.m.f32(0)),
+                62 if name == "image_sample_l" => {
+                    let x = addr_packed(self, coord_base, coords)?;
+                    Some(to_float(self, x))
+                }
+                62 => Some(self.s.m.f32(0)),
+                _ => None,
+            };
+            if let Some(lod) = asked {
+                self.s.note_lod(c, h, lod);
+            }
             let offsets = if kind == 5 {
                 0
             } else {

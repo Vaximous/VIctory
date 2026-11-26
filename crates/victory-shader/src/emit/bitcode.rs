@@ -26,6 +26,9 @@ pub(crate) enum Tag {
     /// A store that, repeated with the same operands, changes nothing (nothing else
     /// writes there): the optimiser drops one below another in the dominator tree.
     Repeat,
+    /// An atomic of a value the same in every lane: made by the wave's first lane alone
+    /// ([`Module::first_lane_only`]).
+    FirstLane,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -383,7 +386,7 @@ impl Module {
     /// are counted, or for the optimiser.
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && (tag == Tag::Repeat || census::enabled())
+            && (matches!(tag, Tag::Repeat | Tag::FirstLane) || census::enabled())
         {
             self.tags.insert(i, tag);
         }
@@ -542,6 +545,65 @@ impl Module {
             }
         }
         post
+    }
+
+    /// Takes out every instruction tagged one of `tags` (stores or atomics whose results
+    /// nothing reads), and forgets their tags.
+    pub fn drop_tagged(&mut self, tags: &[Tag]) {
+        let gone: std::collections::HashSet<u32> =
+            self.tags.iter().filter(|(_, t)| tags.contains(t)).map(|(&i, _)| i).collect();
+        for blk in &mut self.blocks {
+            blk.body.retain(|i| !gone.contains(i));
+        }
+        self.tags.retain(|i, _| !gone.contains(i));
+    }
+
+    /// Puts every instruction tagged [`Tag::FirstLane`] behind a branch on
+    /// `waveIsFirstLane`: its block is split there, the instruction alone in a block
+    /// between the two halves. For a finished module (every block ended). Returns how
+    /// many were put behind one.
+    pub fn first_lane_only(&mut self) -> usize {
+        let mut sites: Vec<u32> = self
+            .tags
+            .iter()
+            .filter(|&(_, &t)| t == Tag::FirstLane)
+            .map(|(&i, _)| i)
+            .collect();
+        sites.sort_unstable();
+        if sites.is_empty() {
+            return 0;
+        }
+        let i1 = self.int(1);
+        let i32t = self.int(32);
+        let fty = self.func_ty(i1, vec![i32t]);
+        self.ptr(fty);
+        let f = self.function("dx.op.waveIsFirstLane", fty, Some(Attr::NoUnwind), false);
+        let op = self.i32(110);
+        let mut done = 0;
+        for i in sites {
+            let Some((b, n)) = self
+                .blocks
+                .iter()
+                .enumerate()
+                .find_map(|(b, blk)| blk.body.iter().position(|&x| x == i).map(|n| (b, n)))
+            else {
+                continue;
+            };
+            if self.blocks[b].term.is_none() {
+                continue;
+            }
+            let rest = self.split_after(b);
+            let tail = self.blocks[b].body.split_off(n + 1);
+            self.blocks[rest].body = tail;
+            self.blocks[b].body.pop();
+            let only = self.new_block();
+            self.blocks[only].body.push(i);
+            self.blocks[only].term = Some(Term::Br(rest));
+            let first = self.call(b, f, vec![op]);
+            self.blocks[b].term = Some(Term::CondBr(first, only, rest));
+            done += 1;
+        }
+        done
     }
 
     pub fn type_of(&self, v: V) -> Ty {
