@@ -2608,6 +2608,78 @@ impl HostHeap {
         }
     }
 
+    /// Eviction by what shaders read (`crate::host::touched`): the host
+    /// slots of placed textures of at least `keep` bytes that no shader read
+    /// through for `idle` epochs (by `seen`, as of epoch `now`) become null,
+    /// their host copies go at the next sweep
+    /// (`crate::resource::overwritten`), and the slots are queued again;
+    /// the texture pass makes them again once a shader reads them
+    /// ([`evicted_waits`]). Not a slot a draw read through a table lately
+    /// (tables are not in the feedback). At most `most` slots; how many went
+    /// and their bytes.
+    pub(crate) fn evict_untouched(&self, frame: u64, now: u32, seen: &[u32], idle: u32, keep: u64, most: usize) -> (u64, u64) {
+        let mut evicted = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut went, mut bytes) = (0u64, 0u64);
+        let stamp_now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        for (index, key) in self.made.keys.iter().enumerate() {
+            if went as usize >= most {
+                break;
+            }
+            let key = key.load(std::sync::atomic::Ordering::Relaxed);
+            let read = seen.get(index).copied().unwrap_or(u32::MAX);
+            if key == 0 || read == u32::MAX || now.saturating_sub(read) < idle {
+                continue;
+            }
+            let index = index as u32;
+            let stamp = self.tabled_stamp(index);
+            if stamp != 0 && u64::from(stamp_now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES {
+                continue;
+            }
+            let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            if resource[0] == 1 {
+                continue;
+            }
+            let first = crate::resource::first_mip(&desc);
+            let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(0);
+            if len < keep {
+                continue;
+            }
+            {
+                let made = self.made.lock(index);
+                if self.made.get(index) != Some(key) {
+                    continue;
+                }
+                self.unmake(index);
+                drop(made);
+            }
+            overwritten(key);
+            self.textures.lock().unwrap_or_else(|e| e.into_inner()).written(index, frame, frame + 1, false);
+            evicted.insert(index, now);
+            went += 1;
+            bytes += len;
+        }
+        (went, bytes)
+    }
+
+    /// Whether title slot `index` was emptied by [`HostHeap::evict_untouched`]
+    /// and no shader read through it since (by `seen`): it is not made
+    /// again yet. One read since is made again, and is no longer noted.
+    pub(crate) fn evicted_waits(&self, index: u32, seen: Option<&[u32]>) -> bool {
+        let mut evicted = EVICTED.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&at) = evicted.get(&index) else {
+            return false;
+        };
+        match seen.and_then(|seen| seen.get(index as usize)) {
+            Some(&read) if read <= at => true,
+            _ => {
+                evicted.remove(&index);
+                false
+            }
+        }
+    }
+
     /// Whether title slot `index` was a table's within the last
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
@@ -4682,6 +4754,10 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 /// title memory is overwritten or unmapped now: its host copy goes at the
 /// next sweep (`crate::resource::overwritten`). Only a texture made already
 /// is looked up; none is made.
+/// Title slots emptied by [`HostHeap::evict_untouched`], each with the
+/// feedback epoch it was emptied in.
+static EVICTED: Mutex<std::collections::BTreeMap<u32, u32>> = Mutex::new(std::collections::BTreeMap::new());
+
 fn overwritten(key: u64) {
     if let Some(View::Placed(false, resource, desc)) = view_at(key as u32, (key >> 32) as u32)
         && resource[0] != 1

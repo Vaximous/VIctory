@@ -755,6 +755,30 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Since the start: host slots of textures picked by index emptied because
+/// no shader read them for a while with the card full
+/// ([`HostHeap::evict_untouched`]), and their textures' bytes.
+pub(crate) static EVICTED_UNTOUCHED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Textures smaller than this keep their host copies (the smallest levels
+/// of what is evicted stay on the card as small textures do).
+const EVICT_KEEP: u64 = 256 << 10;
+
+/// Whether textures no shader reads are evicted without room
+/// (`VICTORY_EVICT_UNTOUCHED=0`: no).
+fn evict_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_UNTOUCHED").is_none_or(|v| v != "0"))
+}
+
+/// Feedback epochs a slot goes unread before it is evicted
+/// (`VICTORY_EVICT_EPOCHS`, at least 3; 8 by default: about 4 s at 16
+/// frames a second with 8 frames an epoch).
+fn evict_epochs() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_EVICT_EPOCHS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).max(3))
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2618,7 +2642,28 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        // What shaders read through the heap's slots, by epoch
+        // (`crate::host::touched`): without room, the slots none read for a
+        // while give their textures back (`evict_untouched`); and the due
+        // slots read lately go first.
+        let feedback = if evict_on() { crate::host::touched::slot_epochs() } else { None };
+        if let Some((now, seen)) = &feedback
+            && !room
+        {
+            static EPOCH: AtomicU64 = AtomicU64::new(0);
+            // (Once an epoch; the feedback lags one or two, so never one read
+            // in the last three.)
+            if EPOCH.swap(u64::from(*now), Ordering::Relaxed) != u64::from(*now) && *now > evict_epochs() + 3 {
+                let (went, bytes) = host.evict_untouched(frame, *now, seen, evict_epochs().max(3), EVICT_KEEP, 4096);
+                EVICTED_UNTOUCHED[0].fetch_add(went, Ordering::Relaxed);
+                EVICTED_UNTOUCHED[1].fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        if let Some((now, seen)) = &feedback {
+            // Stable: the queue's own order within each part.
+            due.sort_by_key(|&(index, _)| seen.get(index as usize).is_none_or(|&read| read == 0 || now.saturating_sub(read) > 3));
+        }
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
@@ -2728,6 +2773,12 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
+            // Emptied for want of room, and no shader read it since: not
+            // yet.
+            if host.evicted_waits(index, feedback.as_ref().map(|(_, seen)| seen.as_slice())) {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
