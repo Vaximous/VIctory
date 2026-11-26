@@ -66,14 +66,14 @@ pub const SLOT_FAULTS: u8 = 253;
 /// that makes a handle from view-heap slot `i` stores that number into dword `1 + i` (`i`
 /// clamped to [`SLOT_TOUCHED_SLOTS`] - 1). A plain store of one value, the same in every
 /// lane that names the slot: no atomics, and a wave's stores to one slot are one write.
+/// One store per handle the optimiser keeps (`Tag::Repeat`).
 pub const SLOT_TOUCHED: u8 = 251;
 /// View-heap slots [`SLOT_TOUCHED`] has a dword for.
 pub const SLOT_TOUCHED_SLOTS: u32 = 1 << 20;
 
-/// `VICTORY_SLOT_FEEDBACK`: 0 off (the default: nothing uses it while eviction by it is off,
-/// and a moving open-world run was slower with it); 1 every stage notes the view-heap slots it
-/// reads through ([`SLOT_TOUCHED`]); 2 every stage but pixel programs (a store in a pixel
-/// program may cost the early depth test). Off by default in this crate's own tests,
+/// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 every stage notes the view-heap slots it reads
+/// through ([`SLOT_TOUCHED`]); 2 (default) every stage but pixel programs (a store in a
+/// pixel program may cost the early depth test). Off by default in this crate's own tests,
 /// whose runners bind no buffer there.
 pub fn slot_feedback() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -81,7 +81,8 @@ pub fn slot_feedback() -> u8 {
         Ok("0") => 0,
         Ok("1") => 1,
         Ok("2") => 2,
-        _ => 0,
+        _ if cfg!(test) => 0,
+        _ => 2,
     })
 }
 

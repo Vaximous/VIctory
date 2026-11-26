@@ -2,8 +2,9 @@
 //! by default; [`victory_shader::emit::SLOT_TOUCHED`]): a buffer in the
 //! card's memory, bound to every translated shader that makes a handle from
 //! the view heap, where such a shader stores the current epoch into the
-//! slot's dword. Every [`frames_per_epoch`] frames one small list copies the
-//! buffer into memory the PC reads and starts the next epoch (dword 0). The
+//! slot's dword. Every [`frames_per_epoch`] frames one small list starts the
+//! next epoch (dword 0) and, when asked for since, copies the buffer into
+//! memory the PC reads (nobody asking costs nothing but the stores). The
 //! slots' epochs are read with [`slot_epochs`] and [`touched_slots`]: a slot
 //! whose last epoch is old has not been read by any shader since. Only
 //! shaders read through slots: copies, clears and the host's own passes do
@@ -50,6 +51,8 @@ struct Feedback {
     /// copy that ran), and that copy's epoch.
     seen: Arc<Vec<u32>>,
     seen_epoch: u32,
+    /// The last list sent copied the buffer back.
+    copied: bool,
 }
 
 // SAFETY: free-threaded objects; the mapping is read under the mutex.
@@ -61,6 +64,12 @@ static FEEDBACK: Mutex<Option<Option<Feedback>>> = Mutex::new(None);
 /// first use; `None` when it could not be made (the shader is not bound
 /// then: its stores go nowhere).
 pub(crate) fn address() -> Option<u64> {
+    // (Asked at every bind of such a shader: no lock once known.)
+    static ADDRESS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ADDRESS.get_or_init(make_address)
+}
+
+fn make_address() -> Option<u64> {
     let mut f = FEEDBACK.lock().unwrap_or_else(|e| e.into_inner());
     if f.is_none() {
         *f = Some(host().and_then(|h| match h.make_feedback() {
@@ -83,9 +92,15 @@ pub(crate) fn address() -> Option<u64> {
     Some(unsafe { made.card.GetGPUVirtualAddress() })
 }
 
+/// Asked for since the last copy was taken: the next epoch's list copies
+/// the buffer back (no copy while nobody asks).
+static WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// At each shown frame: every [`frames_per_epoch`] frames, takes what the
-/// last copy brought back and sends the next copy and epoch.
+/// last copy brought back (if one was sent) and starts the next epoch, with
+/// a copy back when [`slot_epochs`] was asked since.
 pub(crate) fn tick(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
     if slot_feedback() == 0 {
         return;
     }
@@ -102,10 +117,11 @@ pub(crate) fn tick(frame: u64) {
         if fb.fence.GetCompletedValue() < fb.sent {
             return;
         }
-        if fb.sent > 1 {
+        if fb.copied {
             let words = std::slice::from_raw_parts(fb.mapped, SLOT_TOUCHED_SLOTS as usize + 1);
             fb.seen = Arc::new(words[1..].to_vec());
             fb.seen_epoch = words[0];
+            fb.copied = false;
         }
         let Some(h) = host() else { return };
         if fb.allocator.Reset().is_err() || fb.list.Reset(&fb.allocator, None).is_err() {
@@ -116,13 +132,16 @@ pub(crate) fn tick(frame: u64) {
             // The first list fills the buffer with zeros (`back` is zeroed).
             fb.list.CopyBufferRegion(card, 0, back, 0, BYTES);
             D3D12_RESOURCE_STATE_COPY_DEST
-        } else {
+        } else if WANTED.swap(false, Relaxed) {
             fb.list.CopyBufferRegion(back, 0, card, 0, BYTES);
             fb.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
+            fb.copied = true;
+            D3D12_RESOURCE_STATE_COPY_DEST
+        } else {
             D3D12_RESOURCE_STATE_COPY_DEST
         };
         fb.epoch += 1;
@@ -145,9 +164,12 @@ pub(crate) fn tick(frame: u64) {
 
 /// The epoch shaders note now (0 before the first), and per view-heap slot
 /// the last epoch a shader read through it (0: never), as of the last copy
-/// brought back ([`frames_per_epoch`] to twice that many frames old). `None`
-/// with `VICTORY_SLOT_FEEDBACK=0` or before any shader noted a slot.
+/// brought back. The buffer is copied back only when asked: the first call
+/// asks (and gives `None`), later ones give the last copy and ask for the
+/// next, one to two epochs ([`frames_per_epoch`] frames each) later. `None`
+/// with `VICTORY_SLOT_FEEDBACK=0` or before a copy came back.
 pub fn slot_epochs() -> Option<(u32, Arc<Vec<u32>>)> {
+    WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
     let f = FEEDBACK.lock().unwrap_or_else(|e| e.into_inner());
     let fb = f.as_ref()?.as_ref()?;
     (fb.seen_epoch > 0).then(|| (fb.seen_epoch, fb.seen.clone()))
@@ -204,6 +226,7 @@ impl Host {
                 began: 0,
                 seen: Arc::new(Vec::new()),
                 seen_epoch: 0,
+                copied: false,
             })
         }
     }
