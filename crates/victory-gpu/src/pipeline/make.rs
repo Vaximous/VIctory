@@ -56,7 +56,61 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+static RAY_TRACING: OnceLock<bool> = OnceLock::new();
+
+/// Whether the title's ray tracing runs (`ray_tracing` of the config's
+/// `[graphics]`, env `VICTORY_RAY_TRACING`; on unless set off). Off, the
+/// structure builder never runs and the passes that trace rays
+/// ([`RAY_PASSES`]) are left out with the resolves of their hits.
+pub fn ray_tracing() -> bool {
+    *RAY_TRACING.get_or_init(|| {
+        std::env::var("VICTORY_RAY_TRACING")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+/// Sets [`ray_tracing`] before the title creates pipelines; later calls
+/// change nothing.
+pub fn set_ray_tracing(on: bool) {
+    let _ = RAY_TRACING.set(on);
+    if !on {
+        tracing::info!("the title's ray tracing is off: no structure builder, no ray passes");
+    }
+}
+
+/// The passes that trace rays through the title's structures (start of
+/// their names; a trailing `_` keeps a name from matching a longer one, as
+/// the trace's fallback without rays). Without structures their every ray
+/// misses: they cost the card's time for nothing. `VICTORY_RAY_PASSES`
+/// (names separated by commas) replaces the list, for trials.
+const RAY_PASSES: &[&str] = &[
+    "CS_RaytraceVBuffer_",
+    "CS_ScreenProbes_TraceRays_",
+    "CS_TraceShadowRays_",
+    "CS_IrradianceCache_ShadowTrace_",
+    "CS_RTDistantShadowTrace",
+    "CS_LaserLightShadowRaytracing_",
+];
+
+fn ray_pass(shaders: &[Arc<Shader>]) -> bool {
+    static PASSES: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+    let passes = PASSES.get_or_init(|| match std::env::var("VICTORY_RAY_PASSES") {
+        Ok(list) => list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(|n| n.as_bytes().to_vec()).collect(),
+        Err(_) => RAY_PASSES.iter().map(|n| n.as_bytes().to_vec()).collect(),
+    });
+    passes.iter().any(|name| named(shaders, name))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !ray_tracing() {
+        if named(shaders, b"CS_RaytracingResolve") || named(shaders, b"CS_ScreenProbes_ActivateRays") {
+            return Some("ray tracing is off");
+        }
+        if ray_pass(shaders) {
+            return Some("traces rays, and ray tracing is off");
+        }
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");

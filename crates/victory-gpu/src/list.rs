@@ -1479,6 +1479,52 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     let _ = (this, x, y, z, flags);
 }
 
+/// The stand-in for the title's upscaler ([`crate::upscale`]), recorded on
+/// title list `list` where the title's call to its upscaler was: fills the
+/// `out` part (width, height) of title texture `output` from the `render`
+/// part of title texture `color`. False if the list cannot take it (no host
+/// GPU, a mode not known, textures it cannot use: those come out at run time).
+#[cfg(windows)]
+pub fn upscale(
+    list: *const std::ffi::c_void,
+    mode: u32,
+    color: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: (u32, u32),
+    out: (u32, u32),
+) -> bool {
+    let (this, color, output): (This, This, This) = (list.cast(), color.cast(), output.cast());
+    if this.is_null()
+        || crate::upscale::Mode::from_word(mode).is_none()
+        || !crate::resource::is_resource(color)
+        || !crate::resource::is_resource(output)
+    {
+        return false;
+    }
+    let pack = |(w, h): (u32, u32)| u64::from(w) | u64::from(h) << 32;
+    if host_list(this).is_some() {
+        upscale_now(this, color, output, pack(render), pack(out), mode);
+        true
+    } else if thin::on() {
+        thin::upscale(this, color, output, pack(render), pack(out), mode);
+        true
+    } else {
+        false
+    }
+}
+
+/// [`upscale`] on the list's host list.
+#[cfg(windows)]
+fn upscale_now(this: This, color: This, output: This, render: u64, out: u64, mode: u32) {
+    let Some(mode) = crate::upscale::Mode::from_word(mode) else { return };
+    let unpack = |v: u64| (v as u32, (v >> 32) as u32);
+    with_state(this, |list, s| {
+        if crate::upscale::record(list, mode, color, output, unpack(render), unpack(out)) {
+            s.host_state_taken();
+        }
+    });
+}
+
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
 extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}

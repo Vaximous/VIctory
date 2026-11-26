@@ -32,6 +32,15 @@ pub use victory_gpu::pipeline::known as known_pipelines;
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
+/// Whether the title's ray tracing runs (`[graphics] ray_tracing`), set
+/// before the title starts.
+pub fn set_ray_tracing(on: bool) {
+    #[cfg(windows)]
+    victory_gpu::pipeline::set_ray_tracing(on);
+    #[cfg(not(windows))]
+    let _ = on;
+}
+
 /// Resolves a title's imports against our runtime and the host.
 #[derive(Debug, Default)]
 pub struct HleResolver {

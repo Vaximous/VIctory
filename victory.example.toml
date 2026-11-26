@@ -17,3 +17,14 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[graphics]
+# What brings the picture from render size to the screen.   env: VICTORY_UPSCALER
+#   "fsr4"  the title's own ML upscaler (default; about two thirds of the card's time here)
+#   "none"  a plain bilinear upscale, no anti-aliasing (fastest)
+#   "fxaa"  FXAA at render size, then bilinear
+# The render size is the title's either way.
+# upscaler = "none"
+
+# false: the title's ray-tracing passes do not run.   env: VICTORY_RAY_TRACING (on/off)
+# ray_tracing = false

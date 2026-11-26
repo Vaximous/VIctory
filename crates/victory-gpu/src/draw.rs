@@ -1263,6 +1263,14 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
+    /// A pass of ours set the host list's heaps, compute root signature and
+    /// pipeline: the next draw or dispatch sets the title's again.
+    pub(crate) fn host_state_taken(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps_set = false;
+    }
+
     pub(crate) fn replay(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];

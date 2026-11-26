@@ -24,6 +24,36 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// Picture settings (`[graphics]`).
+    pub graphics: Graphics,
+}
+
+/// `[graphics]`: what the title's picture is made with. Each value is the
+/// environment's (`VICTORY_UPSCALER`, `VICTORY_RAY_TRACING`), else the
+/// file's, else the title's own choice.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Graphics {
+    /// `"fsr4"` (the title's), `"none"` (bilinear, no anti-aliasing) or
+    /// `"fxaa"`.
+    pub upscaler: Option<String>,
+    /// `false`: the title's ray-tracing passes do not run.
+    pub ray_tracing: Option<bool>,
+}
+
+impl Graphics {
+    fn resolve(file: Graphics, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<Graphics> {
+        let text = |k: &str| env(k).and_then(|v| v.into_string().ok()).filter(|v| !v.trim().is_empty());
+        let ray_tracing = match text("VICTORY_RAY_TRACING") {
+            Some(v) => Some(match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" | "yes" => true,
+                "0" | "off" | "false" | "no" => false,
+                other => anyhow::bail!("VICTORY_RAY_TRACING={other}: expected on or off"),
+            }),
+            None => file.ray_tracing,
+        };
+        Ok(Graphics { upscaler: text("VICTORY_UPSCALER").or(file.upscaler), ray_tracing })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +61,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: Graphics,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,7 +102,9 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let graphics = Graphics::resolve(parsed.graphics, |k| std::env::var_os(k))?;
+        let config = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        Ok(Config { graphics, ..config })
     }
 
     fn resolve(
@@ -97,6 +131,7 @@ impl Config {
             data_dir,
             test_titles,
             source,
+            graphics: Graphics::default(),
         })
     }
 
@@ -148,6 +183,30 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn graphics_from_file_and_environment() {
+        let file: FileConfig =
+            toml::from_str("[graphics]
+upscaler = 'fxaa'
+ray_tracing = false
+").unwrap();
+        let none = |_: &str| None;
+        let g = Graphics::resolve(file.graphics.clone(), none).unwrap();
+        assert_eq!(g.upscaler.as_deref(), Some("fxaa"));
+        assert_eq!(g.ray_tracing, Some(false));
+        let env = |k: &str| match k {
+            "VICTORY_UPSCALER" => Some(OsString::from("none")),
+            "VICTORY_RAY_TRACING" => Some(OsString::from("on")),
+            _ => None,
+        };
+        let g = Graphics::resolve(file.graphics, env).unwrap();
+        assert_eq!(g.upscaler.as_deref(), Some("none"));
+        assert_eq!(g.ray_tracing, Some(true));
+        let bad = |k: &str| (k == "VICTORY_RAY_TRACING").then(|| OsString::from("maybe"));
+        assert!(Graphics::resolve(Graphics::default(), bad).is_err());
+        assert_eq!(Graphics::resolve(Graphics::default(), none).unwrap(), Graphics::default());
+    }
 
     #[test]
     fn environment_overrides_file() {
