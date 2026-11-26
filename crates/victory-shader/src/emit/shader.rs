@@ -76,8 +76,8 @@ pub const SLOT_TOUCHED_SLOTS: u32 = 1 << 20;
 /// `VICTORY_SLOT_FEEDBACK`: 0 off; 1 (default) every stage notes the view-heap slots it
 /// reads through ([`SLOT_TOUCHED`]); 2 every stage but pixel programs; 3 as 1, but a pixel
 /// program that cannot test depth before it runs (a discard, a depth output, stores of
-/// its own) notes nothing. A pixel program that can is marked `[earlydepthstencil]`, so
-/// its stores do not hold back the depth test. Off by default in this crate's own tests,
+/// its own) notes nothing. Pixel programs without a colour output never note. A store or
+/// atomic is made only where it changes the buffer (most waves only read). Off by default in this crate's own tests,
 /// whose runners bind no buffer there.
 pub fn slot_feedback() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -89,6 +89,15 @@ pub fn slot_feedback() -> u8 {
         _ if cfg!(test) => 0,
         _ => 1,
     })
+}
+
+/// `VICTORY_SLOT_EARLY_DEPTH=1`: a pixel program that notes its slots, with a colour
+/// output and nothing a depth test first would change, is marked `[earlydepthstencil]`.
+/// Off by default: with it the sun's shadows came out black and far too large (fg-move3,
+/// together with pixel programs without colour outputs, which no longer note anything).
+fn early_depth() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SLOT_EARLY_DEPTH").as_deref().map(str::trim) == Ok("1"))
 }
 
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
@@ -638,6 +647,10 @@ impl Shader {
         // (A maximum made again with the same operands changes nothing either.)
         let tag = if uniform { super::bitcode::Tag::FirstLane } else { super::bitcode::Tag::Repeat };
         self.m.tag(atomic, tag);
+        // Only past what is there (Module::guarded): every wave of a draw names the
+        // same few slots, and atomics of one address from all of them wait for each other.
+        self.m.guard(atomic);
+
     }
 
     /// The epoch dword of [`SLOT_TOUCHED`], loaded once in the entry block (as a float).
@@ -680,6 +693,10 @@ impl Shader {
         // (Only these stores write there, all the same epoch: one that every path has
         // made already is left out.)
         self.m.tag(store, super::bitcode::Tag::Repeat);
+        // Only where the epoch is not there yet (Module::guarded): the first wave of the
+        // epoch stores, the others read (stores of one address from every wave queue).
+        self.m.guard(store);
+
     }
 
     /// The finished container.
@@ -714,10 +731,14 @@ impl Shader {
         // depth test wait for it: it tests depth first when nothing else would change by
         // that (no discard, depth, coverage or stencil output, no store of its own). One
         // that cannot keeps its stores (`VICTORY_SLOT_FEEDBACK=3`: leaves them out).
+        // A pixel program without a colour output (a depth or shadow pass) notes nothing.
         if self.pixel && self.touched_frame.is_some() {
+            let colour = self.outputs.iter().any(|o| o.kind == 16);
             let late = self.m.usage().late_effects
                 || self.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20));
-            if !late {
+            if !colour {
+                self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
+            } else if !late && early_depth() {
                 self.flags |= flags::EARLY_DEPTH;
             } else if slot_feedback() == 3 {
                 self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
@@ -741,9 +762,34 @@ impl Shader {
                 }
             }
         }
-        // The slot feedback's atomics of one value per wave: from its first lane alone.
-        if self.m.first_lane_only() > 0 {
-            self.flags |= flags::WAVE_OPS;
+        // The slot feedback's writes only where they change something (and the atomics of
+        // one value per wave from its first lane), after the clean-up merged the repeats.
+        if self.touched_frame.is_some() {
+            let (res, i32t, handle) = (self.t.res_ret, self.t.i32, self.t.handle);
+            let (i8t, i32p) = (self.m.int(8), i32t);
+            let fty = self.m.func_ty(res, vec![i32p, handle, i32p, i32p, i8t, i32p]);
+            self.m.ptr(fty);
+            let load = self.m.function("dx.op.rawBufferLoad.f32", fty, Some(Attr::ReadOnly), false);
+            let firsts = self.m.guarded(|m, b, i| {
+                let args = m.call_args(i);
+                let (op, touched, at) = (args[0], args[1], if args.len() > 7 { args[2] } else { args[3] });
+                let (k139, one, align) = (m.i32(139), m.i8(1), m.i32(4));
+                let iu = m.undef(i32t);
+                let r = m.call(b, load, vec![k139, touched, at, iu, one, align]);
+                let now = m.extract(b, r, 0);
+                let now = m.cast(b, super::bitcode::Cast::Bitcast, now, i32t);
+                if m.int_value(op) == Some(140) {
+                    // a store of the epoch: where another is there
+                    let epoch = m.cast(b, super::bitcode::Cast::Bitcast, args[4], i32t);
+                    m.cmp(b, super::bitcode::pred::NE, now, epoch)
+                } else {
+                    // an atomic maximum: past what is there
+                    m.cmp(b, super::bitcode::pred::IUGT, args[6], now)
+                }
+            });
+            if firsts > 0 {
+                self.flags |= flags::WAVE_OPS;
+            }
         }
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views

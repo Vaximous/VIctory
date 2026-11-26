@@ -27,7 +27,7 @@ pub(crate) enum Tag {
     /// writes there): the optimiser drops one below another in the dominator tree.
     Repeat,
     /// An atomic of a value the same in every lane: made by the wave's first lane alone
-    /// ([`Module::first_lane_only`]).
+    /// ([`Module::guarded`]).
     FirstLane,
 }
 
@@ -232,6 +232,8 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Instructions made only where a condition holds ([`Module::guard`]).
+    guards: HashMap<u32, V>,
 }
 
 impl Module {
@@ -558,18 +560,37 @@ impl Module {
         self.tags.retain(|i, _| !gone.contains(i));
     }
 
-    /// Puts every instruction tagged [`Tag::FirstLane`] behind a branch on
-    /// `waveIsFirstLane`: its block is split there, the instruction alone in a block
-    /// between the two halves. For a finished module (every block ended). Returns how
-    /// many were put behind one.
-    pub fn first_lane_only(&mut self) -> usize {
+    /// Puts instruction `v` (a store or atomic whose result nothing reads) behind a
+    /// condition [`Module::guarded`] builds.
+    pub fn guard(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.guards.insert(i, V::Inst(i));
+        }
+    }
+
+    /// The operands of call instruction `i`, past its function.
+    pub fn call_args(&self, i: u32) -> Vec<V> {
+        match &self.insts[i as usize].op {
+            Op::Call(_, args) => args.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Puts every instruction tagged [`Tag::FirstLane`] or given to [`Module::guard`]
+    /// behind a branch: on `waveIsFirstLane` and/or the condition `cond` builds for it (at
+    /// the end of the block before it, from the instruction's number). Its block is split
+    /// there, the instruction alone in a block between the two halves. For a finished
+    /// module (every block ended). Returns how many went behind `waveIsFirstLane`.
+    pub fn guarded(&mut self, mut cond: impl FnMut(&mut Self, usize, u32) -> V) -> usize {
         let mut sites: Vec<u32> = self
             .tags
             .iter()
             .filter(|&(_, &t)| t == Tag::FirstLane)
             .map(|(&i, _)| i)
+            .chain(self.guards.keys().copied())
             .collect();
         sites.sort_unstable();
+        sites.dedup();
         if sites.is_empty() {
             return 0;
         }
@@ -577,7 +598,7 @@ impl Module {
         let i32t = self.int(32);
         let fty = self.func_ty(i1, vec![i32t]);
         self.ptr(fty);
-        let f = self.function("dx.op.waveIsFirstLane", fty, Some(Attr::NoUnwind), false);
+        let mut first_lane = None;
         let op = self.i32(110);
         let mut done = 0;
         for i in sites {
@@ -599,9 +620,20 @@ impl Module {
             let only = self.new_block();
             self.blocks[only].body.push(i);
             self.blocks[only].term = Some(Term::Br(rest));
-            let first = self.call(b, f, vec![op]);
-            self.blocks[b].term = Some(Term::CondBr(first, only, rest));
-            done += 1;
+            let mut c = self.guards.contains_key(&i).then(|| cond(self, b, i));
+            if self.tags.get(&i) == Some(&Tag::FirstLane) {
+                let f = *first_lane.get_or_insert_with(|| {
+                    self.function("dx.op.waveIsFirstLane", fty, Some(Attr::NoUnwind), false)
+                });
+                let first = self.call(b, f, vec![op]);
+                c = Some(match c {
+                    Some(c) => self.bin(b, Bin::And, first, c),
+                    None => first,
+                });
+                done += 1;
+            }
+            let c = c.expect("a guarded instruction");
+            self.blocks[b].term = Some(Term::CondBr(c, only, rest));
         }
         done
     }
