@@ -83,6 +83,13 @@ pub enum Cache {
     Import { file: PathBuf },
     /// Build again the pipelines an earlier build ended in.
     ForgetBad,
+    /// Look for the shader containers the book names and lacks (an import
+    /// without them) in the title's files, without building anything.
+    Fill {
+        /// The title's folder (default: the configured game folder).
+        #[arg(long)]
+        game: Option<PathBuf>,
+    },
 }
 
 /// The pipeline cache's folder (beside the shaders').
@@ -158,6 +165,13 @@ pub fn command(c: Cache) -> Result<()> {
             println!("{} pipelines will be built again", book::forget_bad(&dir));
             Ok(())
         }
+        Cache::Fill { game } => {
+            let game = game
+                .or(cfg.game_dir)
+                .context("no game folder: pass --game")?;
+            let _ = std::fs::remove_file(dir.join(UNFOUND));
+            fill(&dir, &game)
+        }
     }
 }
 
@@ -230,35 +244,63 @@ fn prepare(dir: &Path, game: Option<&Path>) -> Result<()> {
             )
         }
     }
-    let missing = book::missing_shaders(dir);
-    if !missing.is_empty()
-        && let Some(game) = game
-    {
-        let began = Instant::now();
-        println!(
-            "cache          looking for {} shader containers in {}",
-            missing.len(),
-            game.display()
-        );
-        let found = find_containers(game, &missing);
-        let added = book::add_containers(dir, &found)?;
-        println!(
-            "cache          {added} found, {} not ({:.0} s)",
-            missing.len() - added,
-            began.elapsed().as_secs_f64()
-        );
+    if let Some(game) = game {
+        fill(dir, game)?;
     }
+    Ok(())
+}
+
+/// The containers the last look through the title's files did not find
+/// (BLAKE3s, one per line): a book whose missing containers are all there
+/// is not looked for again at every start.
+const UNFOUND: &str = "book-unfound.txt";
+
+/// Looks for the containers the book lacks in the title's files, unless
+/// the last look found none of the same.
+fn fill(dir: &Path, game: &Path) -> Result<()> {
+    let missing = book::missing_shaders(dir);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let unfound: std::collections::HashSet<String> = std::fs::read_to_string(dir.join(UNFOUND))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let hex = |h: &[u8; 32]| h.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    if missing.keys().all(|h| unfound.contains(&hex(h))) {
+        println!(
+            "cache          {} shader containers the book names are not in the title's files (`victory cache fill` looks again)",
+            missing.len()
+        );
+        return Ok(());
+    }
+    let began = Instant::now();
+    println!(
+        "cache          looking for {} shader containers in {}",
+        missing.len(),
+        game.display()
+    );
+    let found = find_containers(game, &missing);
+    let added = book::add_containers(dir, &found)?;
+    let left: Vec<String> = book::missing_shaders(dir).keys().map(hex).collect();
+    let _ = std::fs::write(dir.join(UNFOUND), left.join("\n"));
+    println!(
+        "cache          {added} found, {} not ({:.0} s)",
+        left.len(),
+        began.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
 /// The containers with the given hashes in the files under `root`.
 fn find_containers(root: &Path, wanted: &HashMap<[u8; 32], u8>) -> Vec<Vec<u8>> {
-    let mut found = Vec::new();
+    let (mut found, mut seen) = (Vec::new(), std::collections::HashSet::new());
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
     {
-        if found.len() >= wanted.len() {
+        if seen.len() >= wanted.len() {
             break;
         }
         if !entry.file_type().is_file()
@@ -274,7 +316,8 @@ fn find_containers(root: &Path, wanted: &HashMap<[u8; 32], u8>) -> Vec<Vec<u8>> 
                 continue;
             };
             let bytes = whole_container(&bytes);
-            if wanted.contains_key(blake3::hash(bytes).as_bytes()) {
+            let hash = *blake3::hash(bytes).as_bytes();
+            if wanted.contains_key(&hash) && seen.insert(hash) {
                 found.push(bytes.to_vec());
             }
         }
