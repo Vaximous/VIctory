@@ -827,6 +827,13 @@ fn log_memory() {
             buffers >> 20,
             used.saturating_sub(named) >> 20
         );
+        let [all, shared, spanned] = crate::resource::targets_shared();
+        tracing::info!(
+            "render targets with a host copy: {} MB; of them {} MB in title memory other targets overlap; the title              memory they span: {} MB (what they would take laid over each other as the title lays them)",
+            all >> 20,
+            shared >> 20,
+            spanned >> 20
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(

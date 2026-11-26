@@ -2269,6 +2269,55 @@ pub(crate) fn census() -> [u64; 10] {
     count
 }
 
+/// For the memory line: what the title's render targets (textures the host
+/// renders to or writes) with a host copy take: the host copies' bytes
+/// (twins not counted); of them, those of copies whose title memory overlaps
+/// another such texture's, which the title lays over each other; and the
+/// bytes of title memory they all span. Copies laid over each other as the
+/// title lays them would take about the last.
+#[cfg(windows)]
+pub(crate) fn targets_shared() -> [u64; 3] {
+    let mut spans: Vec<(u64, u64, u64)> = Vec::new();
+    for &at in textures().iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if fills(&r.desc) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && let Some(size) = footprint(&r.desc).map(|f| f.size)
+        {
+            let start = r.data() as u64;
+            spans.push((start, start + size, host.bytes));
+        }
+    }
+    spans.sort_unstable();
+    let [mut all, mut shared, mut spanned] = [0u64; 3];
+    // The end of the run of overlapping spans so far, and whether the one
+    // that opened it is counted as shared.
+    let mut run: Option<(u64, usize)> = None;
+    for i in 0..spans.len() {
+        let (start, end, bytes) = spans[i];
+        all += bytes;
+        match run {
+            Some((run_end, first)) if start < run_end => {
+                shared += bytes;
+                if first != usize::MAX {
+                    shared += spans[first].2;
+                }
+                spanned += end.saturating_sub(run_end);
+                run = Some((run_end.max(end), usize::MAX));
+            }
+            _ => {
+                spanned += end - start;
+                run = Some((end, i));
+            }
+        }
+    }
+    [all, shared, spanned]
+}
+
 /// Host textures alive (the title's and the twins) and the bytes the host
 /// gives them, for the memory line.
 #[cfg(windows)]
