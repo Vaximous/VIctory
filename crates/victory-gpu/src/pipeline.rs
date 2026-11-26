@@ -330,7 +330,7 @@ pub(crate) fn builder_rests(why: &'static str) {
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") && make::ray_tracing()) {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -763,6 +763,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub use make::{ray_tracing, set_ray_tracing};
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

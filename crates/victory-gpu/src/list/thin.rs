@@ -447,6 +447,12 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    HOST_UPSCALE upscale_op = super::upscale_now, (color: This, output: This, render: u64, out: u64, mode: u32);
+}
+
+/// [`super::upscale`], written down.
+pub(super) fn upscale(this: This, color: This, output: This, render: u64, out: u64, mode: u32) {
+    upscale_op(this, color, output, render, out, mode);
 }
 
 const fn after(n: u64) -> u64 {

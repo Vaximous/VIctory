@@ -53,6 +53,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    graphics(&cfg.graphics)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -162,7 +163,7 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    show(&exe_name, image.bind_imports(&Hooked(&with_dlls), policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -195,6 +196,42 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// The picture settings (`[graphics]`), before anything is bound or made.
+#[cfg(windows)]
+fn graphics(g: &victory_core::Graphics) -> Result<()> {
+    use victory_hle::modules::ffx::{Upscaler, set_upscaler};
+    if let Some(value) = &g.upscaler {
+        let upscaler = Upscaler::parse(value)
+            .with_context(|| format!("upscaler = {value:?}: expected \"fsr4\", \"none\" or \"fxaa\""))?;
+        set_upscaler(upscaler);
+    }
+    if let Some(on) = g.ray_tracing {
+        victory_hle::set_ray_tracing(on);
+    }
+    Ok(())
+}
+
+/// Binds the main image's imports, with the title's upscaler calls taken
+/// over where the settings say so (`victory_hle::modules::ffx`).
+#[cfg(windows)]
+struct Hooked<'a>(&'a dyn victory_loader::ImportResolver);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for Hooked<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        match self.0.resolve(dll, symbol) {
+            Resolution::Found { address, provenance } => {
+                match victory_hle::modules::ffx::hook(dll, &symbol.to_string(), address) {
+                    Some(ours) => Resolution::Found { address: ours, provenance: Provenance::Hle },
+                    None => Resolution::Found { address, provenance },
+                }
+            }
+            Resolution::Missing => Resolution::Missing,
+        }
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
