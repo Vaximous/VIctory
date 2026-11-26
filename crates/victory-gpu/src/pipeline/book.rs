@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -786,8 +786,28 @@ pub struct Plan {
     shaders: Vec<Place>,
     places: HashMap<Hash, Place>,
     entries: Vec<Vec<u8>>,
+    /// What each of them took to make in an earlier run, if that was long
+    /// (`library`'s list of slow pipelines; 0: quick or not known).
+    cost: Vec<u32>,
     keys_built: HashSet<Key>,
 }
+
+/// The pipelines that took long to make in earlier runs, and how long (ms):
+/// `library`'s list beside the book (`key ms` lines).
+fn slow_list(dir: &Path) -> HashMap<Key, u32> {
+    let text = std::fs::read_to_string(dir.join("slow-pipelines.txt")).unwrap_or_default();
+    let mut all = HashMap::new();
+    for (key, ms) in text.lines().filter_map(|l| l.split_once(' ')) {
+        if let (32, Ok(ms)) = (key.len(), ms.trim().parse::<u32>()) {
+            let known = all.entry(key_of(key)).or_insert(0);
+            *known = ms.max(*known);
+        }
+    }
+    all
+}
+
+/// Known to take long: built first, on half the workers, longest first.
+const SLOW_MS: u32 = 1000;
 
 impl Plan {
     /// Shaders to translate (or read from the cache).
@@ -830,8 +850,10 @@ pub fn plan(dir: &Path, again: bool) -> Option<Plan> {
         shaders: Vec::new(),
         places,
         entries: Vec::new(),
+        cost: Vec::new(),
         keys_built,
     };
+    let slow = slow_list(dir);
     let (mut seen, mut shaders) = (HashSet::new(), HashSet::new());
     for e in all {
         let Some(parsed) = parse(&e) else { continue };
@@ -860,6 +882,7 @@ pub fn plan(dir: &Path, again: bool) -> Option<Plan> {
                 plan.shaders.push(plan.places[h]);
             }
         }
+        plan.cost.push(slow.get(&parsed.key).copied().unwrap_or(0));
         plan.entries.push(e);
     }
     Some(plan)
@@ -910,6 +933,18 @@ struct Run {
     /// The shaders made so far, by hash (they are in the shader table too).
     made: Mutex<HashMap<Hash, Arc<Shader>>>,
     next: AtomicUsize,
+    /// The pipelines known to take long, longest first, and the next of
+    /// them; every pipeline is taken once, from either list.
+    slow: Vec<usize>,
+    next_slow: AtomicUsize,
+    taken: Vec<AtomicBool>,
+    /// For the time left: the known cost of the slow ones not started, the
+    /// quick ones not started, and what the quick ones took so far.
+    slow_left_ms: AtomicU64,
+    quick_left: AtomicUsize,
+    quick_ms: AtomicU64,
+    quick_done: AtomicUsize,
+    workers_at_start: usize,
     shaders_done: AtomicUsize,
     pipelines_done: AtomicUsize,
     failed: AtomicUsize,
@@ -931,10 +966,26 @@ impl Plan {
     pub fn start(self, workers: usize, background_workers: usize) -> Build {
         let file = std::fs::File::open(self.dir.join(SHADERS)).ok();
         let workers = workers.max(1);
+        let mut slow: Vec<usize> = (0..self.entries.len())
+            .filter(|&n| self.cost[n] >= SLOW_MS)
+            .collect();
+        slow.sort_by_key(|&n| std::cmp::Reverse(self.cost[n]));
+        let slow_left_ms = slow.iter().map(|&n| u64::from(self.cost[n])).sum();
+        let quick_left = self.entries.len() - slow.len();
         let run = Arc::new(Run {
             file,
             made: Mutex::new(HashMap::new()),
             next: AtomicUsize::new(0),
+            next_slow: AtomicUsize::new(0),
+            taken: (0..self.entries.len())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            slow,
+            slow_left_ms: AtomicU64::new(slow_left_ms),
+            quick_left: AtomicUsize::new(quick_left),
+            quick_ms: AtomicU64::new(0),
+            quick_done: AtomicUsize::new(0),
+            workers_at_start: workers,
             shaders_done: AtomicUsize::new(0),
             pipelines_done: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
@@ -999,6 +1050,12 @@ impl Run {
                     low = true;
                 }
             }
+            // Half the workers start with the pipelines known to take long
+            // (in the foreground): the build ends when the longest do.
+            let background = self.background.load(Ordering::Relaxed);
+            if me.is_multiple_of(2) && !background && self.take_slow() {
+                continue;
+            }
             let n = self.next.fetch_add(1, Ordering::Relaxed);
             if let Some(place) = self.plan.shaders.get(n) {
                 if let Some(s) = self.shader(place) {
@@ -1007,17 +1064,54 @@ impl Run {
                 self.shaders_done.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            let Some(entry) = n
+            match n
                 .checked_sub(shaders)
-                .and_then(|n| self.plan.entries.get(n))
-            else {
-                break;
-            };
-            self.pipelines_began.get_or_init(Instant::now);
-            self.pipeline(entry);
+                .filter(|&n| n < self.plan.entries.len())
+            {
+                Some(n) => self.build(n),
+                // The list in order is through: what is left of the slow ones.
+                None if self.take_slow() => {}
+                None => break,
+            }
         }
         if self.workers.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.finish();
+        }
+    }
+
+    /// Builds the next slow pipeline not taken yet; whether there was one.
+    fn take_slow(&self) -> bool {
+        loop {
+            let k = self.next_slow.fetch_add(1, Ordering::Relaxed);
+            let Some(&n) = self.slow.get(k) else {
+                return false;
+            };
+            if !self.taken[n].load(Ordering::Relaxed) {
+                self.build(n);
+                return true;
+            }
+        }
+    }
+
+    /// Builds entry `n` unless another worker took it.
+    fn build(&self, n: usize) {
+        if self.taken[n].swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let cost = self.plan.cost[n];
+        if cost >= SLOW_MS {
+            self.slow_left_ms
+                .fetch_sub(u64::from(cost), Ordering::Relaxed);
+        } else {
+            self.quick_left.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.pipelines_began.get_or_init(Instant::now);
+        let began = Instant::now();
+        self.pipeline(&self.plan.entries[n]);
+        if cost < SLOW_MS {
+            self.quick_ms
+                .fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            self.quick_done.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1093,9 +1187,22 @@ impl Build {
         let ended = r.pipelines_done.load(Ordering::Relaxed) + r.failed.load(Ordering::Relaxed);
         let pipelines = (ended, r.plan.entries.len());
         let elapsed = r.began.elapsed();
-        let left = r.pipelines_began.get().filter(|_| ended >= 8).map(|since| {
-            let each = since.elapsed().as_secs_f64() / ended as f64;
-            Duration::from_secs_f64(each * pipelines.1.saturating_sub(ended) as f64)
+        // The work not started (known costs of the slow ones, the quick
+        // ones at what they took so far) over the workers; pipelines in
+        // flight are not counted.
+        let quick_done = r.quick_done.load(Ordering::Relaxed);
+        let background = r.background.load(Ordering::Relaxed);
+        let workers = if background {
+            r.background_workers
+        } else {
+            r.workers_at_start
+        }
+        .max(1);
+        let quick_left = r.quick_left.load(Ordering::Relaxed);
+        let left = (quick_done >= 8 || quick_left == 0).then(|| {
+            let each = r.quick_ms.load(Ordering::Relaxed) as f64 / quick_done.max(1) as f64;
+            let ms = r.slow_left_ms.load(Ordering::Relaxed) as f64 + each * quick_left as f64;
+            Duration::from_secs_f64(ms / 1000.0 / workers as f64)
         });
         Progress {
             shaders,
@@ -1277,6 +1384,54 @@ mod tests {
         assert_eq!(take_suspects(dir.path()), 0);
         assert_eq!(forget_bad(dir.path()), 1);
         assert!(bad(dir.path()).is_empty());
+    }
+
+    /// Every pipeline is taken once, from the list in order or from the
+    /// slow ones, and the build ends with all of them counted. (Entries that
+    /// do not read end at once, as failed: no host is needed.)
+    #[test]
+    fn each_pipeline_is_built_once_slow_ones_or_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 40;
+        let plan = Plan {
+            dir: dir.path().to_owned(),
+            stamp: "test".into(),
+            book: n,
+            built: 0,
+            bad: 0,
+            unreadable: 0,
+            suspects: 0,
+            shaders: Vec::new(),
+            places: HashMap::new(),
+            entries: (0..n).map(|k| vec![k as u8]).collect(),
+            cost: (0..n)
+                .map(|k| if k % 5 == 0 { 2000 + k as u32 } else { 0 })
+                .collect(),
+            keys_built: HashSet::new(),
+        };
+        let build = plan.start(6, 0);
+        assert!(build.wait_while(|_| true));
+        let p = build.progress();
+        assert_eq!(p.pipelines, (n, n));
+        assert_eq!(p.failed, n);
+        assert!(build.0.taken.iter().all(|t| t.load(Ordering::Relaxed)));
+        assert_eq!(build.0.slow_left_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(build.0.quick_left.load(Ordering::Relaxed), 0);
+        assert_eq!(build.0.slow.len(), 8);
+        assert!(
+            build
+                .0
+                .slow
+                .windows(2)
+                .all(|w| build.0.plan.cost[w[0]] >= build.0.plan.cost[w[1]])
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(BUILT))
+                .unwrap()
+                .lines()
+                .next(),
+            Some("test")
+        );
     }
 
     #[test]
