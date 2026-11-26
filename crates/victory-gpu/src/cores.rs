@@ -129,6 +129,10 @@ fn placed(what: &str, chain: bool) -> bool {
     let Some((near, far)) = split() else {
         return false;
     };
+    // `VICTORY_CCD_CHAIN_FAR=1`: ours a frame waits for one by one keep to
+    // the other dies too, the first left to the title's threads alone.
+    static CHAIN_FAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let chain = chain && !*CHAIN_FAR.get_or_init(|| crate::switch::on("VICTORY_CCD_CHAIN_FAR"));
     let sets = if chain { near } else { far };
     // SAFETY: our own thread and a list of the system's own set ids.
     let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), sets.as_ptr(), sets.len() as u32) };
