@@ -2470,6 +2470,28 @@ pub(crate) fn relay() -> bool {
     *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
 }
 
+/// Whether a fill that reads what a copy at its place in a list (ahead of
+/// it in the submission) wrote is done on the card out of that copy's
+/// source (`card_steps::through_placed`) instead of refusing the submission
+/// (`VICTORY_OVERLAP`, on unless `0`).
+///
+/// Run fox-lap 1: once a frame a fill of 384 bytes of the title's ring of
+/// constants reads what a copy at its place, a few lists earlier, puts
+/// there out of memory shaders write (the copy and the fill are in the same
+/// list, so `VICTORY_PLACED_ORDER` cannot cut between them). Refused, the
+/// submission stood 230-266 ms a frame until every flight that writes the
+/// title's 174 MB heap had landed: the submitting thread did nothing for most
+/// of the frame, and the card ran dry behind it for 8-9 ms a frame.
+///
+/// With it the title may also be two presents ahead of the thread that
+/// submits (`VICTORY_SUBMIT_FRAMES` 2 instead of 1, `crate::queue`): its
+/// threads stood 25-55 ms a frame at the present waiting for the frame
+/// before to be sent, while the card and that thread still had work.
+pub(crate) fn overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OVERLAP").is_none_or(|v| v != "0"))
+}
+
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared

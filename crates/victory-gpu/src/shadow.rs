@@ -207,6 +207,10 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// The most bytes of copies on the card with `crate::host::overlap` on a
+/// card of 10 GiB or more, unless `VICTORY_CARD_BUFFERS_MB` says otherwise.
+const OVERLAP_CARD_MB: u64 = 1536;
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -219,11 +223,23 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let (mut min_bytes, mut max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
+        // With `crate::host::overlap` on a card of 10 GiB or more: room for
+        // the copies of every buffer shaders write (run fox-lap 2cb: 976 MB
+        // of copies on a 12 GB card; at 512 MB the rest stayed in the PC's
+        // memory, where shaders reached it over the bus and the CPU took
+        // 189 MB of snapshots a frame to find what they wrote: 315 ms a
+        // frame against 268 ms with all of them on the card).
+        if env_mb("VICTORY_CARD_BUFFERS_MB").is_none()
+            && crate::host::overlap()
+            && vram_budget.is_some_and(|b| b >= 10 << 30)
+        {
+            max_bytes = max_bytes.max(OVERLAP_CARD_MB << 20);
+        }
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;

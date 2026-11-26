@@ -228,23 +228,6 @@ fn meet(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-/// Whether a fill that reads what a copy at its place in a list (ahead of
-/// it in the submission) wrote is done on the card out of that copy's
-/// source ([`through_placed`]) instead of refusing the submission
-/// (`VICTORY_OVERLAP`, on unless `0`).
-///
-/// Run fox-lap 1: once a frame a fill of 384 bytes of the title's ring of
-/// constants reads what a copy at its place, a few lists earlier, puts
-/// there out of memory shaders write (the copy and the fill are in the same
-/// list, so `VICTORY_PLACED_ORDER` cannot cut between them). Refused, the
-/// submission stood 230-266 ms a frame until every flight that writes the
-/// title's 174 MB heap had landed: the submitting thread did nothing for most
-/// of the frame, and the card ran dry behind it for 8-9 ms a frame.
-pub(crate) fn overlap() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_OVERLAP").is_none_or(|v| v != "0"))
-}
-
 /// A check of [`through_placed`] (`VICTORY_OVERLAP_CHECK=1`; off by
 /// default): for every fill made to read a copy's source, the submission
 /// waits for the flights that write that source as before (so it is slow),

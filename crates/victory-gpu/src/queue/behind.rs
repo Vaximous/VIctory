@@ -625,10 +625,11 @@ fn runs_most() -> usize {
 
 /// How many presents may be in the line when a present call returns
 /// (`VICTORY_SUBMIT_FRAMES`; 1: the frame before is sent, this one may not be;
-/// 0: both are).
+/// 0: both are; 2, the default with `crate::host::overlap`: the title may be
+/// two frames ahead of what is sent).
 fn frames_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
+    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(if crate::host::overlap() { 2 } else { 1 }))
 }
 
 fn number(name: &str) -> Option<usize> {
