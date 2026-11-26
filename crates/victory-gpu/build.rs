@@ -29,6 +29,13 @@ fn main() {
     let source = crates.join("victory-shader/src");
     println!("cargo:rerun-if-changed={}", source.display());
     files(&source, &mut all);
+    // Tests do not change what the translator puts out: a test added or
+    // changed keeps the cached translations.
+    all.retain(|p| {
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        let inside = p.strip_prefix(&source).map(|r| r.components().any(|c| c.as_os_str() == "tests")).unwrap_or(false);
+        !(name.ends_with("_tests.rs") || name == "tests.rs" || inside)
+    });
     all.sort();
     let mut hash = blake3::Hasher::new();
     for path in &all {
