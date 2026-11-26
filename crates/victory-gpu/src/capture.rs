@@ -462,11 +462,18 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
+        let name = format!("frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+        // With `VICTORY_DUMP_E5=1` the packed-light and small-float targets
+        // are also saved as raw texels (rows without padding), to be read
+        // as numbers.
+        if matches!(f.Format.0, 26 | 42) && crate::switch::on("VICTORY_DUMP_E5")
+            && let Some(dir) = folder()
+        {
+            let row = f.Width as usize * 4;
+            let raw: Vec<u8> = (0..f.Height as usize).flat_map(|y| rows[y * pitch..y * pitch + row].iter().copied()).collect();
+            let _ = std::fs::write(dir.join(format!("{name}.bin")), raw);
+        }
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -605,6 +612,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        // `VICTORY_DUMP_E5=1`: R32_UINT as the packed light (R9G9B9E5) it holds.
+        42 if crate::switch::on("VICTORY_DUMP_E5") => (4, Box::new(move |b| {
+            let v = u32_at(b, 0);
+            let scale = 2f32.powi((v >> 27) as i32 - 24);
+            [0, 1, 2].map(|k| (v >> (9 * k) & 0x1ff) as f32 * scale)
+        })),
         // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
@@ -618,7 +631,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65) && !(format == 42 && crate::switch::on("VICTORY_DUMP_E5"));
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))

@@ -29,6 +29,8 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_TITLE=<multiple>` lets the title's own output through, up to
+//! that multiple of the estimate (0, unset: not at all; 4 before).
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -110,6 +112,30 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// How far the title's own output counts, as a multiple of the estimate
+/// (`VICTORY_AMBIENT_TITLE=<multiple>`; 0 when unset: not at all). The sky's
+/// light outdoors is what it holds right; but indoors it holds blocks of
+/// other memory (the probes' stale texels), and up to 4 times the estimate
+/// (as it was) those show as flat patches of green, yellow, purple with hard
+/// stepped edges on walls and skin, and, when that memory happens to hold
+/// bright values, wash the whole picture out (a different one each run).
+/// `VICTORY_AMBIENT_TITLE_FROM=<frame>:<multiple>` changes it from that
+/// presented frame on (to compare two settings in one run).
+fn most() -> f32 {
+    static SET: OnceLock<(f32, u64, f32)> = OnceLock::new();
+    let (most, from, then) = *SET.get_or_init(|| {
+        let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+        let most = number(&std::env::var("VICTORY_AMBIENT_TITLE").unwrap_or_default()).unwrap_or(0.0);
+        let later = std::env::var("VICTORY_AMBIENT_TITLE_FROM").unwrap_or_default();
+        let (from, then) = later
+            .split_once(':')
+            .and_then(|(f, m)| Some((f.trim().parse().ok()?, number(m)?)))
+            .unwrap_or((u64::MAX, most));
+        (most, from, then)
+    });
+    if crate::queue::presented() >= from { then } else { most }
 }
 
 /// Strength and radius of the creases' shade.
@@ -320,9 +346,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // What the program left counts as far as it can be true (`most` times
+    // the estimate): the sky's light outdoors, not the blocks of other memory.
+    if (most <= 0.0) {
+        light[p] = pack(found);
+        return;
+    }
     float3 was = unpack(light[p]);
-    // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
@@ -459,7 +489,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most().to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
