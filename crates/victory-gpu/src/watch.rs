@@ -1386,7 +1386,29 @@ struct Guards {
     /// these are looked up.)
     aliased: Blocks,
     /// Blocks opened by a write fault, and when ([`rest`]).
-    opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// With how many doublings of [`rest`] it rests ([`Guards::opened`]).
+    opened: std::collections::HashMap<usize, (std::time::Instant, u8), std::hash::BuildHasherDefault<PageHash>>,
+}
+
+/// A block written again within this long after its rest ended is hot
+/// ([`Guards::opened`]).
+///
+/// Each fault on a guarded block is a change of protection under the
+/// guards' lock while the title's thread stands, and other faults and
+/// refreshes wait for that lock: 650 to 850 waits a frame, 80 to 115 ms of
+/// threads' time (run fox-lap 5ot), some of it on the title's own threads,
+/// whose waits are what its main thread waits for in turn. The blocks the
+/// title writes every frame are guarded and opened again every frame. A
+/// block that rests is taken as written at each asking (copied whole,
+/// some microseconds for 64 KiB), which is what it would be found anyway.
+const HOT_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The most doublings of a hot block's rest: 3 ms * 64, about 0.2 s.
+const HEAT_MOST: u8 = 6;
+
+/// `VICTORY_GUARD_HEAT` (on unless 0): see [`Guards::opened`].
+fn heat_on() -> bool {
+    crate::toggled!("VICTORY_GUARD_HEAT")
 }
 
 impl Guards {
@@ -1396,20 +1418,27 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|&(at, heat)| at.elapsed() < rest * (1 << heat))
     }
 
-    /// A write fault opened `block`.
+    /// A write fault opened `block`. A block opened again soon after its
+    /// last rest ended is one the title writes all the time: it rests twice
+    /// as long as the last time, up to [`HEAT_MOST`] doublings
+    /// (`VICTORY_GUARD_HEAT=0`: the same rest each time, as before).
     fn opened(&mut self, block: usize) {
         const MANY: usize = 1 << 13;
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            self.opened.retain(|_, (at, _)| at.elapsed() < HOT_AGAIN);
             if self.opened.len() >= MANY {
                 self.opened.clear();
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-        self.opened.insert(block, std::time::Instant::now());
+        let heat = match self.opened.get(&block) {
+            Some(&(at, heat)) if heat_on() && at.elapsed() < HOT_AGAIN + rest() * (1 << heat) => (heat + 1).min(HEAT_MOST),
+            _ => 0,
+        };
+        self.opened.insert(block, (std::time::Instant::now(), heat));
     }
 }
 
