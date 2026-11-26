@@ -1740,17 +1740,24 @@ pub(crate) fn targets_room_kept() -> u64 {
     // the pool's blocks lay free beside them (run fox-lap 9o1).
     const GROWTH: u64 = 64 << 20;
     const SETTLED_MS: u64 = 30_000;
-    // The bytes at the last growth, and when.
-    static GREW: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    // The most bytes they came to, when that last grew, and whether they
+    // settled. Growth is counted from the most, not from where they fell
+    // back to, and once settled they stay settled: in the open world, moving,
+    // targets came and went by more than 64 MiB within every 30 s, the 1.5 GB
+    // kept never went, and the card had no room for the 5,400 textures due.
+    static GREW: std::sync::Mutex<(u64, u64, bool)> = std::sync::Mutex::new((0, 0, false));
     if crate::toggled!("VICTORY_TARGETS_ROOM_SETTLES") {
         let now = crate::host::now_ms();
         let mut grew = GREW.lock().unwrap_or_else(|e| e.into_inner());
-        if targets > grew.0 + GROWTH || grew.1 == 0 {
-            *grew = (targets, now);
-        } else if targets < grew.0 {
-            grew.0 = targets;
+        if grew.2 {
+            return 0;
         }
-        if now.saturating_sub(grew.1) > SETTLED_MS && targets >= 256 << 20 {
+        if targets > grew.0 + GROWTH || grew.1 == 0 {
+            *grew = (targets.max(grew.0), now, false);
+        }
+        if now.saturating_sub(grew.1) > SETTLED_MS && grew.0 >= 256 << 20 {
+            grew.2 = true;
+            tracing::info!(mb = grew.0 >> 20, "render targets settled: no more room kept for them (VICTORY_TARGETS_ROOM_SETTLES)");
             return 0;
         }
     }
