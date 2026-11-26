@@ -2048,15 +2048,29 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // With a limit, the longest idle first; before that, those whose going
+    // frees the most of the card: a texture of its own allocation, then one
+    // in the emptiest block of the pool, which the pool lets go of once it
+    // is empty (`VICTORY_SWEEP_BLOCKS=0`: by idle time alone). By idle time
+    // alone, what went left holes all over the blocks: in run fox-lap 8o1
+    // 3,700 MB of the 8,320 MB of blocks held nothing, the card was past
+    // its budget and no new texture had room.
+    let mut by_age: Vec<(u64, u64, usize)> = Vec::new();
     if most != u64::MAX {
+        let blocks = crate::toggled!("VICTORY_SWEEP_BLOCKS");
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                // In sixteenths of a block.
+                let full = if blocks {
+                    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                    made.as_ref().map_or(0, |(host, _)| crate::pool::block_held(&host.texture).map_or(0, |held| 1 + (held >> 22)))
+                } else {
+                    0
+                };
+                by_age.push((full, used & 0xffff_ffff, at));
             }
         }
         by_age.sort_unstable();
@@ -2078,7 +2092,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -3018,7 +3032,7 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
 /// frame listing, which must not count as a use).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;

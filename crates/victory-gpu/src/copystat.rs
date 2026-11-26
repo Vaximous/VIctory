@@ -796,6 +796,38 @@ fn log_memory() {
             crate::pool::empty_blocks()
         );
     }
+    {
+        // Where the card's memory goes, by kind, against what the system
+        // says is in use: the rest is ours unnamed (lists' memory on the card,
+        // tables, buffers of our own passes) and the runtime's and driver's.
+        let [blocks_mb, _] = crate::pool::memory();
+        let blocks = blocks_mb << 20;
+        let free = crate::pool::texture_room();
+        let held = blocks.saturating_sub(free);
+        let tiles = [2, 3].map(|i| crate::tiles::STATS[i].load(Relaxed));
+        let own = kinds[1].saturating_sub(held);
+        let twins = census[7];
+        let targets = census[1].saturating_sub(twins);
+        let buffers = crate::shadow::live_span_bytes();
+        let named = blocks + tiles[1] + own + targets + twins + buffers;
+        let [budget, used, ..] = card;
+        tracing::info!(
+            "the card's memory by kind (MB): in use {} of a budget of {}; texture blocks {} ({} held, {} free in {} empty              blocks and holes); tile heaps {} ({} given); textures the title fills outside blocks {}; render targets and              what the host writes {}; depth twins {}; card copies of title buffers and windows {}; the rest {}",
+            used >> 20,
+            budget >> 20,
+            blocks >> 20,
+            held >> 20,
+            free >> 20,
+            crate::pool::empty_blocks(),
+            tiles[1] >> 20,
+            tiles[0] >> 20,
+            own >> 20,
+            targets >> 20,
+            twins >> 20,
+            buffers >> 20,
+            used.saturating_sub(named) >> 20
+        );
+    }
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
