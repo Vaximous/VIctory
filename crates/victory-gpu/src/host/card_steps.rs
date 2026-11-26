@@ -294,15 +294,27 @@ impl Check {
 /// flight that writes it is ahead of our list on the queue, and the title's
 /// bytes are brought up to date by our list's refresh ([`plan`]'s argument).
 /// What the copy itself does at its place in the list is unchanged.
+///
+/// Only the copies at their place, the other copies and what runs are looked
+/// at for each fill (by their places, kept apart): looking through every
+/// step ahead of each fill took 9.5 ms of the submitting thread for one
+/// submission of some 1,400 fills among thousands of steps (run fb-tl).
 fn through_placed(does: &mut [Does]) -> Vec<(usize, usize)> {
     let mut moved = Vec::new();
+    let placed: Vec<usize> = (0..does.len()).filter(|&p| matches!(does[p], Does::Placed { .. })).collect();
+    if placed.is_empty() {
+        return moved;
+    }
+    let writes: Vec<usize> =
+        (0..does.len()).filter(|&w| matches!(does[w], Does::Copy { .. } | Does::Placed { .. } | Does::Run)).collect();
     for i in 0..does.len() {
         let Does::Fill { src, len, .. } = does[i] else {
             continue;
         };
         let read = (src, src + len);
         // The last copy at its place ahead of it that writes any of it.
-        let Some(p) = (0..i).rev().find(|&p| matches!(does[p], Does::Placed { dst, len, .. } if meet((dst, dst + len), read)))
+        let ahead = &placed[..placed.partition_point(|&p| p < i)];
+        let Some(p) = ahead.iter().rev().copied().find(|&p| matches!(does[p], Does::Placed { dst, len, .. } if meet((dst, dst + len), read)))
         else {
             continue;
         };
@@ -313,7 +325,8 @@ fn through_placed(does: &mut [Does]) -> Vec<(usize, usize)> {
         if read.0 < to.0 || read.1 > to.1 || meet(to, source) {
             continue;
         }
-        let between_writes = does[p + 1..i].iter().any(|d| match *d {
+        let between = &writes[writes.partition_point(|&w| w <= p)..writes.partition_point(|&w| w < i)];
+        let between_writes = between.iter().map(|&w| &does[w]).any(|d| match *d {
             Does::Copy { dst, len, .. } | Does::Placed { dst, len, .. } => {
                 meet((dst, dst + len), read) || meet((dst, dst + len), source)
             }
@@ -801,7 +814,9 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (mut does, steps) = does_of(written, runs);
+        spent.next("steps on the card: fills through copies at their place");
         let moved = if overlap() { through_placed(&mut does) } else { Vec::new() };
+        spent.next("steps on the card: planned");
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if !moved.is_empty() {
             THROUGH.fetch_add(moved.len() as u64, Ordering::Relaxed);
