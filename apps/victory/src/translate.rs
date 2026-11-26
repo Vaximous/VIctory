@@ -431,6 +431,21 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                                     }
                                 }
                                 Err(why) => {
+                                    // `VICTORY_FAIL_DUMP=<dir>`: every container that does not
+                                    // translate, as `<hash>.cdxil`, with the reason in `fails.txt`
+                                    if let Some(dir) = std::env::var_os("VICTORY_FAIL_DUMP") {
+                                        let dir = std::path::Path::new(&dir);
+                                        let hex = &hash.to_hex()[..16];
+                                        let _ = std::fs::create_dir_all(dir);
+                                        let _ = std::fs::write(dir.join(format!("{hex}.cdxil")), &bytes[..]);
+                                        let line = format!("{hex}  {why}
+");
+                                        let _ = std::fs::OpenOptions::new()
+                                            .create(true)
+                                            .append(true)
+                                            .open(dir.join("fails.txt"))
+                                            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+                                    }
                                     let mut failed = lock(&failed);
                                     failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
                                 }

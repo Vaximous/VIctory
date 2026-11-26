@@ -988,6 +988,15 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     if (0..n).any(|r| reads[r] && writes[r]) {
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            for r in (0..n).filter(|&r| reads[r] && writes[r]) {
+                let at: Vec<String> = (0..n)
+                    .filter(|&b| !all[b] && find(&mut region, b) == r)
+                    .flat_map(|b| p.blocks[b].insts.iter().filter(|i| matches!(i.fields, Fields::Ds { .. })).map(move |i| format!("B{b}:{:#x} {}", i.machine.offset, i.name())))
+                    .collect();
+                eprintln!("WAVE64-LDS-REGION [{}]", at.join(", "));
+            }
+        }
         return None;
     }
     let mut meet = vec![(false, false); n];
