@@ -184,13 +184,13 @@ fn early_budgets() -> (u64, u64) {
 }
 
 /// Textures a frame's bake passes may make although the card has no room
-/// for new host copies (`VICTORY_BAKE_OVER_FULL`, 768 a frame; 0: refused
+/// for new host copies (`VICTORY_BAKE_OVER_FULL`, 128 a frame, never past the card's budget; 0: refused
 /// like any other, as before). A bake reads its sources once: one it does
 /// not find on the card is baked as nothing for the run.
 fn bake_over_full() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_BAKE_OVER_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(768)
+        std::env::var("VICTORY_BAKE_OVER_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128)
     })
 }
 
@@ -3042,9 +3042,12 @@ impl State {
                 // what the bake does not find on the card it bakes as
                 // nothing, once (dark faces in the open world, where the
                 // card is past its line whenever a passer-by is baked).
+                // (Not past the card's whole budget: ow11 made 7,500 so and
+                // stood at 105 % of it.)
                 let for_bake = !has_its_texture
                     && !back
                     && required
+                    && memory.is_some_and(|[budget, used, ..]| used < budget)
                     && BAKE_OVER_FULL.fetch_add(1, Ordering::Relaxed) < bake_over_full();
                 if for_bake {
                     let n = BAKE_OVER_FULL_MADE.fetch_add(1, Ordering::Relaxed) + 1;
