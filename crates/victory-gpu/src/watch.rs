@@ -4523,12 +4523,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Whether a mapping the runtime made over title memory that the guards
 /// note nothing of takes the guards' lock shared only, to look
-/// (`VICTORY_REMAP_LOOK`, on unless `=0`). In run ow43-move the title's
-/// mappings took it alone some 70 times a frame, nearly always over blocks
-/// with nothing noted; each time the faults queued behind them (the faults
-/// waited 4-9 ms a frame for the lock shared).
+/// (`VICTORY_REMAP_LOOK=1`). In run ow43-move the title's mappings took it
+/// alone some 70 times a frame, nearly always over blocks with nothing
+/// noted; each time the faults queued behind them (the faults waited 4-9 ms
+/// a frame for the lock shared).
+///
+/// Off unless `=1`: with the lock shared, a refresh may guard a block of the
+/// new mapping while the look runs beside it, and the block is not opened as
+/// the lock taken alone would; builds with it on (runs ow47, ow47b, ow50)
+/// crashed in the title reading a pointer that was not one.
 fn remap_look() -> bool {
-    crate::toggled!("VICTORY_REMAP_LOOK")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_LOOK").is_some_and(|v| v == "1"))
 }
 
 /// Whether the guards note nothing of `[at, at + len)`: no block guarded,
