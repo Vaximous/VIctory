@@ -710,6 +710,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's queue Signal");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::gpuwait::signal_called(fence as usize, value);
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         behind::signal(this, fence, value);
@@ -830,6 +832,8 @@ impl Written {
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::gpuwait::label_set(at as usize);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
