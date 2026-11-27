@@ -90,12 +90,6 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_counted(parts, counted_in_threads(parts))
 }
 
-/// Whether the title dispatches the program by a count of threads whose last
-/// group may be partial: the structure builder's programs of one dimension.
-/// Their lanes past the count must not run (they count the lanes of a wave
-/// and store). Not where a group barrier would wait for lanes that left, nor
-/// where two host waves of 32 stand for a console wave (they exchange, which
-/// takes all lanes).
 /// `VICTORY_FINITE_COLOUR` (default 1; 0 off): a pixel program's float colour outputs
 /// are made finite before the target gets them (NaN 0, an infinity the largest half).
 /// Against the black blots under water (most likely such texels, spread by the blurs
@@ -103,6 +97,21 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 fn finite_colour() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_FINITE_COLOUR").as_deref().map(str::trim) != Ok("0"))
+}
+
+/// `VICTORY_NAN_SCRUB` (default 1; 0 off): a float image store writes 0 for a channel
+/// that is NaN or an infinity ([`Lower::scrub_nan`]), and so does a pixel program's
+/// colour output where [`finite_colour`] is off. A NaN a compute pass stores reaches
+/// the title's bloom, blurs and temporal upscaler as a colour does, and spreads into
+/// black patches that stay in their history (black blobs on faces and in the air on
+/// NVIDIA); an infinity through bloom or the exposure turned the whole picture white
+/// at one angle. Not what the console does, hence a switch (both are in the shader
+/// cache key). The colour outputs are [`finite_colour`]'s where it is on: it makes them
+/// finite already (an infinity the largest half there, not 0), so nothing is done
+/// twice. After victory-nvidia-megafork 77e13a974a.
+fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_NAN_SCRUB").as_deref().map(str::trim) != Ok("0"))
 }
 
 /// `VICTORY_CHEAP_FLOAT`: a set of [`super::rdna`]'s bits (decimal or `0x` hex) written
@@ -131,6 +140,12 @@ fn host_float() -> u32 {
     host_rdna() | cheap_float()
 }
 
+/// Whether the title dispatches the program by a count of threads whose last
+/// group may be partial: the structure builder's programs of one dimension.
+/// Their lanes past the count must not run (they count the lanes of a wave
+/// and store). Not where a group barrier would wait for lanes that left, nor
+/// where two host waves of 32 stand for a console wave (they exchange, which
+/// takes all lanes).
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -4365,6 +4380,22 @@ impl<'a> Lower<'a> {
         let number = self.s.m.cmp(c, pred::ORD, f, f);
         let edge = self.s.m.select(c, number, edge, zero);
         self.s.m.select(c, finite, f, edge)
+    }
+
+    /// `f`, or 0 where it is NaN or an infinity ([`nan_scrub`]): one comparison and a
+    /// select fewer than [`Self::finite`], for the stores where an infinity need not
+    /// keep its sign. A constant that is finite is left as it is.
+    fn scrub_nan(&mut self, f: V) -> V {
+        if self.s.m.float_k(f).is_some_and(f32::is_finite) {
+            return f;
+        }
+        let c = self.cur;
+        let size = self.unary(6, f);
+        let inf = self.s.m.f32(f32::INFINITY.to_bits());
+        // Unordered: true for NaN as for the infinities.
+        let bad = self.s.m.cmp(c, pred::UGE, size, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -12060,6 +12091,12 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            // No NaN nor infinity into a float image ([`nan_scrub`]).
+            if nan_scrub() {
+                for v in &mut vals {
+                    *v = self.scrub_nan(*v);
+                }
+            }
             let h = self.handle(site, src, false, props)?;
             let guard = self.last_lane_store(inst, guard, &[(reg, if *d16 { 2 } else { 4 })])?;
             let at = self.begin_guarded(guard);
@@ -13441,8 +13478,12 @@ impl<'a> Lower<'a> {
                 _ => (".i32", x),
             };
             let colour = elements(self, primitive)[id].kind == 16;
+            // A colour made finite ([`finite_colour`]), else at least without NaN
+            // nor infinity ([`nan_scrub`]): one of the two, never both.
             let x = if suffix == ".f32" && colour && self.s.pixel && finite_colour() {
                 self.finite(x)
+            } else if suffix == ".f32" && colour && self.s.pixel && nan_scrub() {
+                self.scrub_nan(x)
             } else {
                 x
             };

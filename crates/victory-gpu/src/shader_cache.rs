@@ -91,6 +91,9 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // Colours and float image stores made finite or free of NaN.
+            "VICTORY_FINITE_COLOUR",
+            "VICTORY_NAN_SCRUB",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
