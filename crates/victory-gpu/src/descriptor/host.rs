@@ -3212,6 +3212,24 @@ impl HostHeap {
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
+    /// Whether slot `index`, showing the made view `shown`, shows it through
+    /// an array view ([`as_array`]).
+    fn arrayed(&self, index: u32, shown: u64) -> bool {
+        if shown == 0 || AS_ARRAY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let key = (std::ptr::from_ref(self) as usize, index);
+        ARRAYED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key)) == Some(&shown)
+    }
+
+    /// Slot `index` shows the made view `shown` through an array view.
+    fn note_arrayed(&self, index: u32, shown: u64) {
+        let key = (std::ptr::from_ref(self) as usize, index);
+        let mut arrayed = ARRAYED.lock().unwrap_or_else(|e| e.into_inner());
+        let arrayed = arrayed.get_or_insert_with(Default::default);
+        arrayed.insert(key, shown);
+    }
+
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
@@ -3657,7 +3675,10 @@ impl HostHeap {
                 && let Some(old) = view_at(shown as u32, (shown >> 32) as u32)
             {
                 let kin = kin(&old, &view);
-                if kin == Kin::Same {
+                // A slot that shows its texture through an array view of it
+                // ([`as_array`]) keeps that only for another array view.
+                let fits = !self.arrayed(index, shown) || view_dimension(&view) == TEXTURE2D_ARRAY;
+                if kin == Kin::Same && fits {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     drop(held);
                     self.unmake_stale(index, stale);
@@ -3667,9 +3688,26 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = (keep_when_full() || crate::resource::room_lately()) && kin.kept(keep_shown());
+                    let kept = (keep_when_full() || crate::resource::room_lately()) && kin.kept(keep_shown()) && fits;
                     rewritten(kin, kept);
                     if kept {
+                        drop(held);
+                        self.unmake_stale(index, stale);
+                        return Some(view);
+                    }
+                    // A 2D texture's slot written with a 2D array's view goes
+                    // on showing the 2D texture, as an array of one, until
+                    // the new one is made (most of the slots that went grey:
+                    // 19,940 in run ow20b-move).
+                    if kin == Kin::None
+                        && keep_as_array()
+                        && is_texture_view(&view)
+                        && let Some(array) = as_array(&old, &view)
+                        && let Some(made) = make(&array, self.at(index))
+                    {
+                        self.keep(index, made);
+                        self.note_arrayed(index, shown);
+                        AS_ARRAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
@@ -4995,6 +5033,44 @@ fn keep_when_full() -> bool {
 /// neutral texture) while a new one was made: should stay 0.
 pub(crate) static WENT_GREY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+const TEXTURE2D: u32 = 4;
+const TEXTURE2D_ARRAY: u32 = 5;
+
+/// Whether a slot that shows a 2D texture and is written with a view of a
+/// 2D array shows the old texture as an array of one until the new one is
+/// made (`VICTORY_KEEP_AS_ARRAY`, on; =0 the neutral texture meanwhile).
+fn keep_as_array() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_AS_ARRAY").is_none_or(|v| v != "0"))
+}
+
+/// Slots shown through an array view of their 2D texture ([`as_array`]).
+pub(crate) static AS_ARRAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The 2D texture view `old` as a view of a 2D array of one slice, for a
+/// slot now written with `new`, a 2D array's view: the same texture, levels
+/// and component mapping. None for any other pair.
+fn as_array(old: &View, new: &View) -> Option<View> {
+    if view_dimension(old) != TEXTURE2D || view_dimension(new) != TEXTURE2D_ARRAY {
+        return None;
+    }
+    // (Words as D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension, mapping,
+    // a pad, then for a 2D texture first level, levels, plane, clamp; for
+    // an array first level, levels, first slice, slices, plane, clamp.)
+    let array = |w: &[u32]| -> [u32; 10] {
+        [w[0], TEXTURE2D_ARRAY, w[2], w[3], w[4], w[5], 0, 1, w[6], w[7]]
+    };
+    match old {
+        View::Shader(r, Some(desc)) => Some(View::Shader(*r, Some(array(desc)))),
+        View::Placed(false, resource, desc) => {
+            let mut words = *desc;
+            words[..10].copy_from_slice(&array(&desc[..10]));
+            Some(View::Placed(false, *resource, words))
+        }
+        _ => None,
+    }
+}
+
 /// The view dimension of a texture view (0: not one).
 fn view_dimension(view: &View) -> u32 {
     match view {
@@ -5012,6 +5088,10 @@ fn grey_dimensions(old: &View, new: &View) {
     let (a, b) = (view_dimension(old).min(15), view_dimension(new).min(15));
     GREY_DIMENSIONS[(a * 16 + b) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Slots (by their heap's slots and index) shown through an array view, and
+/// the made view they show so ([`HostHeap::note_arrayed`]).
+static ARRAYED: Mutex<Option<std::collections::HashMap<(usize, u32), u64>>> = Mutex::new(None);
 
 /// [`WENT_GREY`] by where (0: a view left for later, [`Slots::show_later`];
 /// 1: a view that waits, views not kept; 2: one that waits, not kept) and
@@ -5041,6 +5121,7 @@ fn went_grey(index: u32, at: usize, kin: Option<Kin>) {
         tracing::info!(
             so_far = n,
             slot = index,
+            shown_as_array = AS_ARRAY.load(Relaxed),
             "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen); by where (left for later, waits, waits not kept) and kin (same, moved, sized, other, none, not known; the last's: now a buffer, not counted): {:?} {:?} {:?}; of another dimension, by the dimensions: {}",
             &by[0..6],
             &by[6..12],
