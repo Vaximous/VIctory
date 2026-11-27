@@ -5922,8 +5922,108 @@ impl Host {
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
+        // Parts sent to the card as each is ready ([`send_parts_early`]): a
+        // flight of its own in the line, the rest prepared behind it.
+        let all_runs = runs;
+        let mut heaps_synced = Some(heaps_synced);
+        let mut this_submission = this_submission;
+        // Lists `[0, done)` have had their steps; `[held, done)` are not sent.
+        let (mut done, mut held) = (0, 0);
+        let cuts = if late && relay() && send_parts_early() { early_cuts(&parts, all_runs.len()) } else { Vec::new() };
+        for &cut in &cuts {
+            // Result slots for the compares running low: the rest as one,
+            // which settles first, as before.
+            if self.card_results_low() {
+                EARLY[2].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            stage.next("submit: the lists' steps (a part sent early)");
+            for list in &all_runs[done..cut] {
+                let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+                if let Some(prelude) = list.prelude(&uploads) {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
+            }
+            done = cut;
+            batch.fill();
+            batch.flush();
+            let (group, rest) = (&all_runs[held..cut], &all_runs[cut..]);
+            // What shaders may write through views they pick, declared from
+            // here on: a part goes on with the next if the rest refreshes it
+            // (a refresh leaves a range being written alone).
+            let picked = crate::picked::declare(group);
+            if !picked.written.is_empty() {
+                let mut ranges = Vec::new();
+                join_ranges(&mut ranges, picked.written.iter().map(|(_, at, len)| (*at, *at + *len)));
+                if blocked_by(&ranges, rest, false).is_some() {
+                    EARLY[1].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            }
+            stage.next("submit: a part sent early");
+            crate::shadow::take_snapshots();
+            for (shadow, at, len) in &picked.written {
+                shadow.writing(*at, *len);
+            }
+            let declared = declared_writes(group);
+            let card = self.card_before(&declared, &picked, true);
+            for (shadow, at, bytes) in batch.placed.drain(..) {
+                shadow.placed_copy(at, &bytes);
+            }
+            if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+                lists.push(Some(check));
+            }
+            if let Some(heaps) = heaps_synced.take() {
+                let heaps_began = std::time::Instant::now();
+                drop(heaps);
+                crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+            }
+            crate::descriptor::make_waiting();
+            *submitted += 1;
+            // SAFETY: closed lists; the fence is ours.
+            let signalled = unsafe {
+                self.queue.ExecuteCommandLists(&lists);
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            awake::sent(&self.device);
+            self.card_sent();
+            if let Err(e) = signalled {
+                fail(format_args!("a part of a submission sent ahead could not be followed by a signal ({e})"));
+            }
+            // In the line as a flight: its declared writes come back when it
+            // lands. Its host lists, the list of steps on the card, texture
+            // read-backs and bottom-of-pipe writes go with the last part,
+            // which lands after it.
+            let back = crate::picked::with(declared, &picked.written);
+            {
+                let mut line = line();
+                let Line { line: items, written, target, .. } = &mut *line;
+                join_ranges(written, back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+                *target = *submitted;
+                items.push(Late::Run(Flight {
+                    number: this_submission,
+                    fence: *submitted,
+                    lists: Vec::new(),
+                    order: Vec::new(),
+                    card,
+                    back,
+                    own: None,
+                    texture_back_ranges: Vec::new(),
+                }));
+            }
+            RELAY_MOVED.notify_one();
+            EARLY[0].fetch_add(1, Ordering::Relaxed);
+            lists.clear();
+            held = cut;
+            this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+            crate::shadow::preparing(this_submission);
+        }
+        // The rest, or all of it, as before.
+        let runs = &all_runs[held..];
+        let parts: Vec<usize> = if held == 0 && done == 0 { parts } else { Vec::new() };
         stage.next("submit: the lists' steps");
-        for list in runs {
+        for list in &all_runs[done..] {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(&uploads) {
@@ -5979,9 +6079,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        if let Some(heaps) = heaps_synced.take() {
+            let heaps_began = std::time::Instant::now();
+            drop(heaps);
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -6030,10 +6132,11 @@ impl Host {
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
-            for list in runs {
+            // (Of the parts sent early too: their lists go with this one.)
+            for list in all_runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            let writes: Vec<_> = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            let writes: Vec<_> = all_runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             #[cfg(all(windows, feature = "diagnostics"))]
             crate::gpuwait::labels_queued(writes.iter().map(|w| w.0));
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -8089,6 +8192,55 @@ fn refresh_front() -> bool {
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }
 
+/// Whether the parts of a joined submission (`VICTORY_JOIN_PARTS`) go to the
+/// card as each is prepared, a flight of its own in the line, while the
+/// rest is prepared behind it (`VICTORY_SEND_PARTS_EARLY=1`; off by default:
+/// all at the end, as before).
+///
+/// The refreshes in front, the asking of the write watch, the steps done on
+/// the card and the look at flights stay shared, once for the submission,
+/// as joined. Each part sent early has its own snapshots, compare of copies
+/// in the card's memory (and their send up), signal and number; the host
+/// lists, the list of steps on the card, texture read-backs and bottom-of-
+/// pipe writes go with the last part, which lands after the others. What
+/// makes it hold: a part is joined only if nothing prepared for it reads what
+/// the parts before it write ([`joinable`]); the views shaders pick
+/// (`crate::picked`), which that does not see, keep a part with the next
+/// where a later part refreshes them. With result slots for the compares
+/// running low the rest goes as one, which settles first.
+///
+/// Run ow19-move: the submitting thread spent 24.2 ms a frame in the lists'
+/// steps, all of it before the card got any of the submission.
+fn send_parts_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_PARTS_EARLY"))
+}
+
+/// Of [`send_parts_early`], since the last frame line: parts sent early,
+/// parts kept with the next for picked views, submissions whose rest went as
+/// one for the compares' result slots.
+static EARLY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The places in a submission of `len` lists where a part sent early ends
+/// ([`send_parts_early`]): the beginnings of `parts` but the first, in order.
+fn early_cuts(parts: &[usize], len: usize) -> Vec<usize> {
+    let mut cuts: Vec<usize> = parts.iter().copied().filter(|&p| p > 0 && p < len).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+/// The counts of [`EARLY`], for the frame line.
+fn send_parts_early_line(frames: f64) {
+    let [sent, kept, rest] = [0, 1, 2].map(|i| EARLY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if sent + kept + rest > 0.0 {
+        tracing::info!(
+            "parts of submissions sent early, per frame (VICTORY_SEND_PARTS_EARLY=1): {sent:.1}; {kept:.1} kept with the next \
+             for views shaders pick; {rest:.1} submissions whose rest went as one for the compares' result slots"
+        );
+    }
+}
+
 /// Whether a submission sent ahead begins the round of the heaps' records
 /// (`crate::descriptor::begin_sync_heaps`) as soon as it holds the
 /// submission lock, before the steps done on the card are planned and
@@ -9636,6 +9788,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         heap_sync_first_line(frames);
+        send_parts_early_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
@@ -10952,6 +11105,16 @@ mod refresh_tests {
     /// copies (of both kinds of memory, over one another, none on a page
     /// line) are refreshed in which ranges: a refreshed range holds what
     /// title memory holds.
+    /// A joined submission's parts end where the next begins: not at its
+    /// first list, nor past its last, each once, in order.
+    #[test]
+    fn parts_sent_early_end_where_the_next_begins() {
+        assert_eq!(super::early_cuts(&[0, 3, 5], 8), vec![3, 5]);
+        assert_eq!(super::early_cuts(&[5, 1, 5, 8, 9], 8), vec![1, 5]);
+        assert!(super::early_cuts(&[], 4).is_empty());
+        assert!(super::early_cuts(&[0], 1).is_empty());
+    }
+
     /// Long spans cut on the lines of pieces, whole pages each, in order and
     /// covering what they did.
     #[test]
