@@ -412,6 +412,12 @@ fn replay() -> Option<&'static Route> {
         .as_ref()
 }
 
+/// Where a route played back is now, in route microseconds ([`clock`]).
+#[cfg(feature = "diagnostics")]
+pub(super) fn route_us() -> Option<u64> {
+    replay().map(clock)
+}
+
 /// Whether a route is played back: live input is left out.
 pub(super) fn replaying() -> bool {
     replay().is_some()

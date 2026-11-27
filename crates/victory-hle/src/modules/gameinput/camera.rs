@@ -16,6 +16,8 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::{AtomicI64, AtomicU64};
 
 /// One camera's fields and how a mouse count turns them.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +56,42 @@ static DX: AtomicI32 = AtomicI32::new(0);
 static DY: AtomicI32 = AtomicI32::new(0);
 /// A camera was found when the title last read its pad.
 static LIVE: AtomicBool = AtomicBool::new(false);
+/// Counts turned into a camera and counts dropped for want of one
+/// (horizontal, vertical), since the start.
+#[cfg(feature = "diagnostics")]
+static TURNED: [AtomicI64; 2] = [const { AtomicI64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
+static DROPPED: [AtomicI64; 2] = [const { AtomicI64::new(0) }; 2];
+
+/// With a route played back (`VICTORY_INPUT_REPLAY`; diagnostics builds), once each second of
+/// the route: the camera's yaw and pitch and the counts so far, to compare
+/// where replays of one route looked at the same moment of it.
+#[cfg(feature = "diagnostics")]
+fn note_heading(found: impl FnOnce() -> Option<(f32, f32)>) {
+    static LAST_S: AtomicU64 = AtomicU64::new(u64::MAX);
+    let Some(us) = super::route::route_us() else { return };
+    let s = us / 1_000_000;
+    if LAST_S.swap(s, Ordering::Relaxed) == s {
+        return;
+    }
+    let found = found();
+    let turned = [0, 1].map(|i| TURNED[i].load(Ordering::Relaxed));
+    let dropped = [0, 1].map(|i| DROPPED[i].load(Ordering::Relaxed));
+    match found {
+        Some((yaw, pitch)) => tracing::info!(route_s = s, yaw, pitch, ?turned, ?dropped, "route camera"),
+        None => tracing::info!(route_s = s, ?turned, ?dropped, "route camera: none found"),
+    }
+}
+
+/// The first found camera's yaw and pitch now.
+#[cfg(feature = "diagnostics")]
+fn heading(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<(f32, f32)> {
+    list.iter().filter(|c| present(memory, base, c)).find_map(|c| {
+        let y = read_f32(memory, resolve(memory, base, &c.yaw)?)?;
+        let p = read_f32(memory, resolve(memory, base, &c.pitch)?)?;
+        Some((y, p))
+    })
+}
 
 /// The cameras of the user's file, with the title image's base.
 pub fn configure(base: u64, list: Vec<Camera>, sensitivity: f32, invert_y: bool) {
@@ -208,6 +246,62 @@ pub(super) fn turn(
     found
 }
 
+/// Whether a route played back (`VICTORY_INPUT_REPLAY`) turns the camera to
+/// an absolute heading rather than by counts added to whatever it has
+/// (`VICTORY_ROUTE_CAMERA_ABS=1`; off by default): the heading the camera
+/// had when it was found, plus every count of the route since, written at
+/// each pad read. What the title turns by itself in between (a follow
+/// camera that swings behind a walking player, at its own frame pace) is
+/// undone.
+fn absolute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| super::route::replaying() && std::env::var_os("VICTORY_ROUTE_CAMERA_ABS").is_some_and(|v| v == "1"))
+}
+
+/// For [`absolute`]: the heading the camera had when found, and the counts
+/// since.
+static TARGET: std::sync::Mutex<Option<((f32, f32), (i64, i64))>> = std::sync::Mutex::new(None);
+
+/// Turns the first found camera to its absolute target ([`absolute`]);
+/// whether one was found.
+fn turn_to(memory: &impl Memory, base: u64, list: &[Camera], counts: (i32, i32), scale: f32, invert_y: bool) -> bool {
+    let mut target = TARGET.lock().unwrap_or_else(|e| e.into_inner());
+    for camera in list {
+        if !present(memory, base, camera) {
+            continue;
+        }
+        let (Some(y), Some(p)) = (resolve(memory, base, &camera.yaw), resolve(memory, base, &camera.pitch)) else {
+            continue;
+        };
+        let (Some(yaw), Some(pitch)) = (read_f32(memory, y), read_f32(memory, p)) else {
+            continue;
+        };
+        // Found anew (another camera object, or after none): its heading now
+        // is the base.
+        if !LIVE.load(Ordering::Relaxed) || target.is_none() {
+            *target = Some(((yaw, pitch), (0, 0)));
+        }
+        let Some((from, sum)) = target.as_mut() else { continue };
+        sum.0 += i64::from(counts.0);
+        sum.1 += i64::from(counts.1);
+        let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        let (new_yaw, new_pitch) = turned(camera, *from, (clamp(sum.0), clamp(sum.1)), scale, invert_y);
+        if (new_yaw, new_pitch) != (yaw, pitch) {
+            memory.write(y, &new_yaw.to_le_bytes());
+            memory.write(p, &new_pitch.to_le_bytes());
+            let mut by_yaw = new_yaw - yaw;
+            if camera.wrap > 0.0 {
+                let half = camera.wrap / 2.0;
+                by_yaw = (by_yaw + half).rem_euclid(camera.wrap) - half;
+            }
+            shift(memory, base, &camera.yaw_copies, by_yaw, camera.wrap);
+            shift(memory, base, &camera.pitch_copies, new_pitch - pitch, 0.0);
+        }
+        return true;
+    }
+    false
+}
+
 /// At the title's pad read: the counts since the last one go to the cameras.
 pub(super) fn apply() {
     let Some(cameras) = CAMERAS.get() else {
@@ -218,19 +312,24 @@ pub(super) fn apply() {
     }
     let counts = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
     #[cfg(windows)]
-    let found = turn(
-        &host::Own,
-        cameras.base,
-        &cameras.list,
-        counts,
-        cameras.scale,
-        cameras.invert_y,
-    );
+    let found = if absolute() {
+        turn_to(&host::Own, cameras.base, &cameras.list, counts, cameras.scale, cameras.invert_y)
+    } else {
+        turn(&host::Own, cameras.base, &cameras.list, counts, cameras.scale, cameras.invert_y)
+    };
     #[cfg(not(windows))]
     let found = false;
+    #[cfg(feature = "diagnostics")]
+    {
+        let into = if found { &TURNED } else { &DROPPED };
+        into[0].fetch_add(i64::from(counts.0), Ordering::Relaxed);
+        into[1].fetch_add(i64::from(counts.1), Ordering::Relaxed);
+    }
     if LIVE.swap(found, Ordering::Relaxed) != found {
         tracing::info!(found, "mouse camera");
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    note_heading(|| heading(&host::Own, cameras.base, &cameras.list));
 }
 
 #[cfg(windows)]
