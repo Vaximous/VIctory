@@ -1,7 +1,7 @@
-//! Fingerprint of the translator's own source, for the shader cache key
-//! (`victory-gpu`'s `shader_cache`): a rebuilt executable whose translator did
-//! not change keeps its cached translations. Also lists every `VICTORY_*`
-//! switch the translator reads, whose values join the key at run time.
+//! Lists every `VICTORY_*` switch the translator reads, whose values join the
+//! shader cache key at run time (`emit::translation_fingerprint`). Also a
+//! fingerprint of the translator's own source, which joins the key only with
+//! `VICTORY_SHADER_KEY=source`: the key is `TRANSLATOR_VERSION` otherwise.
 //! Reads only this crate's `src` folder; writes nothing but cargo directives.
 
 use std::path::{Path, PathBuf};

@@ -1,13 +1,15 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the translator
-//! (the BLAKE3 of its sources) and its settings, so a changed translator
-//! never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's content, by the translator's
+//! version (`victory_shader::TRANSLATOR_VERSION`, bumped with every change
+//! of what it puts out) and its settings, so a rebuild that leaves the
+//! version keeps every translation, and one that bumps it never serves an
+//! old one. Entries go through `victory-pipeline`'s content-addressed cache,
+//! which writes them atomically; an entry that does not read back is
+//! translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! must be added to `encode` and `decode` too, and [`MAGIC`] changed (it is
+//! part of the key: entries of the old form are then not looked at).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -38,10 +40,12 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies a translation beside its container: the translator
-/// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
-/// what it was told of the host. Not our executable: a rebuild of anything
-/// else used to translate every shader again.
+/// What identifies a translation beside its container: the translator's
+/// version (`victory_shader::TRANSLATOR_VERSION`) and the form of the entry,
+/// the settings it runs with, and what it was told of the host. Not our
+/// executable, nor the translator's source (only with
+/// `VICTORY_SHADER_KEY=source`, the BLAKE3 of it from `build.rs`): a rebuild
+/// used to translate every shader again into a new set of entries.
 fn build() -> [u8; 32] {
     // The view heap's null slot differs by host GPU: a translation cached
     // without the clamp must not be served (`host_settings` below).
@@ -55,7 +59,12 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
+        let mut bytes = b"version".to_vec();
+        bytes.extend_from_slice(&victory_shader::TRANSLATOR_VERSION.to_le_bytes());
+        bytes.extend_from_slice(MAGIC);
+        if victory_shader::emit::source_keyed() {
+            bytes.extend_from_slice(env!("VICTORY_TRANSLATOR").as_bytes());
+        }
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
@@ -143,7 +152,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
+        // The translator's version and the entry's form in the input do
+        // the versioning (`build`).
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -185,6 +195,8 @@ fn cached(
     (converter.translate)(container)
 }
 
+/// The form of an entry ([`encode`]): change it with the form. It is part of
+/// the key ([`build`]), so entries of another form are not looked at.
 const MAGIC: &[u8; 4] = b"VSH1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,

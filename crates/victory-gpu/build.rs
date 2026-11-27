@@ -1,6 +1,7 @@
-//! Fingerprints the shader translator, so that cached translations
-//! (`src/shader_cache.rs`) last until the translator itself changes and not
-//! only until the next build of anything.
+//! Fingerprints the shader translator's source. Cached translations
+//! (`src/shader_cache.rs`) are keyed by `victory_shader::TRANSLATOR_VERSION`;
+//! this fingerprint joins the key only with `VICTORY_SHADER_KEY=source`, for
+//! work on the translator before its version is bumped.
 
 use std::path::{Path, PathBuf};
 

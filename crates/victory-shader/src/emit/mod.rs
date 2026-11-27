@@ -275,15 +275,30 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
+/// Whether the shader cache keys on the translator's source (hashed at build
+/// time) as well as on [`crate::TRANSLATOR_VERSION`]
+/// (`VICTORY_SHADER_KEY=source`): for work on the translator, where a change
+/// of its output may not have bumped the version yet. Off by default, so a
+/// rebuild keeps its translations.
+pub fn source_keyed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_KEY").is_some_and(|v| v == "source"))
+}
+
 /// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
+/// translator's version ([`crate::TRANSLATOR_VERSION`], bumped with every
+/// change of what it puts out), the value of every `VICTORY_*` switch it
+/// reads, the host facts the device hands it (widest wave, view heap limit)
+/// and the settings above. The shader cache keys on this instead of on the
+/// whole executable or the translator's source, so a rebuild that leaves the
+/// version alone keeps its translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    out.extend_from_slice(b"version");
+    out.extend_from_slice(&crate::TRANSLATOR_VERSION.to_le_bytes());
+    if source_keyed() {
+        out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    }
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
     for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
