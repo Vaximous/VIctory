@@ -1019,7 +1019,12 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // The buffers small copies are cut from, made ahead (on a
+            // thread that waits for this to be done).
+            crate::shadow::premake_slots();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -4751,7 +4756,7 @@ impl Host {
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
                             if let Some(((staging, base), _, _)) = side {
                                 for &(a, b) in rs {
-                                    cards.push((&shadow.buffer, a as u64));
+                                    cards.push((&shadow.buffer, shadow.base() + a as u64));
                                     ranges.push((staging, base + a as u64, (b - a) as u64));
                                 }
                             }
@@ -4767,7 +4772,7 @@ impl Host {
                         };
                         if own.is_none() && up.is_none() {
                             for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, base + a as u64, (b - a) as u64);
+                                list.CopyBufferRegion(&shadow.buffer, shadow.base() + a as u64, staging, base + a as u64, (b - a) as u64);
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
@@ -4806,7 +4811,7 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, shadow.card_gpu());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
                         // Not the pieces of ranges still to be compared
@@ -4949,7 +4954,7 @@ impl Host {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(1, r.shadow.card_gpu());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
@@ -5202,7 +5207,7 @@ impl Host {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, shadow.base() + *lo as u64, (*hi - *lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -5519,7 +5524,8 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     for &(i, lo, hi, at) in &pieces {
-                        list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
+                        let shadow = &plan.ranges[i].shadow;
+                        list.CopyBufferRegion(fetched, at, &shadow.buffer, shadow.base() + lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -10190,7 +10196,7 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
-                list.CopyBufferRegion(&buffer, 0, &shadow.buffer, 0, len);
+                list.CopyBufferRegion(&buffer, 0, &shadow.buffer, shadow.base(), len);
                 list.Close()?;
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);

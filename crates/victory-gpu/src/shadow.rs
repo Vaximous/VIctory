@@ -37,6 +37,9 @@ pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
+    /// Where the copy begins in `buffer`: 0, or its place in a buffer
+    /// shared with other copies' card sides ([`card_slot`]).
+    at: u64,
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
@@ -125,6 +128,9 @@ struct Card {
     staging_at: u64,
     /// That place, given back once the card is done with it.
     _slot: Option<CpuSlot>,
+    /// The place of the card's side in `buffer` ([`card_slot`]), shared
+    /// with the descriptor slots that show it ([`Held`]).
+    card_slot: Option<Arc<CardSlot>>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -449,7 +455,7 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(size: u64) -> Option<CardSide> {
     let there = card_room_for(size);
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
@@ -461,7 +467,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some(CardSide { buffer, at: 0, slot: None })
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -520,98 +526,277 @@ fn copy_made(at: [std::time::Duration; 4], again: bool) {
     );
 }
 
-/// The CPU's sides of small copies in the card's memory (up to
-/// [`CPU_SLOT`]) as places in a few big buffers in the PC's memory, made,
-/// resident and mapped once each: a copy's is a pop off a list, no call of
-/// the host's. Each such side was a buffer of its own, made and waited
-/// for until mapped, about 0.5-1.5 ms: an area's 3,400 in 2 s at its first
-/// sight (run ow55c). Only the CPU's side: nothing binds it, views it or
-/// keeps it in a state; it is the source of the copies that send what
-/// changed up (from its place, [`Shadow::card_sides`]), and what `data`
-/// maps. `VICTORY_SUBALLOC_COPIES=0`: a buffer of its own, as before.
+/// Small copies in the card's memory (up to [`SLOT`]), both sides, as
+/// places in a few big buffers made, resident (and on the CPU's side
+/// mapped) once each: a copy's is a pop off a list, no call of the host's.
+/// Each side was a buffer of its own, made and waited for, about 1.4 ms on
+/// the card's side and 0.2-1.5 ms on the CPU's: an area's 3,400 in 2-3 s
+/// at its first sight (runs ow55c, ow62).
+///
+/// The CPU's side is the source of the copies that send what changed up
+/// (from its place, [`Shadow::card_sides`]) and what `data` maps; nothing
+/// binds or views it. The card's side is what shaders see: its views,
+/// copies and passes take the copy's place in the big buffer
+/// ([`Shadow::offset`], [`Shadow::card_gpu`], [`Shadow::base`]); its width
+/// is where the place ends ([`Shadow::width`]); the barriers of our own
+/// lists are one per big buffer (one state for all of it); and whether
+/// anything still shows it is the count of its [`Held`]s
+/// ([`Shadow::held_elsewhere`]), not the buffer's references.
+/// `VICTORY_SUBALLOC_COPIES=0`: buffers of their own, as before.
 fn suballoc_on() -> bool {
     crate::toggled!("VICTORY_SUBALLOC_COPIES")
 }
 
-/// The bytes of a place ([`cpu_slot`]): a small copy's size, rounded.
-const CPU_SLOT: u64 = 1 << 16;
+/// The bytes of a place: a small copy's size, rounded.
+const SLOT: u64 = 1 << 16;
 
 /// The bytes of a buffer the places are cut from.
-const CPU_BLOCK: u64 = 64 << 20;
+const SLOT_BLOCK: u64 = 64 << 20;
 
-/// The buffers ([`cpu_slot`]): each with where it is mapped; the free
-/// places, by buffer and number.
-struct CpuSlots {
+/// Fewer free places than this: the next buffer is made on a thread of
+/// its own, ahead of the copies that will want it.
+const SLOTS_LOW: usize = 256;
+
+/// The buffers places are cut from ([`take_slot`]), with where each is
+/// mapped (0 on the card), and the free places: by buffer and number,
+/// and whether a copy used it before (a card side then is not zeros).
+#[derive(Default)]
+struct Slots {
     blocks: Vec<(ID3D12Resource, usize)>,
-    free: Vec<(u32, u32)>,
+    free: Vec<(u32, u32, bool)>,
+    making: bool,
 }
 // SAFETY: D3D12 buffers (free-threaded) and the addresses of their mappings.
-unsafe impl Send for CpuSlots {}
+unsafe impl Send for Slots {}
 
-static CPU_SLOTS: Mutex<CpuSlots> = Mutex::new(CpuSlots { blocks: Vec::new(), free: Vec::new() });
+/// The PC's memory's places and the card's.
+static SLOTS: [Mutex<Slots>; 2] = [
+    Mutex::new(Slots { blocks: Vec::new(), free: Vec::new(), making: false }),
+    Mutex::new(Slots { blocks: Vec::new(), free: Vec::new(), making: false }),
+];
 
-/// Places taken and given back since the start, buffers made.
-static CPU_SLOT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Places taken and given back since the start, buffers made: the PC's
+/// memory's, then the card's.
+static SLOT_STATS: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
 
-/// A place taken ([`cpu_slot`]): given back once every submission
-/// running when its copy goes has finished ([`crate::host::retire`]).
+/// A buffer for places made and added to the list, outside its lock.
+fn add_slot_block(card: bool) -> bool {
+    let Some(host) = host() else { return false };
+    let made = if card {
+        host.uav_buffer(SLOT_BLOCK).map(|b| (b, 0usize))
+    } else {
+        host.shared_buffer(SLOT_BLOCK).map(|(b, data)| (b, data as usize))
+    };
+    let Some((buffer, data)) = made else {
+        return false;
+    };
+    crate::host::name(&buffer, || {
+        if card { "small title buffers' card sides, shared" } else { "small title buffers' CPU sides, shared" }.into()
+    });
+    let side = usize::from(card);
+    let mut slots = SLOTS[side].lock().unwrap_or_else(|e| e.into_inner());
+    let block = slots.blocks.len() as u32;
+    slots.blocks.push((buffer, data));
+    let n = (SLOT_BLOCK / SLOT) as u32;
+    slots.free.splice(0..0, (0..n).rev().map(|i| (block, i, false)));
+    let stats = &SLOT_STATS[side];
+    let made = stats[2].fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(
+        side = if card { "card" } else { "cpu" },
+        buffers = made,
+        mb = made * (SLOT_BLOCK >> 20),
+        taken = stats[0].load(Ordering::Relaxed),
+        given_back = stats[1].load(Ordering::Relaxed),
+        "a buffer small title-buffer copies' sides are cut from (VICTORY_SUBALLOC_COPIES=0: each its own)"
+    );
+    true
+}
+
+/// The buffers of places made before any copy wants one: two on each
+/// side, on a thread of their own once the host is there.
+pub(crate) fn premake_slots() {
+    if !suballoc_on() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("victory-slots".into()).spawn(|| {
+        for card in [false, false, true, true] {
+            if card && !(cards() && host().is_some_and(|h| h.card_ready())) {
+                continue;
+            }
+            add_slot_block(card);
+        }
+    });
+}
+
+/// A free place on a side: its buffer, where it is mapped (null on the
+/// card), its offset in the buffer, its buffer and number, and whether a
+/// copy used it before. None if no buffer could be made.
+fn take_slot(card: bool) -> Option<(ID3D12Resource, *mut u8, u64, u32, u32, bool)> {
+    let side = usize::from(card);
+    let taken = loop {
+        let mut slots = SLOTS[side].lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((block, i, again)) = slots.free.pop() {
+            if slots.free.len() < SLOTS_LOW && !slots.making {
+                slots.making = true;
+                let _ = std::thread::Builder::new().name("victory-slots".into()).spawn(move || {
+                    add_slot_block(card);
+                    SLOTS[side].lock().unwrap_or_else(|e| e.into_inner()).making = false;
+                });
+            }
+            let (buffer, data) = slots.blocks[block as usize].clone();
+            break (buffer, data, block, i, again);
+        }
+        drop(slots);
+        if !add_slot_block(card) {
+            return None;
+        }
+    };
+    let (buffer, data, block, i, again) = taken;
+    SLOT_STATS[side][0].fetch_add(1, Ordering::Relaxed);
+    let at = u64::from(i) * SLOT;
+    let data = if data == 0 { std::ptr::null_mut() } else { (data + at as usize) as *mut u8 };
+    Some((buffer, data, at, block, i, again))
+}
+
+/// A place given back once its copy has gone and every submission
+/// running then has finished ([`crate::host::retire`]): the CPU's is zeros
+/// again (as a new buffer's are), then free.
+struct SlotBack(bool, u32, u32);
+
+impl Drop for SlotBack {
+    fn drop(&mut self) {
+        let SlotBack(card, block, i) = *self;
+        let side = usize::from(card);
+        let mut slots = SLOTS[side].lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&(_, data)) = slots.blocks.get(block as usize) else { return };
+        if !card {
+            // SAFETY: the place, inside the buffer's mapping; nothing else
+            // writes it now (its copy went, its submissions ran).
+            unsafe { std::ptr::write_bytes((data + i as usize * SLOT as usize) as *mut u8, 0, SLOT as usize) };
+        }
+        slots.free.push((block, i, card));
+        SLOT_STATS[side][1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A place on the CPU's side taken ([`cpu_slot`]).
 pub(crate) struct CpuSlot(u32, u32);
 
 impl Drop for CpuSlot {
     fn drop(&mut self) {
-        crate::host::retire(SlotBack(self.0, self.1));
+        crate::host::retire(SlotBack(false, self.0, self.1));
     }
 }
 
-/// A place whose copy has gone and whose submissions have run: zeros
-/// again (a new buffer's are), then free.
-struct SlotBack(u32, u32);
+/// A place on the card's side taken ([`card_slot`]), shared by the copy
+/// and every descriptor slot that shows it ([`Held`]): given back when the
+/// last of them lets it go.
+pub(crate) struct CardSlot(u32, u32);
 
-impl Drop for SlotBack {
+impl Drop for CardSlot {
     fn drop(&mut self) {
-        let mut slots = CPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&(_, data)) = slots.blocks.get(self.0 as usize) else { return };
-        // SAFETY: the place, inside the buffer's mapping; nothing else
-        // writes it now (its copy went, its submissions ran).
-        unsafe { std::ptr::write_bytes((data + self.1 as usize * CPU_SLOT as usize) as *mut u8, 0, CPU_SLOT as usize) };
-        slots.free.push((self.0, self.1));
-        CPU_SLOT_STATS[1].fetch_add(1, Ordering::Relaxed);
+        crate::host::retire(SlotBack(true, self.0, self.1));
     }
 }
 
-/// A place for the CPU's side of a copy of `size` bytes in the card's
+/// A resource a descriptor slot shows, and with it the place in it of a
+/// small copy's card side ([`CardSlot`]) if it is one: the place is not
+/// given to another copy while a slot shows it.
+#[derive(Clone)]
+pub(crate) struct Held {
+    pub(crate) resource: ID3D12Resource,
+    slot: Option<Arc<CardSlot>>,
+}
+
+impl Held {
+    /// A resource of its own.
+    pub(crate) fn plain(resource: ID3D12Resource) -> Held {
+        Held { resource, slot: None }
+    }
+
+    /// `resource` from byte `offset` on: with its place if that is one
+    /// of a copy's card side.
+    pub(crate) fn at(resource: &ID3D12Resource, offset: u64) -> Held {
+        Held { resource: resource.clone(), slot: slot_at(resource, offset) }
+    }
+
+    /// The same resource, and the same place in it.
+    pub(crate) fn same(&self, other: &Held) -> bool {
+        use windows::core::Interface;
+        self.resource.as_raw() == other.resource.as_raw()
+            && match (&self.slot, &other.slot) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    /// Whether it holds a place ([`Held::slot`]): dropped through
+    /// [`crate::host::retire`], not as a bare resource.
+    pub(crate) fn holds_place(&self) -> bool {
+        self.slot.is_some()
+    }
+}
+
+/// The copies whose card sides are places, by buffer and number: what a
+/// descriptor slot made from a buffer and an offset holds
+/// ([`Held::at`]).
+static SLOT_HOLDERS: Mutex<Vec<(usize, Vec<std::sync::Weak<CardSlot>>)>> = Mutex::new(Vec::new());
+
+/// The place of `resource` at `offset` and the copy's that has it now, if
+/// `resource` is a buffer places are cut from.
+fn slot_at(resource: &ID3D12Resource, offset: u64) -> Option<Arc<CardSlot>> {
+    use windows::core::Interface;
+    let raw = resource.as_raw() as usize;
+    let holders = SLOT_HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, slots) = holders.iter().find(|(r, _)| *r == raw)?;
+    slots.get((offset / SLOT) as usize)?.upgrade()
+}
+
+/// A place on the CPU's side for a copy of `size` bytes in the card's
 /// memory ([`suballoc_on`]): its buffer, where it is mapped, its offset in
 /// the buffer, and the place to keep. None if too big, or no buffer.
 fn cpu_slot(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, CpuSlot)> {
-    if !suballoc_on() || size > CPU_SLOT {
+    if !suballoc_on() || size > SLOT {
         return None;
     }
-    let mut slots = CPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
-    if slots.free.is_empty() {
-        let (buffer, data) = host()?.shared_buffer(CPU_BLOCK)?;
-        crate::host::name(&buffer, || "title buffers' CPU sides, shared".into());
-        let block = slots.blocks.len() as u32;
-        slots.blocks.push((buffer, data as usize));
-        let n = (CPU_BLOCK / CPU_SLOT) as u32;
-        slots.free.extend((0..n).rev().map(|i| (block, i)));
-        let made = CPU_SLOT_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::info!(
-            buffers = made,
-            mb = made * (CPU_BLOCK >> 20),
-            taken = CPU_SLOT_STATS[0].load(Ordering::Relaxed),
-            given_back = CPU_SLOT_STATS[1].load(Ordering::Relaxed),
-            "a buffer the CPU's sides of small title-buffer copies are cut from (VICTORY_SUBALLOC_COPIES=0: each its own)"
-        );
+    let (buffer, data, at, block, i, _) = take_slot(false)?;
+    Some((buffer, data, at, CpuSlot(block, i)))
+}
+
+/// A place on the card's side for a copy of `size` bytes
+/// ([`suballoc_on`]): its buffer, its offset in it, the place, and whether
+/// another copy had it before (its bytes are that copy's then).
+fn card_slot(size: u64) -> Option<(ID3D12Resource, u64, Arc<CardSlot>, bool)> {
+    use windows::core::Interface;
+    if !suballoc_on() || size > SLOT {
+        return None;
     }
-    let (block, i) = slots.free.pop()?;
-    let (buffer, data) = slots.blocks[block as usize].clone();
-    CPU_SLOT_STATS[0].fetch_add(1, Ordering::Relaxed);
-    let at = u64::from(i) * CPU_SLOT;
-    Some((buffer, (data + at as usize) as *mut u8, at, CpuSlot(block, i)))
+    let (buffer, _, at, block, i, again) = take_slot(true)?;
+    let slot = Arc::new(CardSlot(block, i));
+    let raw = buffer.as_raw() as usize;
+    let mut holders = SLOT_HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let at_block = match holders.iter().position(|(r, _)| *r == raw) {
+        Some(n) => n,
+        None => {
+            holders.push((raw, vec![std::sync::Weak::new(); (SLOT_BLOCK / SLOT) as usize]));
+            holders.len() - 1
+        }
+    };
+    holders[at_block].1[i as usize] = Arc::downgrade(&slot);
+    Some((buffer, at, slot, again))
+}
+
+/// A copy's card side as [`card_for`] gives it: the buffer, the copy's
+/// offset in it (not 0 for a place, [`card_slot`]), and the place.
+struct CardSide {
+    buffer: ID3D12Resource,
+    at: u64,
+    slot: Option<Arc<CardSlot>>,
 }
 
 /// [`card_for`] in the card's own memory.
-fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+fn card_room_for(size: u64) -> Option<CardSide> {
     CARD_USED_BEFORE.set(false);
     if !cards() {
         return None;
@@ -668,12 +853,21 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         late = true;
     }
-    let buffer = match crate::pool::buffer(&host.device, size, false) {
-        Some((buffer, _, again)) => {
+    // A place in a buffer shared with other small copies' card sides
+    // ([`card_slot`]); else one placed in a block (`crate::pool::buffer`),
+    // or a buffer of its own.
+    let buffer = match card_slot(size) {
+        Some((buffer, at, slot, again)) => {
             CARD_USED_BEFORE.set(again);
-            Some(buffer)
+            Some(CardSide { buffer, at, slot: Some(slot) })
         }
-        None => host.uav_buffer(size),
+        None => match crate::pool::buffer(&host.device, size, false) {
+            Some((buffer, _, again)) => {
+                CARD_USED_BEFORE.set(again);
+                Some(CardSide { buffer, at: 0, slot: None })
+            }
+            None => host.uav_buffer(size).map(|buffer| CardSide { buffer, at: 0, slot: None }),
+        },
     };
     match (&buffer, late) {
         (None, true) => {
@@ -3877,7 +4071,7 @@ pub(crate) fn window_use() -> [u64; 8] {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
+        if s.held_elsewhere() {
             out[1] += 1;
             out[2] += s.len;
         }
@@ -3985,7 +4179,7 @@ pub(crate) fn let_go_idle() {
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && !s.held_elsewhere()
             })
             .map(|(&key, s)| {
                 (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
@@ -4101,7 +4295,40 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.place.as_ref().map_or(0, |place| place.1) + self.at
+    }
+
+    /// Where the copy begins in `buffer` ([`Shadow::at`]): what an offset
+    /// in the copy (from `start`) adds to be one in the buffer.
+    pub(crate) fn base(&self) -> u64 {
+        self.at
+    }
+
+    /// The card's address of the copy's first byte (of a copy that is not
+    /// in place): what passes that read or write the copy by offsets in it
+    /// bind.
+    pub(crate) fn card_gpu(&self) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetGPUVirtualAddress() + self.at }
+    }
+
+    /// The buffer as a descriptor slot that shows the copy holds it: with
+    /// the place of a card side ([`Held`]).
+    pub(crate) fn held(&self) -> Held {
+        Held {
+            resource: self.buffer.clone(),
+            slot: self.card.as_ref().and_then(|card| card.card_slot.clone()),
+        }
+    }
+
+    /// Whether anything but the copy holds its card side: a descriptor
+    /// slot, or a list that has not run (the buffer's references; for a
+    /// place, [`Held`]s of it).
+    pub(crate) fn held_elsewhere(&self) -> bool {
+        match self.card.as_ref().and_then(|card| card.card_slot.as_ref()) {
+            Some(slot) => Arc::strong_count(slot) > 1,
+            None => crate::host::references(&self.buffer) > 1,
+        }
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -4145,6 +4372,7 @@ impl Shadow {
             buffer,
             data,
             gpu,
+            at: 0,
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
@@ -6024,6 +6252,7 @@ impl Shadow {
                 staging: none(),
                 staging_at: 0,
                 _slot: None,
+                card_slot: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -6183,6 +6412,7 @@ mod land_tests {
             staging: buffer,
             staging_at: 0,
             _slot: None,
+            card_slot: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -6705,18 +6935,19 @@ fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
     if slot.is_none() {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
     }
-    if let Some(on_card) = &on_card {
-        crate::host::name(on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+    if let Some(on_card) = on_card.as_ref().filter(|side| side.slot.is_none()) {
+        crate::host::name(&on_card.buffer, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
     }
     let named_at = began.elapsed();
     // A big one, with `cards`: shaders get a buffer in the card's own
     // memory, and the one just made is the CPU's side.
-    let (buffer, card) = match on_card {
-        Some(on_card) => {
+    let (buffer, at, card) = match on_card {
+        Some(CardSide { buffer: on_card, at, slot: card_slot }) => {
             let card = Card {
                 staging: buffer,
                 staging_at,
                 _slot: slot,
+                card_slot,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -6724,12 +6955,12 @@ fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
                 me: std::sync::OnceLock::new(),
                 size,
             };
-            (on_card, Some(card))
+            (on_card, at, Some(card))
         }
-        None => (buffer, None),
+        None => (buffer, 0, None),
     };
     // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
     if len >= 16 << 20 {
         tracing::info!(
             start = format_args!("{:#x}", key.0),
@@ -6745,6 +6976,11 @@ fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
     }
     let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
     shadow.card = card;
+    if at != 0 || shadow.card.as_ref().is_some_and(|c| c.card_slot.is_some()) {
+        // Views end where the place does, not at the shared buffer's end.
+        shadow.at = at;
+        let _ = shadow.width.set(at + size);
+    }
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         carded(&shadow);
@@ -6955,6 +7191,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         staging,
         staging_at: 0,
         _slot: None,
+        card_slot: None,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -7055,6 +7292,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 staging: buffer,
                 staging_at: 0,
                 _slot: None,
+                card_slot: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),

@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Held;
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
@@ -169,7 +170,7 @@ pub(crate) struct HostHeap {
     /// A lock for each slot: one for the heap was what the recording threads
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
-    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    kept: Box<[Mutex<Option<Held>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -2353,7 +2354,7 @@ impl HostHeap {
             };
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
-                self.keep(slot, kept);
+                self.keep_held(slot, kept);
                 remade += 1;
             }
         }
@@ -2639,7 +2640,7 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.clear_twin(index);
                 self.made.set(index, key);
-                self.keep(index, kept);
+                self.keep_held(index, kept);
                 (true, stale)
             } else {
                 (false, stale)
@@ -2703,7 +2704,7 @@ impl HostHeap {
                 let was = shown;
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
-                self.keep(f.index, kept);
+                self.keep_held(f.index, kept);
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -3140,7 +3141,7 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
-        self.keep(index, kept.flatten());
+        self.keep_held(index, kept.flatten());
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3190,7 +3191,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_held(index, made.kept.clone());
             Some(made.listed)
         })
     }
@@ -3267,28 +3268,39 @@ impl HostHeap {
     }
 
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        self.keep_held(index, resource.map(Held::plain));
+    }
+
+    /// [`HostHeap::keep`] of a resource with the place of a copy's card
+    /// side in it, if it holds one ([`Held`]).
+    fn keep_held(&self, index: u32, resource: Option<Held>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
-                return;
+            match (slot.as_ref(), resource.as_ref()) {
+                (None, None) => return,
+                (Some(a), Some(b)) if a.same(b) => return,
+                _ => {}
             }
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            if old.holds_place() {
+                crate::host::retire(old);
+            } else {
+                crate::host::retire_resource(old.resource);
+            }
         }
     }
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.resource.clone())
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -3320,7 +3332,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_held(index, Some(Held::at(buffer, offset)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3365,7 +3377,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_held(index, Some(Held::at(buffer, offset)));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3436,7 +3448,7 @@ impl HostHeap {
             }
             self.twin_made(index, twin.is_some());
             self.write_stride(index, 0);
-            self.keep(index, (made && holds).then(|| buffer.clone()));
+            self.keep_held(index, (made && holds).then(|| Held::at(buffer, offset)));
             return;
         }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -3497,7 +3509,7 @@ impl HostHeap {
         }
         self.twin_made(index, twin.is_some());
         self.write_stride(index, 0);
-        self.keep(index, Some(shadow.buffer.clone()));
+        self.keep_held(index, Some(shadow.held()));
         true
     }
 
@@ -3741,7 +3753,7 @@ impl HostHeap {
                         && let Some(array) = as_array(&old, &view)
                         && let Some(made) = make(&array, self.at(index))
                     {
-                        self.keep(index, made);
+                        self.keep_held(index, made);
                         self.note_arrayed(index, shown);
                         AS_ARRAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         drop(held);
@@ -3781,7 +3793,7 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
+            self.keep_held(index, kept.flatten());
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -4175,7 +4187,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 /// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+type Kept = Option<Held>;
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
 /// `offset` bytes into its host copy) as a raw view of the same bytes:
@@ -4398,7 +4410,7 @@ fn buffer_srv(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(shadow.held()))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4476,8 +4488,8 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    // (Where its place ends, for a card side in a shared buffer.)
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -4522,7 +4534,7 @@ fn buffer_uav(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(shadow.held()))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -4728,7 +4740,7 @@ fn make_twinned(
                 if let Some(twin) = twin {
                     constant_raw(&shadow.buffer, offset, width, size, twin);
                 }
-                return Some(Some(shadow.buffer.clone()));
+                return Some(Some(shadow.held()));
             }
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -4749,7 +4761,7 @@ fn make_twinned(
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(shadow.held()))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -4826,7 +4838,7 @@ fn make_twinned(
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Some(Held::plain(texture.clone())))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -4888,7 +4900,7 @@ fn make_twinned(
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some(Held::plain(texture.clone())))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -6256,7 +6268,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let width = |v: &View| {
             let made = make(v, at).expect("a view").expect("a buffer");
             // SAFETY: a live buffer.
-            unsafe { made.GetDesc() }.Width
+            unsafe { made.resource.GetDesc() }.Width
         };
         for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
             let v = view(start + off, raw);

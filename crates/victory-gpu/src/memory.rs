@@ -1040,7 +1040,7 @@ pub(crate) fn ready(
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, shadow.base(), len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever

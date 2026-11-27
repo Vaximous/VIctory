@@ -188,17 +188,18 @@ pub(super) fn record(
             let n = taken.was.len();
             std::ptr::copy_nonoverlapping(taken.was.as_ptr(), to.add(at), n);
             std::ptr::copy_nonoverlapping(taken.new.as_ptr(), to.add(at + n), n);
-            list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+            list.SetComputeRootShaderResourceView(1, shadow.card_gpu());
             let constants = [taken.at as u32, (n / 4) as u32, at as u32, (at + n) as u32, (i as u64 * ANSWER) as u32];
             list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
             list.Dispatch((n / 4).div_ceil(64) as u32, 1, 1);
             at += 2 * n;
         }
         // The sends come after the looks.
+        // (One per buffer: card sides that are places share theirs.)
         let mut seen = std::collections::HashSet::new();
         let done: Vec<D3D12_RESOURCE_BARRIER> = all
             .iter()
-            .filter(|(s, _)| seen.insert(std::sync::Arc::as_ptr(s) as usize))
+            .filter(|(s, _)| seen.insert(s.buffer.as_raw() as usize))
             .map(|(s, _)| transition(&s.buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST))
             .collect();
         list.ResourceBarrier(&done);
@@ -546,7 +547,7 @@ fn look(host: &Host) -> Option<u64> {
                 };
                 if bound != shadow.id() {
                     bound = shadow.id();
-                    list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
+                    list.SetComputeRootShaderResourceView(1, shadow.card_gpu());
                     list.SetComputeRootShaderResourceView(2, staging.GetGPUVirtualAddress() + base);
                 }
                 let at = *at as u32;
@@ -588,7 +589,7 @@ fn look(host: &Host) -> Option<u64> {
     run(host, |list| {
         for (i, d) in shown.iter().enumerate() {
             // SAFETY: an open list; live buffers, the ranges in them.
-            unsafe { list.CopyBufferRegion(&held, (i * PIECE) as u64, &d.shadow.buffer, d.at as u64, d.len as u64) };
+            unsafe { list.CopyBufferRegion(&held, (i * PIECE) as u64, &d.shadow.buffer, d.shadow.base() + d.at as u64, d.len as u64) };
         }
     })?;
     let mut by: BTreeMap<(u64, u64), (u64, usize, Vec<String>)> = BTreeMap::new();
@@ -731,7 +732,7 @@ mod tests {
         // SAFETY: the mapping; an open list and live buffers.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-            list.list.CopyBufferRegion(&shadow.buffer, at as u64, &upload, 0, bytes.len() as u64);
+            list.list.CopyBufferRegion(&shadow.buffer, shadow.base() + at as u64, &upload, 0, bytes.len() as u64);
             list.list
                 .ResourceBarrier(&[transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
         }
@@ -742,7 +743,7 @@ mod tests {
     fn card(host: &Host, shadow: &Shadow) -> Vec<u8> {
         let (held, data) = host.shared_buffer(LEN as u64).unwrap();
         // SAFETY: an open list; live buffers.
-        run(host, |list| unsafe { list.CopyBufferRegion(&held, 0, &shadow.buffer, 0, LEN as u64) }).unwrap();
+        run(host, |list| unsafe { list.CopyBufferRegion(&held, 0, &shadow.buffer, shadow.base(), LEN as u64) }).unwrap();
         // SAFETY: the mapping; the copy has run.
         unsafe { std::slice::from_raw_parts(data, LEN) }.to_vec()
     }
@@ -916,7 +917,7 @@ mod tests {
                 shadow.refresh(&list, (start + AT) as u64, 256);
                 // SAFETY: an open list; live buffers.
                 unsafe {
-                    list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, AT as u64, 256);
+                    list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, shadow.base() + AT as u64, 256);
                 }
                 list.close();
                 host.execute_own(&list);
@@ -959,7 +960,7 @@ mod tests {
         shadow.refresh(list, shadow.span().0 + at as u64, n as u64);
         // SAFETY: an open list; live buffers.
         unsafe {
-            list.list.CopyBufferRegion(out.0, out.1, &shadow.buffer, at as u64, n as u64);
+            list.list.CopyBufferRegion(out.0, out.1, &shadow.buffer, shadow.base() + at as u64, n as u64);
             list.list
                 .ResourceBarrier(&[transition(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
         }
