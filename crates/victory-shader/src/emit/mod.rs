@@ -124,7 +124,8 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_TOUCHED, SLOT_TOUCHED_SLOTS, slot_feedback,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, early_depth_allowed, early_depth_safe, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    without_early_depth,
 };
 
 /// The loop limit without an override: 2^20.
@@ -392,6 +393,10 @@ pub struct HostShader {
     /// descriptor picked at run time keeps the float path (its slot, and so
     /// its format, is known only then).
     pub half_views: Vec<(u8, u32)>,
+    /// A pixel program marked `[earlydepthstencil]` (`shader::early_depth_safe`): the
+    /// host takes one made [`without_early_depth`] where the mark is not known to be
+    /// safe.
+    pub early_depth: bool,
 }
 
 impl HostShader {
@@ -440,6 +445,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+    let _ = shader::take_marked_early_depth();
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -948,6 +954,7 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    let early_depth = shader::take_marked_early_depth();
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -970,6 +977,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         half_views: l.half_views,
+        early_depth,
     };
     Ok((shader, wave_size))
 }
@@ -1753,6 +1761,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            early_depth: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1766,6 +1775,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                early_depth: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2376,6 +2386,7 @@ mod tests {
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            early_depth: false,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2513,6 +2524,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                early_depth: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let raw_data = super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw };
@@ -2666,6 +2678,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
                 half_views: Vec::new(),
+                early_depth: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3083,6 +3096,7 @@ mod barycentric_tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             half_views: Vec::new(),
+            early_depth: false,
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

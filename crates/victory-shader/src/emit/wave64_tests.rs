@@ -143,6 +143,7 @@ fn lowered_counted(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        early_depth: false,
     })
 }
 
@@ -283,6 +284,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: Vec::new(),
+        early_depth: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

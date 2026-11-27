@@ -98,13 +98,56 @@ fn feedback_own_writes() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_SLOT_OWN_WRITES").as_deref().map(str::trim) == Ok("1"))
 }
 
-/// `VICTORY_SLOT_EARLY_DEPTH=1`: a pixel program that notes its slots, with a colour
-/// output and nothing a depth test first would change, is marked `[earlydepthstencil]`.
-/// Off by default: with it the sun's shadows came out black and far too large (fg-move3,
-/// together with pixel programs without colour outputs, which no longer note anything).
-fn early_depth() -> bool {
+/// `VICTORY_EARLY_DEPTH_SAFE` (on by default; `0` off): a pixel program whose only
+/// stores are the slot feedback's, with a colour output and nothing a depth test first
+/// would change (no discard, no depth, coverage or stencil output, no store or atomic of
+/// its own), is marked `[earlydepthstencil]`: its feedback stores, which would otherwise
+/// have the card test depth after it runs, no longer hold back the depth test. Only the
+/// feedback, which is a hint, is left out where depth hides a pixel. The host takes a
+/// translation without the mark ([`without_early_depth`]) for the pipelines where the
+/// mark could change the picture or that may draw shadows: alpha to coverage on, no
+/// colour target written, a depth bias, depth clipping off.
+///
+/// da29b4c7 turned the mark off everywhere (`VICTORY_SLOT_EARLY_DEPTH=1` put it back on
+/// every such program): with it in every pipeline the sun's shadows came out black and
+/// far too large (fg-move3, together with feedback in pixel programs without a colour
+/// output, which no longer note anything).
+pub fn early_depth_safe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EARLY_DEPTH_SAFE").as_deref().map(str::trim) != Ok("0"))
+}
+
+fn slot_early_depth() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_SLOT_EARLY_DEPTH").as_deref().map(str::trim) == Ok("1"))
+}
+
+thread_local! {
+    /// Translations on this thread are made without `[earlydepthstencil]`
+    /// ([`without_early_depth`]).
+    static NO_EARLY_DEPTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The last program finished on this thread was marked `[earlydepthstencil]`.
+    static MARKED_EARLY_DEPTH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether programs translated now may be marked `[earlydepthstencil]`: the switches,
+/// and not inside [`without_early_depth`]. Part of what identifies a translation.
+pub fn early_depth_allowed() -> bool {
+    !NO_EARLY_DEPTH.get() && (early_depth_safe() || slot_early_depth())
+}
+
+/// Runs `translate` with no program marked `[earlydepthstencil]` (the translation the
+/// host takes for pipelines where the mark is not known to be safe).
+pub fn without_early_depth<R>(translate: impl FnOnce() -> R) -> R {
+    let before = NO_EARLY_DEPTH.replace(true);
+    let result = translate();
+    NO_EARLY_DEPTH.set(before);
+    result
+}
+
+/// Whether the program finished last on this thread was marked, and forgets it.
+pub(crate) fn take_marked_early_depth() -> bool {
+    MARKED_EARLY_DEPTH.replace(false)
 }
 
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
@@ -784,8 +827,9 @@ impl Shader {
                 || self.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20));
             if !colour {
                 self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
-            } else if !late && early_depth() {
+            } else if !late && early_depth_allowed() {
                 self.flags |= flags::EARLY_DEPTH;
+                MARKED_EARLY_DEPTH.set(true);
             } else if slot_feedback() == 3 {
                 self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
             }
