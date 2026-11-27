@@ -710,17 +710,35 @@ fn by_regions(start: usize, end: usize, pages: &mut Vec<(usize, u16)>) -> bool {
     let mut regions = 0u64;
     port6_count(P6_ASKED_BY_REGIONS, 1);
     while at < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let asked = std::time::Instant::now();
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        ask_part(AS_QUERY, asked);
-        if n == 0 || info.Type != MEM_PRIVATE || info.State != MEM_COMMIT {
-            return false;
-        }
-        let to = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        let known = REGIONS.read().unwrap_or_else(|e| e.into_inner()).range(..=at).next_back().map(|(&a, &b)| (a, b));
+        let (region, cached) = match known.filter(|r| at < r.1 && region_cache()) {
+            Some(r) => {
+                port6_count(P6_REGIONS_CACHED, 1);
+                (r, true)
+            }
+            None => {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                let asked = std::time::Instant::now();
+                // SAFETY: a valid out pointer of the right size.
+                let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+                ask_part(AS_QUERY, asked);
+                if n == 0 || info.Type != MEM_PRIVATE || info.State != MEM_COMMIT {
+                    return false;
+                }
+                let r = (info.BaseAddress as usize, (info.BaseAddress as usize).saturating_add(info.RegionSize));
+                if region_cache() {
+                    REGIONS.write().unwrap_or_else(|e| e.into_inner()).insert(r.0, r.1);
+                }
+                (r, false)
+            }
+        };
+        let to = region.1.min(end);
         if to <= at || !kernel_ask(at, to, pages) {
+            if cached {
+                // Something else there now: asked about again next time.
+                REGIONS.write().unwrap_or_else(|e| e.into_inner()).remove(&region.0);
+            }
             return false;
         }
         regions += 1;
@@ -728,6 +746,59 @@ fn by_regions(start: usize, end: usize, pages: &mut Vec<(usize, u16)>) -> bool {
     }
     port6_count(P6_REGIONS, regions);
     true
+}
+
+/// Regions of committed private memory [`by_regions`] found (start, end),
+/// that it need not ask Windows about again (`VICTORY_REGION_CACHE`, on
+/// unless `=0`). Such a question walks the region's page tables: about 4
+/// a frame over large regions of the title's took 2.65 ms of the
+/// submitting thread (run ow59-move). Forgotten where the runtime
+/// allocates, frees, maps or unmaps ([`regions_changed`]); one the kernel's
+/// asking refuses is forgotten too, and the asking answered as refused.
+static REGIONS: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+fn region_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REGION_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Title memory `[at, at + len)` changed (allocated, freed, mapped,
+/// unmapped): the [`REGIONS`] it touches are forgotten.
+fn regions_changed(at: usize, len: usize) {
+    let end = at.saturating_add(len.max(1));
+    let mut r = REGIONS.write().unwrap_or_else(|e| e.into_inner());
+    if r.is_empty() {
+        return;
+    }
+    let gone: Vec<usize> = r.range(..end).filter(|(_, b)| **b > at).map(|(&a, _)| a).collect();
+    for a in gone {
+        r.remove(&a);
+    }
+}
+
+/// The [`WATCHED`] runs, those that meet joined, in bytes.
+pub(crate) fn watched_spans() -> Vec<(usize, usize)> {
+    if !watch_once() || !watch_pieces() {
+        return Vec::new();
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in watched_runs() {
+        match spans.last_mut() {
+            Some(last) if last.1 == a * PAGE => last.1 = b * PAGE,
+            _ => spans.push((a * PAGE, b * PAGE)),
+        }
+    }
+    spans
+}
+
+/// Whether a submission's asking takes, of copies that lie in the
+/// [`WATCHED`] runs, the ranges its steps refresh rather than each copy's
+/// span of them (`VICTORY_WATCH_PIECES`, on unless `=0`). The heap's copy
+/// is one: its span was some 150 MB at each of the frame's later
+/// submissions, 2 GB a frame asked about (run ow59-move).
+pub(crate) fn watch_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_PIECES").is_none_or(|v| v != "0"))
 }
 
 /// The parts of a submission's asking ([`ask_once`]) on its thread, in
@@ -1378,6 +1449,7 @@ static WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// The runtime made `[at, at + len)` write-watched private memory in place
 /// of a view of physical pages (`watched`), or is about to give it back.
 pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
+    regions_changed(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut w = WATCHED.write().unwrap_or_else(|e| e.into_inner());
     if watched {
@@ -2013,7 +2085,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 29] = [const { std::sync::atomic::AtomicU64::new(0) }; 29];
+static PORT6: [std::sync::atomic::AtomicU64; 30] = [const { std::sync::atomic::AtomicU64::new(0) }; 30];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -2058,6 +2130,8 @@ const P6_EXACT_PAGES: usize = 26;
 const P6_EXACT_NS: usize = 27;
 /// Refused askings cut at the watched runs' ends ([`ask_cut`]).
 const P6_CUT_AT_RUNS: usize = 28;
+/// Regions [`by_regions`] took from [`REGIONS`] with no question.
+const P6_REGIONS_CACHED: usize = 29;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -2241,7 +2315,7 @@ pub(crate) fn port_guard_line(frames: f64) {
          of the claims waited for, {:.2} ms a refresh's guarding held, {:.2} others' (VICTORY_CLAIMS_PER_RUN); \
          askings by regions {:.1} ({:.1} regions), submissions' askings spread over threads {:.1} ({:.1} pieces) (VICTORY_WATCH_NOT_GUARD); \
          walks of the watched runs {:.1}, {:.0} MB, {:.2} ms; later submissions' exact askings in them {:.1}, {:.0} MB, {:.2} ms (VICTORY_WATCH_ONCE); \
-         refused askings cut at the runs {:.1}",
+         refused askings cut at the runs {:.1}; regions known without asking {:.1} (VICTORY_REGION_CACHE)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -2271,8 +2345,10 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_EXACT_PAGES] * PAGE as f64 / 1e6,
         n[P6_EXACT_NS] / 1e6,
         n[P6_CUT_AT_RUNS],
+        n[P6_REGIONS_CACHED],
     );
     once_split_line(frames);
+    crate::safecopy::merge_line(frames);
     #[cfg(feature = "diagnostics")]
     asked_by_thread_line(frames);
 }
@@ -2894,6 +2970,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    regions_changed(at, len);
     if len == 0 || !known_holes() {
         return;
     }
@@ -5010,6 +5087,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    regions_changed(at, len);
     crate::texback::remapped(at, len);
     if remap_look() && nothing_noted(at, len) {
         // What the guards' lock alone would have changed: nothing.
@@ -5062,6 +5140,7 @@ fn nothing_noted(at: usize, len: usize) -> bool {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    regions_changed(at, len);
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
@@ -5088,6 +5167,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // (No length: the whole allocation, whose end is not known here.)
+    regions_changed(at, if len == 0 { usize::MAX - at } else { len });
     crate::shadow::write_combined_freed(at, len);
     #[cfg(feature = "diagnostics")]
     crate::memcensus::freed(at, len);

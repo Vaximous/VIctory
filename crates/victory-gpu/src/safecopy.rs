@@ -267,6 +267,41 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let began = std::time::Instant::now();
+    // SAFETY: the caller's promises, passed on.
+    let out = unsafe { merge_timed(title, now, held, len, take) };
+    use std::sync::atomic::Ordering::Relaxed;
+    MERGES[0].fetch_add(1, Relaxed);
+    MERGES[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    MERGES[2].fetch_add(len as u64, Relaxed);
+    MERGES[3].fetch_add(out.kept, Relaxed);
+    out
+}
+
+/// Since the last line: [`merge`]s, their nanoseconds, bytes, and blocks in
+/// which a title write since was kept.
+static MERGES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The landings' merge line of the frame lines, per frame.
+pub(crate) fn merge_line(frames: f64) {
+    let n: Vec<f64> = MERGES.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    if n[0] == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "landings merged into title memory per frame (three-way): {:.0} merges, {:.2} ms on all threads, {:.2} MB, {:.1} blocks a title write since kept",
+        n[0],
+        n[1] / 1e6,
+        n[2] / 1e6,
+        n[3],
+    );
+}
+
+/// [`merge`], untimed.
+///
+/// # Safety
+/// As [`merge`].
+unsafe fn merge_timed(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {

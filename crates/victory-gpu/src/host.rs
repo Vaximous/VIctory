@@ -6114,7 +6114,16 @@ impl Host {
                 let scanning = std::time::Instant::now();
                 batch.copy_spans(runs);
                 batch.scanned = scanning.elapsed();
-                batch.spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)).collect()
+                // In write-watched physical pages, the ranges refreshed, not
+                // their span (`crate::watch::watch_pieces`).
+                let b = &batch;
+                b.spans
+                    .iter()
+                    .zip(&b.span_rest)
+                    .filter(|(s, r)| s.0.asked_ahead() && r.0 < r.1)
+                    .map(|(_, r)| *r)
+                    .chain(b.watched_pieces.iter().filter(|p| b.spans[p.0].0.asked_ahead()).map(|p| (p.1, p.2)))
+                    .collect()
             } else {
                 let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
                 for list in runs {
@@ -8567,6 +8576,12 @@ struct Batch {
     /// copy (by address) is in it; how long finding them took.
     spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     spans_at: ByCopy<usize>,
+    /// Per span, the span of its ranges outside memory the runtime
+    /// write-watches for physical pages (empty: none); and the ranges
+    /// inside it, as the steps refresh them (span, from, to), for the
+    /// submission's asking (`crate::watch::watch_pieces`).
+    span_rest: Vec<(usize, usize)>,
+    watched_pieces: Vec<(usize, usize, usize)>,
     scanned: std::time::Duration,
     /// Room for [`Batch::refresh_front`]'s walk over the steps.
     touches: Vec<Touch>,
@@ -9394,6 +9409,13 @@ impl Batch {
     fn copy_spans(&mut self, runs: &[&HostList]) {
         self.spans.clear();
         self.spans_at.clear();
+        self.span_rest.clear();
+        self.watched_pieces.clear();
+        let watched = crate::watch::watched_spans();
+        let inside = |from: usize, to: usize| {
+            let i = watched.partition_point(|w| w.0 <= from);
+            i > 0 && to <= watched[i - 1].1
+        };
         // (Most come several times on end.)
         let mut last = (0, 0);
         for list in runs {
@@ -9411,11 +9433,20 @@ impl Batch {
                         std::collections::hash_map::Entry::Vacant(place) => {
                             place.insert(self.spans.len());
                             self.spans.push((shadow.clone(), from, to));
+                            self.span_rest.push((usize::MAX, 0));
                             self.spans.len() - 1
                         }
                     }
                 };
                 last = (key, at);
+                if !watched.is_empty() && inside(from, to) {
+                    if self.watched_pieces.last() != Some(&(at, from, to)) {
+                        self.watched_pieces.push((at, from, to));
+                    }
+                } else {
+                    let rest = &mut self.span_rest[at];
+                    (rest.0, rest.1) = (rest.0.min(from), rest.1.max(to));
+                }
                 let span = &mut self.spans[at];
                 (span.1, span.2) = (span.1.min(from), span.2.max(to));
             }
