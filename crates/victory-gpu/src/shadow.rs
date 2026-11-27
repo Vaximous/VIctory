@@ -4934,9 +4934,15 @@ impl Shadow {
         let at = from + (salt % parts) * PART;
         let n = PART.min(to - at);
         let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < at + n && e > at);
-        if busy || self.landing.load(Ordering::Acquire) {
+        if busy {
             return None;
         }
+        let landed = {
+            let first = start / KERNEL_PAGE;
+            let page = at / KERNEL_PAGE - first;
+            let bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            bits.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0)
+        };
         let mut title = [0u8; PART];
         if !crate::host::read_into(at as *const u8, &mut title[..n]) {
             return None;
@@ -4953,13 +4959,16 @@ impl Shadow {
         let (published, holds, asked, note, watched) = crate::watch::audit_page(at);
         Some(format!(
             "copy {} {start:#x}+{:#x} card {} window {} watched-state {}: part {at:#x} {differ} bytes differ; page copied after asking {copied}, ranged {:?}; \
-             journal: bit published {published}, ahead holds {holds}, asking standing {asked}, page last found written {note}; in a watched run {watched}",
+             journal: bit published {published}, ahead holds {holds}, asking standing {asked}, page last found written {note}; in a watched run {watched}; \
+             the copy has landings {} (this page noted {landed}); guards: {}",
             self.id,
             self.len,
             self.card.is_some(),
             self.window,
             self.watched.load(Ordering::Relaxed),
             ranged,
+            self.landing.load(Ordering::Acquire),
+            crate::watch::audit_block(at),
         ))
     }
 

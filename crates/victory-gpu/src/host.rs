@@ -8401,11 +8401,12 @@ static FRONT_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atom
 /// copy was refreshed whole some 9 times a frame, in 1 MiB pieces that
 /// nearly all took nothing, 18.9 GB a frame gone over (run ow60-move).
 ///
-/// Off unless `=1`: run ow61-move with it on was banded (stale tone curves)
-/// where run ow60-move without it was not; [`piece_audit`] looks for why.
+/// Run ow63-move with them off was banded as well: the stale copies are of
+/// view memory whose writes the guards missed ([`piece_audit`]), which the
+/// looks only skip more often.
 fn piece_looks() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_LOOKS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_LOOKS").is_none_or(|v| v != "0"))
 }
 
 /// Diagnostics: each piece of a long front span is looked at as with

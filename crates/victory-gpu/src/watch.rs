@@ -34,6 +34,148 @@ use std::sync::{Condvar, Mutex, RwLock};
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
 pub(crate) const PAGE: usize = 64 << 10;
+
+/// Diagnostics: what happened to guarded blocks, the last million events
+/// (blocks first..last, what, the path that did it, ms since the start, a
+/// thread number), for the audit of a stale piece ([`audit_block`]).
+#[cfg(feature = "diagnostics")]
+mod blocklog {
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    pub(super) struct Ev {
+        first: usize,
+        last: usize,
+        kind: &'static str,
+        path: &'static str,
+        ms: u32,
+        thread: u32,
+    }
+
+    static LOG: Mutex<VecDeque<Ev>> = Mutex::new(VecDeque::new());
+    const MOST: usize = 1 << 20;
+
+    thread_local! {
+        static PATH: Cell<&'static str> = const { Cell::new("other") };
+        static THREAD: u32 = {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+    }
+
+    fn ms() -> u32 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u32
+    }
+
+    /// Blocks `[first, last)` had `kind` done to them.
+    pub(super) fn note(first: usize, last: usize, kind: &'static str) {
+        if first >= last {
+            return;
+        }
+        let ev = Ev { first, last, kind, path: PATH.get(), ms: ms(), thread: THREAD.with(|t| *t) };
+        let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+        if log.len() >= MOST {
+            log.pop_front();
+        }
+        log.push_back(ev);
+    }
+
+    /// The path the events of this thread are said to come by, until dropped.
+    pub(super) struct Path(&'static str);
+
+    impl Path {
+        pub(super) fn set(path: &'static str) -> Path {
+            Path(PATH.replace(path))
+        }
+    }
+
+    impl Drop for Path {
+        fn drop(&mut self) {
+            PATH.set(self.0);
+        }
+    }
+
+    /// The last `n` events of `block`, newest first, and the ms now.
+    pub(super) fn of(block: usize, n: usize) -> String {
+        let log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = log
+            .iter()
+            .rev()
+            .filter(|e| e.first <= block && block < e.last)
+            .take(n)
+            .map(|e| format!("{} by {} at {} ms (t{}, {} blocks)", e.kind, e.path, e.ms, e.thread, e.last - e.first))
+            .collect();
+        if out.is_empty() {
+            out.push("none kept".into());
+        }
+        format!("now {} ms: {}", ms(), out.join("; "))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+macro_rules! blocklog {
+    ($first:expr, $last:expr, $kind:expr) => {
+        blocklog::note($first, $last, $kind)
+    };
+}
+#[cfg(not(feature = "diagnostics"))]
+macro_rules! blocklog {
+    ($first:expr, $last:expr, $kind:expr) => {{
+        let _ = (&$first, &$last);
+    }};
+}
+#[cfg(feature = "diagnostics")]
+macro_rules! blockpath {
+    ($path:expr) => {
+        blocklog::Path::set($path)
+    };
+}
+#[cfg(not(feature = "diagnostics"))]
+macro_rules! blockpath {
+    ($path:expr) => {
+        ()
+    };
+}
+
+/// Diagnostics for the audit of a stale piece: the guards' state of the
+/// 64 KiB block at `at` and of every other view of its page, with the last
+/// events of each ([`blocklog`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn audit_block(at: usize) -> String {
+    let block = at / BLOCK;
+    let mut views: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect();
+    views.retain(|&v| v != block);
+    let g = guards_shared();
+    let state = |b: usize| {
+        format!(
+            "{:#x}: protected {} clean {} aliased {} absent {} held {} parts open {:#06x} bit published {} bit protected {} beside {} opened lately {}",
+            b * BLOCK,
+            g.protected.contains(b),
+            g.clean.contains(b),
+            g.aliased.contains(b),
+            g.absent.contains(b),
+            g.held.contains(b),
+            parts_open(b),
+            PUBLISHED.any(b, b + 1),
+            PROTECTED.any(b, b + 1),
+            BESIDE.any(b, b + 1),
+            g.opened_lately(b),
+        )
+    };
+    let here = state(block);
+    let others: Vec<String> = views.iter().map(|&v| state(v)).collect();
+    drop(g);
+    let mut out = format!("block {here}; its events: {}", blocklog::of(block, 10));
+    if others.is_empty() {
+        out.push_str("; no other view of its page known");
+    }
+    for (v, s) in views.iter().zip(others) {
+        out.push_str(&format!(" || other view {s}; its events: {}", blocklog::of(*v, 6)));
+    }
+    out
+}
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
@@ -1404,6 +1546,7 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    blocklog!(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK), "wrote (a buffer copy of the title's)");
     // Renderer port #7: with no asking standing there is nothing to note,
     // which is seen shared. (Standing, its number moves: alone, as before.)
     if port_journal() && (len == 0 || !journal().kept) {
@@ -1696,6 +1839,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let _path = blockpath!("an asking");
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
@@ -2645,6 +2789,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     };
     put(page.wrapping_sub(block * BLOCK));
     count.fetch_add(weight, Relaxed);
+    blocklog!(block, block + 1, "a store put beside the guard");
     for view in shown.iter().filter(|&&view| view != 0) {
         BESIDE.set(view / BLOCK);
     }
@@ -2660,7 +2805,11 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
 pub(crate) fn nothing_put(block: usize) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let count = put_count(block);
-    count.load(Relaxed) < crate::titlewrite::MOST && count.fetch_add(1, Relaxed) < crate::titlewrite::MOST
+    let left = count.load(Relaxed) < crate::titlewrite::MOST && count.fetch_add(1, Relaxed) < crate::titlewrite::MOST;
+    if left {
+        blocklog!(block, block + 1, "a faulting store left out (changed nothing)");
+    }
+    left
 }
 
 /// The title is about to write block by block around `at`: as by a fault.
@@ -2682,6 +2831,8 @@ pub(crate) fn opened_for_writing(at: usize) {
 /// as the block opened (its heat, [`Guards::opened`]).
 fn open_faulted(at: usize, part: bool) -> (usize, std::time::Duration) {
     let block = at / BLOCK;
+    let _path = blockpath!(if part { "a title fault" } else { "a fault" });
+    blocklog!(block, block + 1, "faulted");
     let began = std::time::Instant::now();
     if !port_guard() {
         // (Bare, as a fault took it: see `guards_bare`.)
@@ -2824,6 +2975,7 @@ fn parts_open(block: usize) -> u16 {
 /// many parts, or the change failed).
 fn open_part(g: &Guards, block: usize, wrote: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    blocklog!(block, block + 1, "part open asked");
     let part = wrote % BLOCK / KERNEL_PAGE;
     let bit = 1u16 << part;
     let had = parts_open_locked(|open| open.get(&block).copied().unwrap_or(0));
@@ -2899,6 +3051,9 @@ fn parts_close(block: usize) -> u16 {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
+    for &page in pages {
+        blocklog!(page, page + 1, "published (clean, noted)");
+    }
     if port_guard() {
         // A block's claim while its bit is set: a fault opening it meanwhile
         // clears the bit after this sets it, never before.
@@ -3706,6 +3861,7 @@ impl std::hash::Hasher for PageHash {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
+    blocklog!(at / BLOCK, at.saturating_add(len.max(1)).div_ceil(BLOCK), "landing");
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
@@ -3740,6 +3896,9 @@ pub(crate) fn landing(at: usize, len: usize) {
 /// Returns the note's number, and for each 64 KiB block noted the number of
 /// the block's last write before (0: none is known).
 pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
+    for &(at, len) in spans {
+        blocklog!(at / BLOCK, at.saturating_add(len.max(1)).div_ceil(BLOCK), "landed beside the guard");
+    }
     let mut before = Vec::with_capacity(spans.len());
     let noted;
     // The same pages at other addresses: copies of the memory there have not
@@ -4272,6 +4431,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
         return false;
     }
     g.aliased.insert(block);
+    blocklog!(block, block + 1, "protected as another view");
     if g.protected.contains(block) {
         if parts_open(block) != 0 {
             // Parts open alone ([`guard_parts`]): read-only whole now, a
@@ -4430,6 +4590,7 @@ fn protect_alias_runs(g: &Guards, views: &[(usize, Vec<usize>)], mut claims: Opt
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    blocklog!(from, to, "protected (guarded clean)");
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
@@ -4566,6 +4727,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
     // All of them before the first can be written: a write through one is a
     // write of the others' bytes.
     for &block in blocks {
+        blocklog!(block, block + 1, "opened whole");
         g.protected.remove(block);
         g.clean.remove(block);
         PUBLISHED.clear(block);
@@ -4608,6 +4770,8 @@ fn writing_shared() -> bool {
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
+    let _path = blockpath!("our or the kernel's write");
+    blocklog!(at / BLOCK, last, "written by us or the kernel");
     if !light() || PROTECTED.any(at / BLOCK, last) {
         let opened = if writing_shared() && port_guard() && TAKING.1.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             // Block by block, each with its claims, beside the title's faults.
@@ -5106,6 +5270,8 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     regions_changed(at, len);
+    let _path = blockpath!("the runtime's mapping");
+    blocklog!(at / BLOCK, at.saturating_add(len.max(1)).div_ceil(BLOCK), "remapped");
     crate::texback::remapped(at, len);
     if remap_look() && nothing_noted(at, len) {
         // What the guards' lock alone would have changed: nothing.
@@ -5159,6 +5325,8 @@ fn nothing_noted(at: usize, len: usize) -> bool {
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
     regions_changed(at, len);
+    let _path = blockpath!("the runtime's unmapping");
+    blocklog!(at / BLOCK, at.saturating_add(len.max(1)).div_ceil(BLOCK), "unmapping");
     crate::texback::remapped(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
