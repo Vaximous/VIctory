@@ -6170,11 +6170,15 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        #[cfg(feature = "diagnostics")]
+        let ahead_began = std::time::Instant::now();
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
+        #[cfg(feature = "diagnostics")]
+        steps_add(0, ahead_began);
         // Parts sent to the card as each is ready ([`send_parts_early`]): a
         // flight of its own in the line, the rest prepared behind it.
         let all_runs = runs;
@@ -6196,6 +6200,8 @@ impl Host {
                 break;
             }
             stage.next("submit: the lists' steps (a part sent early)");
+            #[cfg(feature = "diagnostics")]
+            let steps_began = std::time::Instant::now();
             for list in &all_runs[done..cut] {
                 let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
                 if let Some(prelude) = list.prelude(&uploads) {
@@ -6203,9 +6209,17 @@ impl Host {
                 }
                 lists.push(list.list.cast().ok());
             }
+            #[cfg(feature = "diagnostics")]
+            steps_add(1, steps_began);
             done = cut;
+            #[cfg(feature = "diagnostics")]
+            let flush_began = std::time::Instant::now();
             batch.fill();
             batch.flush();
+            #[cfg(feature = "diagnostics")]
+            steps_add(2, flush_began);
+            #[cfg(feature = "diagnostics")]
+            let part_began = std::time::Instant::now();
             let (group, rest) = (&all_runs[held..cut], &all_runs[cut..]);
             // What shaders may write through views they pick, declared from
             // here on: a part goes on with the next if the rest refreshes it
@@ -6240,6 +6254,10 @@ impl Host {
             }
             crate::descriptor::make_waiting();
             *submitted += 1;
+            #[cfg(feature = "diagnostics")]
+            steps_add(3, part_began);
+            #[cfg(feature = "diagnostics")]
+            let call_began = std::time::Instant::now();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
@@ -6248,6 +6266,10 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            #[cfg(feature = "diagnostics")]
+            steps_add(4, call_began);
+            #[cfg(feature = "diagnostics")]
+            let part_began = std::time::Instant::now();
             awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
@@ -6286,11 +6308,15 @@ impl Host {
             held = cut;
             this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
             crate::shadow::preparing(this_submission);
+            #[cfg(feature = "diagnostics")]
+            steps_add(3, part_began);
         }
         // The rest, or all of it, as before.
         let runs = &all_runs[held..];
         let parts: Vec<usize> = if held == 0 && done == 0 { parts } else { Vec::new() };
         stage.next("submit: the lists' steps");
+        #[cfg(feature = "diagnostics")]
+        let steps_began = std::time::Instant::now();
         for list in &all_runs[done..] {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -6299,9 +6325,15 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        steps_add(1, steps_began);
+        #[cfg(feature = "diagnostics")]
+        let flush_began = std::time::Instant::now();
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        steps_add(2, flush_began);
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
@@ -8329,6 +8361,18 @@ impl std::hash::Hasher for AddressHash {
 #[cfg(feature = "diagnostics")]
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
+/// Of the lists' steps ([`SPLIT`]'s third), nanoseconds: the refreshes ahead
+/// of writes; the lists' own steps (`run_deferred`) and their preludes; the
+/// last fill and flush; of the parts sent early, what is done for them but
+/// the call; and that call (`ExecuteCommandLists` and the signal).
+#[cfg(feature = "diagnostics")]
+static STEPS_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "diagnostics")]
+fn steps_add(i: usize, since: std::time::Instant) {
+    STEPS_SPLIT[i].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
 #[cfg(feature = "diagnostics")]
@@ -8360,6 +8404,16 @@ impl Split {
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let st: Vec<f64> = STEPS_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    tracing::info!(
+        "the lists' steps per frame, the submitting thread: {:.1} ms refreshes ahead of writes, {:.1} the lists' own steps and preludes, \
+         {:.1} the fills and flushes after them, {:.1} the parts sent early but for the call, {:.1} sending them (ExecuteCommandLists, signal)",
+        st[0],
+        st[1],
+        st[2],
+        st[3],
+        st[4]
+    );
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
