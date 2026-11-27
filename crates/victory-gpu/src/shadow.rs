@@ -1536,6 +1536,22 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Whether a refresh's long copies are cut into small pieces for the kept
+/// threads (`VICTORY_WIDE_PIECES`, on; =0 pieces of 256 KiB from 1 MiB on,
+/// and a buffer nothing watches copied in one go, as before). The threads
+/// waited half of their time behind one long piece (p90 527 us against a
+/// median of 37).
+fn wide_pieces_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PIECES").is_none_or(|v| v != "0"))
+}
+
+/// From how many bytes a refresh's copying is spread, and in pieces of how
+/// many ([`wide_pieces_on`]).
+fn wide_pieces() -> (usize, usize) {
+    if wide_pieces_on() { (128 << 10, 64 << 10) } else { (1 << 20, 256 << 10) }
+}
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
@@ -4140,7 +4156,7 @@ impl Shadow {
         if self.card.is_some() && !self.window && whole_changed() {
             self.copy_changed(from, to);
         } else {
-            self.copy(from, to);
+            self.copy_wide(from, to);
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
@@ -4152,18 +4168,17 @@ impl Shadow {
     /// watched, that takes, and sends up, only the 4 KiB parts in which
     /// title memory differs from the CPU's side. On several threads if long.
     fn copy_changed(&self, from: usize, to: usize) {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        let (long, part) = wide_pieces();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
             return;
         }
-        if to - from < LONG {
+        if to - from < long {
             self.copy_changed_part(from, to);
             return;
         }
-        let parts: Vec<(usize, usize)> = (from..to).step_by(PART).map(|a| (a, (a + PART).min(to))).collect();
+        let parts: Vec<(usize, usize)> = (from..to).step_by(part).map(|a| (a, (a + part).min(to))).collect();
         let this = std::ptr::from_ref(self) as usize;
         wide_each(parts.len(), move |i| {
             // SAFETY: `wide_each` returns when every part is done, before
@@ -4337,21 +4352,20 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        let (long, part) = wide_pieces();
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
-        if bytes < LONG || !crate::watch::light() {
+        if bytes < long || !crate::watch::light() {
             for (from, to, known) in runs {
                 self.take(from, to, known);
             }
             return bytes;
         }
-        let mut parts = Vec::with_capacity(bytes / PART + runs.len());
+        let mut parts = Vec::with_capacity(bytes / part + runs.len());
         for (from, to, known) in runs {
             let mut at = from;
             while at < to {
                 // Whole pages to a part.
-                let next = ((at / PAGE) * PAGE + PART).min(to);
+                let next = ((at / PAGE) * PAGE + part).min(to);
                 parts.push((at, next, known));
                 at = next;
             }
@@ -4492,6 +4506,26 @@ impl Shadow {
             }
         });
         to - from
+    }
+
+    /// [`Shadow::copy`], on several threads in pieces if long
+    /// ([`wide_pieces`]; a whole copy of a buffer nothing watches was one
+    /// job of up to milliseconds while the other threads waited).
+    fn copy_wide(&self, from: usize, to: usize) {
+        let (long, part) = wide_pieces();
+        if !wide_pieces_on() || to.saturating_sub(from) < long {
+            self.copy(from, to);
+            return;
+        }
+        let parts: Vec<(usize, usize)> = (from..to).step_by(part).map(|a| (a, (a + part).min(to))).collect();
+        let this = std::ptr::from_ref(self) as usize;
+        wide_each(parts.len(), move |i| {
+            // SAFETY: `wide_each` returns when every part is done, before
+            // the borrow of `self` ends. The parts lie apart.
+            let this = unsafe { &*(this as *const Shadow) };
+            let (a, b) = parts[i];
+            this.copy(a, b);
+        });
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
