@@ -69,7 +69,7 @@ static DROPPED: [AtomicI64; 2] = [const { AtomicI64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 fn note_heading(found: impl FnOnce() -> Option<(f32, f32)>) {
     static LAST_S: AtomicU64 = AtomicU64::new(u64::MAX);
-    let Some(us) = super::route::route_us() else { return };
+    let Some(us) = super::route::route_now_us() else { return };
     let s = us / 1_000_000;
     if LAST_S.swap(s, Ordering::Relaxed) == s {
         return;
@@ -302,6 +302,118 @@ fn turn_to(memory: &impl Memory, base: u64, list: &[Camera], counts: (i32, i32),
     false
 }
 
+/// A camera trace for a route played back (`VICTORY_ROUTE_CAMERA_TRACE=<file>`;
+/// off when unset): lines of `<route seconds> <yaw> <pitch>`, the camera's
+/// heading at those moments of a replay that went where the route goes
+/// (the "route camera" lines of a diagnostics build). The title's follow
+/// camera turns by itself as the player walks, by as much as 1.1 rad in a
+/// few seconds with no mouse input, and by how much depends on the frame
+/// pace: the same counts left the camera facing elsewhere at the door.
+/// From the first checkpoint until the last one (and route 80 s at most),
+/// while a camera is found, it is written at each pad read to the heading
+/// interpolated between the checkpoints around the route's moment; the
+/// route's mouse counts are in the trace already and are not added again.
+fn trace() -> Option<&'static [(f64, f32, f32)]> {
+    static TRACE: OnceLock<Option<Vec<(f64, f32, f32)>>> = OnceLock::new();
+    TRACE
+        .get_or_init(|| {
+            if !super::route::replaying() {
+                return None;
+            }
+            let path = std::env::var_os("VICTORY_ROUTE_CAMERA_TRACE")?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(%error, "the camera trace could not be read (VICTORY_ROUTE_CAMERA_TRACE)");
+                    return None;
+                }
+            };
+            let mut points: Vec<(f64, f32, f32)> = text
+                .lines()
+                .filter_map(|line| {
+                    let mut w = line.split_whitespace().map(str::parse::<f64>);
+                    let (Some(Ok(t)), Some(Ok(y)), Some(Ok(p))) = (w.next(), w.next(), w.next()) else { return None };
+                    (t.is_finite() && y.is_finite() && p.is_finite()).then_some((t, y as f32, p as f32))
+                })
+                .filter(|&(t, _, _)| t <= TRACE_UNTIL_S)
+                .collect();
+            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+            tracing::info!(
+                path = %std::path::Path::new(&path).display(),
+                points = points.len(),
+                from_s = points.first().map(|p| p.0),
+                to_s = points.last().map(|p| p.0),
+                "route camera trace (VICTORY_ROUTE_CAMERA_TRACE)"
+            );
+            (!points.is_empty()).then_some(points)
+        })
+        .as_deref()
+}
+
+/// The trace is followed no further than this route second.
+const TRACE_UNTIL_S: f64 = 80.0;
+
+/// The trace's heading at route second `t`, if `t` is within it: yaw along
+/// the shorter way round (`wrap`), pitch straight.
+fn traced(points: &[(f64, f32, f32)], t: f64, wrap: f32) -> Option<(f32, f32)> {
+    let first = points.first()?;
+    let last = points.last()?;
+    if t < first.0 || t > last.0 {
+        return None;
+    }
+    let i = points.partition_point(|p| p.0 <= t);
+    let a = points[i.saturating_sub(1)];
+    let Some(&b) = points.get(i) else { return Some((a.1, a.2)) };
+    let k = if b.0 > a.0 { ((t - a.0) / (b.0 - a.0)) as f32 } else { 0.0 };
+    let mut dy = b.1 - a.1;
+    if wrap > 0.0 {
+        let half = wrap / 2.0;
+        dy = (dy + half).rem_euclid(wrap) - half;
+    }
+    let mut yaw = a.1 + dy * k;
+    if wrap > 0.0 {
+        let half = wrap / 2.0;
+        yaw = (yaw + half).rem_euclid(wrap) - half;
+    }
+    Some((yaw, a.2 + (b.2 - a.2) * k))
+}
+
+/// Writes the first found camera to the trace's heading now; `None` when
+/// the trace does not hold this moment, else whether a camera was found.
+fn turn_to_trace(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<bool> {
+    let points = trace()?;
+    let t = super::route::route_now_us()? as f64 / 1e6;
+    for camera in list {
+        if !present(memory, base, camera) {
+            continue;
+        }
+        let (Some(y), Some(p)) = (resolve(memory, base, &camera.yaw), resolve(memory, base, &camera.pitch)) else {
+            continue;
+        };
+        let (Some(yaw), Some(pitch)) = (read_f32(memory, y), read_f32(memory, p)) else {
+            continue;
+        };
+        let (new_yaw, new_pitch) = traced(points, t, camera.wrap)?;
+        let (lo, hi) = (camera.pitch_min.min(camera.pitch_max), camera.pitch_max.max(camera.pitch_min));
+        let new_pitch = new_pitch.clamp(lo, hi);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!(route_s = t, yaw, new_yaw, "route camera trace: followed from here"));
+        if (new_yaw, new_pitch) != (yaw, pitch) {
+            memory.write(y, &new_yaw.to_le_bytes());
+            memory.write(p, &new_pitch.to_le_bytes());
+            let mut by_yaw = new_yaw - yaw;
+            if camera.wrap > 0.0 {
+                let half = camera.wrap / 2.0;
+                by_yaw = (by_yaw + half).rem_euclid(camera.wrap) - half;
+            }
+            shift(memory, base, &camera.yaw_copies, by_yaw, camera.wrap);
+            shift(memory, base, &camera.pitch_copies, new_pitch - pitch, 0.0);
+        }
+        return Some(true);
+    }
+    None
+}
+
 /// At the title's pad read: the counts since the last one go to the cameras.
 pub(super) fn apply() {
     let Some(cameras) = CAMERAS.get() else {
@@ -312,7 +424,9 @@ pub(super) fn apply() {
     }
     let counts = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
     #[cfg(windows)]
-    let found = if absolute() {
+    let found = if let Some(found) = turn_to_trace(&host::Own, cameras.base, &cameras.list) {
+        found
+    } else if absolute() {
         turn_to(&host::Own, cameras.base, &cameras.list, counts, cameras.scale, cameras.invert_y)
     } else {
         turn(&host::Own, cameras.base, &cameras.list, counts, cameras.scale, cameras.invert_y)
