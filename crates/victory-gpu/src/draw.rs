@@ -194,6 +194,28 @@ fn bake_over_full() -> u64 {
     })
 }
 
+/// Whether the pass may make one more host copy in the PC's memory this
+/// frame for a texture the card has no room for
+/// (`VICTORY_SYSTEM_FALLBACK=N`, N a frame; unset or 0: none, as before).
+fn system_fallback_left(frame: u64) -> bool {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static AT: AtomicU64 = AtomicU64::new(0);
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SYSTEM_FALLBACK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    if most == 0 {
+        return false;
+    }
+    let at = AT.load(Ordering::Relaxed);
+    let (seen, count) = (at >> 16, at & 0xffff);
+    let count = if seen == frame & 0xffff_ffff_ffff { count } else { 0 };
+    if count >= most.min(0xffff) {
+        return false;
+    }
+    AT.store((frame & 0xffff_ffff_ffff) << 16 | (count + 1), Ordering::Relaxed);
+    true
+}
+
 /// Made over the line for bakes this frame ([`bake_over_full`]); in all.
 static BAKE_OVER_FULL: AtomicU64 = AtomicU64::new(0);
 static BAKE_OVER_FULL_MADE: AtomicU64 = AtomicU64::new(0);
@@ -2655,6 +2677,8 @@ impl State {
         }
         let mut refused = 0;
         let mut back_made = 0u32;
+        // This slot's copy goes to the PC's memory ([`system_fallback_left`]).
+        let mut in_system;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         // A bake's pass takes them too: its inputs may be among them
@@ -2801,6 +2825,7 @@ impl State {
         }
         let mut served = true;
         for (index, write) in due {
+            in_system = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
@@ -2974,7 +2999,21 @@ impl State {
                         );
                     }
                 }
-                if !has_its_texture && !back && !for_bake {
+                // Or, with `VICTORY_SYSTEM_FALLBACK=N`, up to N a pass in
+                // the PC's memory (`crate::resource::IN_SYSTEM_MEMORY`).
+                let fallback = !has_its_texture && !back && !for_bake && system_fallback_left(frame);
+                if fallback {
+                    in_system = true;
+                    let n = crate::resource::IN_SYSTEM_MEMORY_MADE.load(Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() || n.is_multiple_of(1000) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture the card has no room for is made in the PC's memory (VICTORY_SYSTEM_FALLBACK)"
+                        );
+                    }
+                }
+                if !has_its_texture && !back && !for_bake && !fallback {
                     refused += 1;
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
@@ -3131,7 +3170,9 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                crate::resource::IN_SYSTEM_MEMORY.set(in_system);
                 readable(list, sampled.kind, view);
+                crate::resource::IN_SYSTEM_MEMORY.set(false);
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.

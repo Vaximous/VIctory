@@ -1778,7 +1778,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() && !IN_SYSTEM_MEMORY.get() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -2952,10 +2952,24 @@ fn host_texture_as(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // In the PC's memory, where the card reads it over the bus
+    // ([`IN_SYSTEM_MEMORY`]).
+    let system = !reserved && IN_SYSTEM_MEMORY.get() && fills(desc) && clear_value.is_none();
+    let heap = if system {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        }
+    } else {
+        heap
+    };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    if !system
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -3019,12 +3033,29 @@ fn host_texture_as(
         texture = None;
     }
     if let Some(t) = &texture {
+        if system {
+            IN_SYSTEM_MEMORY_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
     texture
 }
+
+thread_local! {
+    /// While set, a host copy of a texture the title fills is made in the
+    /// PC's memory (a custom heap of memory pool L0), not the card's: the
+    /// texture pass sets it for a texture the card has no room for
+    /// (`crate::draw`, `VICTORY_SYSTEM_FALLBACK`). Slower to sample than
+    /// the card's, not gray; the sweep lets it go when idle, and it comes
+    /// back on the card when there is room.
+    pub(crate) static IN_SYSTEM_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Host copies made in the PC's memory ([`IN_SYSTEM_MEMORY`]), since the
+/// start.
+pub(crate) static IN_SYSTEM_MEMORY_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.
