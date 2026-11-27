@@ -1276,6 +1276,12 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    let [runs, run_blocks, left] =
+        [0, 1, 2].map(|n| crate::watch::ALIAS_RUNS[n].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "other views made read-only a run at a time, per frame (VICTORY_ALIAS_RUNS): {runs:.1} calls for {run_blocks:.1} blocks; \
+         {left:.1} runs left to a call a block (not one region of one protection)"
+    );
     tracing::info!(
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)

@@ -3018,7 +3018,11 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// have now; a view whose block's claim cannot be had is not covered.
 fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) -> bool {
     let mut all = true;
-    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
+    let views = elsewhere(from * BLOCK, (to - from) * BLOCK);
+    if alias_runs() {
+        protect_alias_runs(g, &views, claims.as_deref_mut());
+    }
+    for (page, others) in views {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
             continue; // not there, or not ours to guard
@@ -3085,6 +3089,117 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     PROTECTED.clear(block);
     false
+}
+
+/// Whether [`cover`] makes the other views' blocks read-only a run at a
+/// time (`VICTORY_ALIAS_RUNS`, on; =0 one block at a time, as before).
+///
+/// The other views of a guarded range's pages are mostly a range too, and
+/// [`protect_alias`] changed them one page per call, under the guards'
+/// lock: in run ow22-move 8.0 ms a frame went to changing protections and
+/// 10 ms to waiting for that lock. Now the blocks that would be changed are
+/// gathered first and each run of them in one region of the same
+/// protection is changed with one call; [`protect_alias`] then finds them
+/// read-only and only notes them.
+fn alias_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_RUNS").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ALIAS_RUNS") {
+        return on;
+    }
+    on
+}
+
+/// Since the last line: calls that changed a run of other views' blocks
+/// at once, the blocks they changed, and the runs left to one call a block
+/// (the region was not one of the same protection).
+pub(crate) static ALIAS_RUNS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`alias_runs`]: the blocks of the other views in `views` that
+/// [`protect_alias`] would make read-only, made so a run at a time where a
+/// run lies in one region that is read-write or read-only. What is left is
+/// left to [`protect_alias`].
+fn protect_alias_runs(g: &Guards, views: &[(usize, Vec<usize>)], mut claims: Option<&mut Claims>) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect, VirtualQuery,
+    };
+    let rest = rest();
+    let mut blocks: Vec<usize> = Vec::new();
+    for (page, others) in views {
+        if !g.protected.contains(page / BLOCK) {
+            continue;
+        }
+        for &other in others {
+            let block = other / BLOCK;
+            if g.protected.contains(block) || g.left_alone(block) || g.rests(block, rest) {
+                continue;
+            }
+            if let Some(claims) = claims.as_deref_mut()
+                && !claims.holds(block)
+                && !claims.try_one(block)
+            {
+                continue;
+            }
+            blocks.push(block);
+        }
+    }
+    if blocks.len() < 2 {
+        return;
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut j = i + 1;
+        while j < blocks.len() && blocks[j] == blocks[j - 1] + 1 {
+            j += 1;
+        }
+        let (first, last) = (blocks[i], blocks[j - 1] + 1);
+        i = j;
+        if last - first < 2 {
+            continue;
+        }
+        // One region of one protection from `first` to `last`, ours to guard.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query only.
+        let asked = unsafe { VirtualQuery((first * BLOCK) as *const _, &mut m, size_of_val(&m)) } != 0;
+        let fits = asked
+            && m.State == MEM_COMMIT
+            && m.Protect & PAGE_GUARD == 0
+            && matches!(m.Protect, PAGE_READWRITE | PAGE_READONLY)
+            && m.BaseAddress as usize <= first * BLOCK
+            && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= last * BLOCK;
+        if !fits {
+            ALIAS_RUNS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        // Ahead of the protection.
+        (first..last).for_each(|block| PROTECTED.set(block));
+        let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        // SAFETY: title view memory, one region read-write or read-only;
+        // only its protection changes.
+        let done = unsafe { VirtualProtect((first * BLOCK) as *const _, (last - first) * BLOCK, PAGE_READONLY, &mut old) } != 0;
+        #[cfg(feature = "diagnostics")]
+        {
+            tally(5, (last - first) as u64);
+            tally(8, started.elapsed().as_nanos() as u64);
+        }
+        if done {
+            g.protected.insert_all(first..last);
+            (first..last).for_each(|block| {
+                g.aliased.insert(block);
+                #[cfg(feature = "diagnostics")]
+                crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+            });
+            ALIAS_RUNS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ALIAS_RUNS[1].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            (first..last).for_each(|block| PROTECTED.clear(block));
+        }
+    }
 }
 
 /// [`protect`] for one range, without the other views of its pages.
