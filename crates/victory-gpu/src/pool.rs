@@ -518,6 +518,16 @@ struct Reclaim {
     piece: Piece,
     /// The texture's address ([`PIECES`]).
     texture: usize,
+    /// The pool it is from: [`TEXTURES`], or a buffer pool ([`buffer`]).
+    kind: Kind,
+}
+
+/// Which pool a piece is from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Texture,
+    CardBuffer,
+    SharedBuffer,
 }
 
 struct Methods([*const (); 3]);
@@ -554,9 +564,15 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            PIECES.lock().unwrap_or_else(|e| e.into_inner()).remove(&gone.texture);
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            match gone.kind {
+                Kind::Texture => {
+                    PIECES.lock().unwrap_or_else(|e| e.into_inner()).remove(&gone.texture);
+                    HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+                    lock(&TEXTURES).give(gone.piece, now());
+                }
+                Kind::CardBuffer => lock(&CARD_BUFFERS).give(gone.piece, now()),
+                Kind::SharedBuffer => lock(&SHARED_BUFFERS).give(gone.piece, now()),
+            }
         }
         left
     }
@@ -595,12 +611,16 @@ fn made_now(texture: &ID3D12Resource) {
     recent.push_back((texture.as_raw() as usize, now));
 }
 
-/// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+/// Makes `texture` give `piece` back to its pool when the last reference
+/// to it goes.
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, kind: Kind) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let raw = texture.as_raw() as usize;
-    PIECES.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, piece.block);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw }));
+    if kind == Kind::Texture {
+        PIECES.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, piece.block);
+    }
+    let made =
+        Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, texture: raw, kind }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -670,7 +690,7 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            give_back_with(&made, piece, Kind::Texture);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -697,6 +717,133 @@ pub(crate) unsafe fn texture(
             None
         }
     }
+}
+
+/// Whether the host copies of small title buffers (up to [`BUFFER_MOST`]),
+/// both sides, are buffers placed in blocks made once
+/// (`VICTORY_POOLED_CARD_COPIES=1`; off by default), not allocations of their
+/// own. Each of those was made, made resident and waited for on the card
+/// alone, about 0.6 ms, two a copy: when the world first shows a part of
+/// it the pass over the heap's views made some 3,500 of them in a row (1,040
+/// and 4,096 bytes, 64 KiB each), and the lists' close waited for it for
+/// 1.1 to 3.6 s without a frame (runs ow46b, ow48, ow50b). A placed buffer
+/// is a resource of its own still: its barriers, views (at offset 0) and
+/// copies are as they were; only its memory comes from a block.
+///
+/// Off by default since run ow52: the card's time per frame went from 29.5
+/// to 37.1 ms over world frames 1000-3000 (against ow50b) and no cause in
+/// the blocks themselves was found: no aliasing barriers are issued for
+/// buffers, each block is made resident once (64 MiB, not per frame), and
+/// a copy placed where another was sends its 64 KiB up once. The card
+/// sides' ranges sent up per frame rose from 20,000-34,000 to 25,000-67,000
+/// in the same run, which the blocks do not explain either.
+pub(crate) fn pooled_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOLED_CARD_COPIES").is_some_and(|v| v != "0"))
+}
+
+/// The most bytes of a buffer [`buffer`] places in a block.
+pub(crate) const BUFFER_MOST: u64 = 64 << 10;
+
+static CARD_BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE));
+static SHARED_BUFFERS: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE));
+
+/// Buffers placed in blocks, made so far, in the card's memory and in the PC's.
+static BUFFERS_MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A buffer of `size` bytes (up to [`BUFFER_MOST`]) that shaders may write,
+/// placed in a block ([`pooled_copies`]): in the card's memory, or with
+/// `shared` in the PC's, mapped (as `crate::host::Host::shared_buffer`).
+/// The buffer, its mapping (null unless `shared`), and whether its memory
+/// held another buffer before (a shared one is zeros all the same; one in the
+/// card's memory is not). `None`: not pooled, or no room.
+pub(crate) fn buffer(device: &ID3D12Device, size: u64, shared: bool) -> Option<(ID3D12Resource, *mut u8, bool)> {
+    if !pooled_copies() || size == 0 || size > BUFFER_MOST {
+        return None;
+    }
+    let size = size.next_multiple_of(1 << 16);
+    let (pool, kind) = if shared { (&SHARED_BUFFERS, Kind::SharedBuffer) } else { (&CARD_BUFFERS, Kind::CardBuffer) };
+    let (piece, heap, again) = lock(pool).take_ripe(size, 1 << 16, now(), Ripe::now(), || {
+        let properties = if shared {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+        };
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: BLOCK,
+            Properties: properties,
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | crate::host::not_resident(),
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
+            tracing::warn!(error = %e, shared, "no block of buffer memory");
+        }
+        if let Some(h) = &heap
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+        {
+            tracing::warn!(error = %e, "a block of buffer memory is not resident");
+            return None;
+        }
+        heap
+    })?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: the piece is no one else's; the heap lives while a piece of
+    // it is taken.
+    let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made) };
+    let made = match (result, made) {
+        (Ok(()), Some(made)) => made,
+        (result, _) => {
+            lock(pool).give(piece, now());
+            if let Err(e) = result {
+                tracing::warn!(error = %e, shared, "no buffer placed in a block");
+            }
+            return None;
+        }
+    };
+    give_back_with(&made, piece, kind);
+    let mut data = std::ptr::null_mut();
+    if shared {
+        // SAFETY: a buffer in CPU-visible memory, mapped whole.
+        if unsafe { made.Map(0, None, Some(&mut data)) }.is_err() || data.is_null() {
+            return None;
+        }
+        if again {
+            // As a buffer of its own: zeros.
+            // SAFETY: the mapping's `size` bytes, ours alone.
+            unsafe { std::ptr::write_bytes(data.cast::<u8>(), 0, size as usize) };
+        }
+    }
+    let n = BUFFERS_MADE[usize::from(shared)].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 64 {
+        tracing::info!(
+            on_card = BUFFERS_MADE[0].load(Ordering::Relaxed),
+            in_the_pc = BUFFERS_MADE[1].load(Ordering::Relaxed),
+            card_blocks = lock(&CARD_BUFFERS).blocks(),
+            pc_blocks = lock(&SHARED_BUFFERS).blocks(),
+            "title buffers' host copies placed in blocks so far (VICTORY_POOLED_CARD_COPIES=1)"
+        );
+    }
+    // (Booked where it is named, `crate::host::name`: once, not twice.)
+    Some((made, data.cast(), again))
 }
 
 #[cfg(test)]
@@ -867,6 +1014,39 @@ mod tests {
         let q = pool.take(quarter, 65536, REST, make).unwrap().0;
         assert_eq!(q.block, pieces[0].block);
         assert_eq!(pool.blocks(), 2);
+    }
+
+    /// A pooled buffer is a resource of its own at offset 0 of its piece,
+    /// its piece comes back when its last reference goes, and a shared one
+    /// used again begins as zeros.
+    #[test]
+    fn a_pooled_buffer_gives_its_piece_back_and_starts_as_zeros() {
+        let Some(host) = crate::host::host() else { return };
+        let Some((card, data, _)) = buffer(&host.device, 1040, false) else { return };
+        assert!(data.is_null());
+        assert_eq!(crate::host::references(&card), 1);
+        let resting = || lock(&CARD_BUFFERS).resting.len();
+        let before = resting();
+        drop(card);
+        assert_eq!(resting(), before + 1);
+        let (shared, data, _) = buffer(&host.device, 4096, true).unwrap();
+        // SAFETY: the mapping's 64 KiB.
+        unsafe { std::ptr::write_bytes(data, 0xCD, 1 << 16) };
+        drop(shared);
+        lock(&SHARED_BUFFERS).rested(u64::MAX);
+        let mut seen_again = false;
+        for _ in 0..4 {
+            let (b, data, again) = buffer(&host.device, 4096, true).unwrap();
+            if again {
+                seen_again = true;
+                // SAFETY: as above.
+                assert!(unsafe { (0..1 << 16).all(|i| *data.add(i) == 0) });
+            }
+            drop(b);
+            lock(&SHARED_BUFFERS).rested(u64::MAX);
+        }
+        assert!(seen_again);
+        assert!(buffer(&host.device, BUFFER_MOST + 1, true).is_none());
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

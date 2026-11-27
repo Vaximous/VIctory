@@ -282,24 +282,42 @@ impl Own {
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
         let (mut first, mut last) = (Vec::new(), Vec::new());
+        // By buffer: copies whose card sides are places in one buffer
+        // (`crate::shadow::card_slot`) share its state, and get one barrier
+        // each way. The buffer, whether one was copied into (or looked
+        // at), written by the pass, and hashed after.
+        let mut buffers: Vec<(&ID3D12Resource, bool, bool, bool)> = Vec::new();
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, shadow.base() + a as u64, source, from, n as u64) };
             }
-            let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
-            if copy.pairs.1 > 0 {
+            let copied = looked(shadow) || !copy.runs.is_empty();
+            let written = copy.pairs.1 > 0;
+            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some())
+                && (!copy.runs.is_empty() || copy.pairs.1 > 0);
+            let raw = shadow.buffer.as_raw();
+            match buffers.iter_mut().find(|b| b.0.as_raw() == raw) {
+                Some(b) => {
+                    b.1 |= copied;
+                    b.2 |= written;
+                    b.3 |= hashed;
+                }
+                None => buffers.push((&shadow.buffer, copied, written, hashed)),
+            }
+        }
+        for &(buffer, copied, written, hashed) in &buffers {
+            let mut state = copied.then_some(dest);
+            if written {
                 if let Some(was) = state {
-                    first.push(transition(&shadow.buffer, was, write));
+                    first.push(transition(buffer, was, write));
                 }
                 state = Some(write);
             }
-            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(was) = state
                 && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
             {
-                last.push(transition(&shadow.buffer, was, read));
+                last.push(transition(buffer, was, read));
             }
         }
         // SAFETY: the caller's; live objects.
@@ -314,7 +332,7 @@ impl Own {
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
-                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(2, shadow.card_gpu());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let mut done = 0;
