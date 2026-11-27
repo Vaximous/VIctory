@@ -242,15 +242,20 @@ impl Table {
 
     fn find(&self, at: usize) -> Option<&Arc<Probed>> {
         // The last live span beginning at or below `at` that holds it (they
-        // may nest: a view's block inside an older copy's range).
+        // may nest: a view's block inside an older copy's range). The 16
+        // nearest first; then all of them, which a fault that found none
+        // there must not miss.
         let end = self.spans.partition_point(|s| s.0 <= at);
-        self.spans[..end]
-            .iter()
-            .rev()
-            .take(16)
-            .filter(|s| at < s.1)
-            .map(|s| &self.copies[s.2])
-            .find(|c| c.alive.load(Ordering::Relaxed))
+        let live = |s: &&(usize, usize, usize)| at < s.1 && self.copies[s.2].alive.load(Ordering::Relaxed);
+        let near = self.spans[..end].iter().rev().take(16).find(live);
+        near.or_else(|| self.spans[..end].iter().rev().skip(16).find(live)).map(|s| &self.copies[s.2])
+    }
+
+    /// Whether any span, live or not, holds `at`: a page armed for a copy
+    /// since let go of.
+    fn armed_once(&self, at: usize) -> bool {
+        let end = self.spans.partition_point(|s| s.0 <= at);
+        self.spans[..end].iter().any(|s| at < s.1)
     }
 }
 
@@ -575,7 +580,10 @@ pub(crate) fn fault(at: usize, write: bool, site: usize) -> bool {
         // (Whoever holds the table to change it takes no fault meanwhile.)
         let t = TABLE.read().unwrap_or_else(|e| e.into_inner());
         let Some(p) = t.find(at) else {
-            return false;
+            // Armed for a copy let go of since: the guard is off now, and
+            // the access goes on (else nobody takes the fault and the
+            // process ends: run ow54-port, in a memcpy).
+            return t.armed_once(at);
         };
         p.clone()
     };
