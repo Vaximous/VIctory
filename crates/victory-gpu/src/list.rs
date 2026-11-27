@@ -1393,6 +1393,9 @@ extern "system" fn clear_rtv(
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
+        if rects.is_none() {
+            crate::draw::note_clear(record.resource, handle, *color);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);

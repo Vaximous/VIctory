@@ -318,6 +318,131 @@ fn world_ms() -> Option<u64> {
 /// made ahead (for the lines of slow passes).
 pub(crate) static PASS_PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// A draw of a decoration bake as [`State::note_bake`] keeps it.
+#[derive(Clone, Copy)]
+enum Shot {
+    Mesh(u32),
+    Draw(u32, u32, u32, u32),
+    Indexed(u32, u32, u32, i32, u32),
+}
+
+/// What a bake draw had set, to draw it again ([`State::replay_bakes`]).
+struct BakeShot {
+    frame: u64,
+    pipeline: usize,
+    hashes: Vec<String>,
+    heaps: [usize; 2],
+    graphics: Vec<Root>,
+    vertex: [VertexView; 32],
+    index: IndexView,
+    topology: u32,
+    topology_set: bool,
+    target_handles: Vec<u64>,
+    depth_handle: u64,
+    targets_set: bool,
+    targets: Vec<(usize, Option<(u64, u32, u32)>)>,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<[f32; 4]>,
+    stencil: Option<u32>,
+    depth_bounds: Option<[f32; 2]>,
+    shot: Shot,
+}
+
+// SAFETY: plain values; the title objects it names are only looked up.
+unsafe impl Send for BakeShot {}
+
+static BAKE_SHOTS: std::sync::Mutex<Vec<BakeShot>> = std::sync::Mutex::new(Vec::new());
+
+/// The bake draws of the frame being recorded: its number, whether a pass
+/// before one was not served, the draws.
+static FRAME_BAKES: std::sync::Mutex<(u64, bool, Vec<BakeShot>)> = std::sync::Mutex::new((0, false, Vec::new()));
+
+thread_local! {
+    /// Bake draws are being drawn again: not kept again.
+    static REPLAYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The bake draws of a frame before `frame` are kept to be drawn again if
+/// a pass before one of them was not served, all of them in order (a bake
+/// draws its layers onto what the ones before drew), and let go otherwise.
+fn settle_bakes(frame: u64) {
+    let mut current = FRAME_BAKES.lock().unwrap_or_else(|e| e.into_inner());
+    if current.0 == frame {
+        return;
+    }
+    let (unserved, shots) = (current.1, std::mem::take(&mut current.2));
+    *current = (frame, false, Vec::new());
+    drop(current);
+    if unserved && !shots.is_empty() {
+        BAKE_REPLAYS[0].fetch_add(shots.len() as u64, Ordering::Relaxed);
+        let mut kept = BAKE_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.len() + shots.len() <= 1024 {
+            kept.extend(shots);
+        } else {
+            BAKE_REPLAYS[3].fetch_add(shots.len() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The title's whole clears of render targets: by resource, the frame, the
+/// view's handle, the colour (to clear a bake's targets again before it is
+/// drawn again).
+static CLEARS: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, u64, [f32; 4])>>> = std::sync::Mutex::new(None);
+
+/// The title cleared render target `resource` whole through view `handle`.
+pub(crate) fn note_clear(resource: This, handle: u64, color: [f32; 4]) {
+    if !bake_replay() {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut clears = CLEARS.lock().unwrap_or_else(|e| e.into_inner());
+    let clears = clears.get_or_insert_with(Default::default);
+    if clears.len() > 4096 {
+        clears.retain(|_, c| c.0 + 120 > frame);
+    }
+    clears.insert(resource as usize, (frame, handle, color));
+}
+
+/// Clears `target` again in `list` as the title cleared it in `frame`, if
+/// it did and the view is still of it.
+fn clear_again(list: &HostList, gpu: &crate::host::Host, target: usize, frame: u64) {
+    let Some((at, handle, color)) =
+        CLEARS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|c| c.get(&target).copied())
+    else {
+        return;
+    };
+    if at != frame {
+        return;
+    }
+    let Some(record) = crate::descriptor::rtv_record(handle) else { return };
+    if record.resource as usize != target {
+        return;
+    }
+    let Some(texture) = crate::resource::host_resource(record.resource) else { return };
+    const RENDER_TARGET: u32 = 0x4;
+    let rtv = gpu.rtv(Some(texture), record.desc().as_ref());
+    crate::list::ensure_state(list, record.resource, RENDER_TARGET);
+    // SAFETY: an open list, a fresh view of a live texture.
+    unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+}
+
+/// The last bake pass ran out of its time with slots still due.
+static BAKE_UNSERVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bake draws kept, drawn again, found stale, not kept for want of room.
+static BAKE_REPLAYS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Frames after which a kept bake draw is drawn again even with slots due.
+const BAKE_REPLAY_LATEST: u64 = 90;
+
+/// Whether bake draws whose pass was not served are drawn again
+/// (`VICTORY_BAKE_REPLAY`, on; =0 not).
+fn bake_replay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_REPLAY").is_none_or(|v| v != "0"))
+}
+
 /// Bake targets' title memory (start, end), the frame, the resource
 /// (`VICTORY_BAKE_TRACE`).
 static BAKE_TARGETS: std::sync::Mutex<Vec<(u64, u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
@@ -2570,6 +2695,148 @@ impl State {
         }
     }
 
+    /// A draw of a decoration bake whose pass before it was not served
+    /// (`BAKE_UNSERVED`: textures it samples may have been stand-ins) is
+    /// kept to be drawn again ([`State::replay_bakes`], `VICTORY_BAKE_REPLAY`).
+    fn note_bake(&self, shot: Shot) {
+        if !bake_replay() || REPLAYING.get() {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        if !self.is_bake_draw(&p) {
+            return;
+        }
+        let frame = crate::frame::current();
+        settle_bakes(frame);
+        let mut current = FRAME_BAKES.lock().unwrap_or_else(|e| e.into_inner());
+        current.1 |= BAKE_UNSERVED.load(Ordering::Relaxed);
+        if current.2.len() >= 256 {
+            BAKE_REPLAYS[3].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        current.2.push(BakeShot {
+            frame,
+            pipeline: self.pipeline,
+            hashes: p.stages.iter().map(|s| s.shader.hash.clone()).collect(),
+            heaps: self.heaps,
+            graphics: self.graphics.clone(),
+            vertex: self.vertex,
+            index: self.index,
+            topology: self.topology,
+            topology_set: self.topology_set,
+            target_handles: self.target_handles.clone(),
+            depth_handle: self.depth_handle,
+            targets_set: self.targets_set,
+            targets: self.targets.iter().map(|&t| (t, crate::resource::texture_kind(t as This))).collect(),
+            viewports: self.viewports.clone(),
+            scissors: self.scissors.clone(),
+            blend: self.blend,
+            stencil: self.stencil,
+            depth_bounds: self.depth_bounds,
+            shot,
+        });
+    }
+
+    /// Bake draws kept by [`State::note_bake`] drawn again, in a list of
+    /// their own sent at once, when the texture passes have caught up (no
+    /// slot due) or [`BAKE_REPLAY_LATEST`] frames after them, once each.
+    /// The draw again runs the bake's synchronous texture pass first, as the
+    /// first did. Not when the pipeline or a target is no longer what it was.
+    fn replay_bakes(frame: u64) {
+        if !bake_replay() {
+            return;
+        }
+        settle_bakes(frame);
+        let due = HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed);
+        let ready: Vec<BakeShot> = {
+            let mut shots = BAKE_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
+            if shots.is_empty() {
+                return;
+            }
+            let (ready, wait): (Vec<BakeShot>, Vec<BakeShot>) = std::mem::take(&mut *shots)
+                .into_iter()
+                .partition(|s| frame >= s.frame + 2 && (due == 0 || frame >= s.frame + BAKE_REPLAY_LATEST));
+            *shots = wait;
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        let Some(gpu) = crate::host::host() else { return };
+        let list = match gpu.new_list() {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "no host list to draw bakes again");
+                return;
+            }
+        };
+        let began = std::time::Instant::now();
+        let (mut drawn, mut stale) = (0u64, 0u64);
+        let mut states = Vec::new();
+        // The targets the title cleared in those frames, cleared again first
+        // (a bake that blends its layers would add them twice).
+        let mut cleared = std::collections::HashSet::new();
+        REPLAYING.set(true);
+        for shot in ready {
+            let same_pipeline = crate::pipeline::host_pipeline(shot.pipeline as This).is_some_and(|p| {
+                p.stages.len() == shot.hashes.len() && p.stages.iter().zip(&shot.hashes).all(|(s, h)| &s.shader.hash == h)
+            });
+            let same_targets = shot.targets.iter().all(|&(t, kind)| crate::resource::texture_kind(t as This) == kind);
+            if !same_pipeline || !same_targets {
+                stale += 1;
+                continue;
+            }
+            let mut state = State::default();
+            state.pipeline = shot.pipeline;
+            state.heaps = shot.heaps;
+            state.graphics = shot.graphics;
+            state.vertex = shot.vertex;
+            state.index = shot.index;
+            state.topology = shot.topology;
+            state.topology_set = shot.topology_set;
+            state.target_handles = shot.target_handles;
+            state.depth_handle = shot.depth_handle;
+            state.targets_set = shot.targets_set;
+            state.viewports = shot.viewports;
+            state.scissors = shot.scissors;
+            state.blend = shot.blend;
+            state.stencil = shot.stencil;
+            state.depth_bounds = shot.depth_bounds;
+            for &(target, _) in &shot.targets {
+                if cleared.insert((shot.frame, target)) {
+                    clear_again(&list, gpu, target, shot.frame);
+                }
+            }
+            state.replay(&list);
+            match shot.shot {
+                Shot::Mesh(x) => state.dispatch_mesh(&list, x),
+                Shot::Draw(v, i, f, fi) => state.draw(&list, v, i, f, fi),
+                Shot::Indexed(n, i, f, b, fi) => state.draw_indexed(&list, n, i, f, b, fi),
+            }
+            drawn += 1;
+            // (Its dynamic slots stay taken until the list has run.)
+            states.push(state);
+        }
+        if list.has_recorded_work() {
+            list.close();
+            gpu.execute_sync_internal(&list);
+        }
+        REPLAYING.set(false);
+        drop(states);
+        BAKE_REPLAYS[1].fetch_add(drawn, Ordering::Relaxed);
+        BAKE_REPLAYS[2].fetch_add(stale, Ordering::Relaxed);
+        tracing::info!(
+            frame,
+            drawn,
+            stale,
+            due,
+            ms = began.elapsed().as_millis() as u64,
+            kept_so_far = BAKE_REPLAYS[0].load(Ordering::Relaxed),
+            drawn_so_far = BAKE_REPLAYS[1].load(Ordering::Relaxed),
+            "bake draws drawn again, their textures caught up (VICTORY_BAKE_REPLAY=0: not)"
+        );
+    }
+
     /// Whether a graphics draw is a one-shot texture compositor / decoration
     /// bake whose bindless texture inputs must be flushed and up to date
     /// before recording the draw. Matches known bake pixel/geometry shaders
@@ -2665,6 +2932,9 @@ impl State {
             BAKED_MS.store(0, Ordering::Relaxed);
             BAKE_OVER_FULL.store(0, Ordering::Relaxed);
         }
+        if first && !is_bake {
+            Self::replay_bakes(frame);
+        }
         if !is_bake && !(first && early_ms > 0) {
             return;
         }
@@ -2733,6 +3003,7 @@ impl State {
                     crate::host::settle_for_fence();
                 }
                 let published = sync.publish.len();
+                BAKE_UNSERVED.store(run_pass && !served, Ordering::Relaxed);
                 for (index, handle, key) in sync.publish {
                     let _ = host.publish_uploaded_slot(index, handle, key);
                 }
@@ -4153,6 +4424,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.note_bake(Shot::Mesh(x));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -4642,6 +4914,9 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            if !rects {
+                self.note_bake(Shot::Draw(vertices, instances, first, first_instance));
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4747,6 +5022,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.note_bake(Shot::Indexed(indices, instances, first, base, first_instance));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
