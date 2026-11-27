@@ -244,13 +244,19 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
     queue: ID3D12CommandQueue,
-    list: ID3D12CommandList,
+    /// The same copy in [`ASIDE_LISTS`] lists: a list is sent again only
+    /// once its last sending ran (one list sent while it ran was refused,
+    /// 752 times in run ow16-check, once the waits were batched).
+    lists: Vec<ID3D12CommandList>,
     fence: ID3D12Fence,
     value: u64,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Aside {}
+
+/// Lists of [`Aside`].
+const ASIDE_LISTS: usize = 64;
 
 /// Whether new memory made inside [`batch_mapped`] is waited for once, at
 /// its end, rather than one by one (`VICTORY_WAIT_RESIDENT_BATCH=0`: one by
@@ -347,19 +353,29 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 ..Default::default()
             })?;
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
-            list.CopyBufferRegion(&to, 0, &from, 0, 16);
-            list.Close()?;
+            let mut lists = Vec::with_capacity(ASIDE_LISTS);
+            for _ in 0..ASIDE_LISTS {
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.CopyBufferRegion(&to, 0, &from, 0, 16);
+                list.Close()?;
+                lists.push(list.cast()?);
+            }
             *aside = Some(Aside {
                 queue,
-                list: list.cast()?,
+                lists,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 value: 0,
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+        // The list's last sending was `ASIDE_LISTS` values ago.
+        let last = (a.value + 1).saturating_sub(ASIDE_LISTS as u64);
+        if last > 0 {
+            wait_fence(&a.fence, last)?;
+        }
+        a.queue.ExecuteCommandLists(&[Some(a.lists[(a.value as usize) % ASIDE_LISTS].clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
         (a.fence.clone(), a.value)
