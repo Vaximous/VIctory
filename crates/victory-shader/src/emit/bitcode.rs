@@ -341,6 +341,32 @@ impl Module {
         }
     }
 
+    /// Takes back `f`, the declaration made last, if nothing calls it or
+    /// names it in metadata: the validator refuses an external function
+    /// nothing uses. Only the last one, so no other function's number (which
+    /// callers may hold) changes.
+    pub fn drop_last_if_unused(&mut self, f: V) {
+        let V::Func(i) = f else {
+            return;
+        };
+        if i as usize + 1 != self.funcs.len() || self.funcs[i as usize].body {
+            return;
+        }
+        // (Instructions in blocks only: one that left its block keeps a
+        // stale function number, `opt::drop_unused_functions`.)
+        let called = self.blocks.iter().any(|blk| {
+            blk.phis
+                .iter()
+                .chain(&blk.body)
+                .any(|&n| matches!(self.insts[n as usize].op, Op::Call(g, _) if g == i))
+        });
+        let named = self.mds.iter().any(|md| matches!(md, MdDef::Value(_, V::Func(g)) if *g == i));
+        if !called && !named {
+            let gone = self.funcs.pop().expect("the last declaration");
+            self.func_ids.remove(&gone.name);
+        }
+    }
+
     /// A function declaration (or `main` with `body`), found by name.
     pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
         if let Some(&i) = self.func_ids.get(name) {

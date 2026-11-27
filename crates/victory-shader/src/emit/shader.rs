@@ -843,6 +843,12 @@ impl Shader {
             if firsts > 0 {
                 self.flags |= flags::WAVE_OPS;
             }
+            // The load declared above, if no guard reads it: a declaration
+            // nothing calls is refused by the validator ("External function
+            // ... is unused"). It was called anyway in most programs, whose
+            // own raw loads keep it; one whose buffer accesses are all typed
+            // (moving halves, `half_views`) has none.
+            self.m.drop_last_if_unused(load);
         }
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views

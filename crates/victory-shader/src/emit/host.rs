@@ -612,6 +612,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -1004,6 +1005,9 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// The same buffer viewed as R16G16B16A16_UINT: what a translated
+    /// program that moves halves is shown ([`super::HostShader::half_views`]).
+    HalfUintUav(u32),
     /// A typed buffer UAV pre-filled with `data` (`format`, bytes per element).
     TypedUav {
         data: &'a [u32],
@@ -1246,12 +1250,18 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
                                 2 * e,
                                 DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
+                            View::HalfUintUav(e) => (
+                                2 * e,
+                                DXGI_FORMAT_R16G16B16A16_UINT,
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),

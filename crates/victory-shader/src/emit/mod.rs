@@ -372,6 +372,26 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table)
+    /// through which the shader moves a buffer's 16-bit channels as they
+    /// are, in order: `buffer_load_format_d16_*` and
+    /// `buffer_store_format_d16_*`, and format loads of whole dwords whose
+    /// every use reads one half of them as a half float (`v_fma_mix*` with
+    /// `op_sel_hi`, `v_cvt_f32_f16`). On the console each channel's 16 bits
+    /// move unchanged through a 16-bit float view and a 16-bit integer one
+    /// alike (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). Read as floats through
+    /// such an integer view, which D3D12 leaves undefined, NVIDIA gave
+    /// zeros (the face network's output). The DXIL moves them as unsigned
+    /// integers instead, which an unsigned 16-bit view carries unchanged,
+    /// and the host shows the shader a 16-bit float or signed buffer view
+    /// at these places as the unsigned format of the same layout
+    /// (fxceless #927; `VICTORY_HALF_VIEWS=0`: none, as before).
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -949,6 +969,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1731,6 +1752,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1743,6 +1765,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2352,6 +2375,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -2488,6 +2512,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let raw_data = super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw };
@@ -2640,6 +2665,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3056,6 +3082,7 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
