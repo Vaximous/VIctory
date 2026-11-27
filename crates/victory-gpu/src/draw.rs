@@ -367,7 +367,7 @@ pub(crate) static PREMADE: AtomicU64 = AtomicU64::new(0);
 /// as one (`VICTORY_PREMAKE`, 32; 0: none).
 fn premake() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PREMAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *N.get_or_init(|| std::env::var("VICTORY_PREMAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32))
 }
 
 /// Whether the due slots shaders read lately are taken first
