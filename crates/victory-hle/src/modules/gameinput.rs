@@ -1241,6 +1241,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            super::route::polled();
             let mut down = scripted();
             if super::route::replaying() {
                 // The route's keys, focus or not; live keys left out.
@@ -1300,7 +1301,12 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// With `VICTORY_KEYS_FROM_WORLD=1` the seconds count from the first
+    /// frame of the world (`victory_gpu::frame::world_began`) instead, and
+    /// nothing is held before it.
     fn scripted() -> Vec<u8> {
+        static FROM_WORLD: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FROM_WORLD").is_some_and(|v| v == "1"));
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
@@ -1329,7 +1335,14 @@ mod host {
             (super::route::zero(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
+        let now = if *FROM_WORLD {
+            match victory_gpu::frame::world_began() {
+                Some(world) => world.elapsed(),
+                None => return Vec::new(),
+            }
+        } else {
+            start.elapsed()
+        };
         keys.iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)

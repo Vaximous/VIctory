@@ -14,9 +14,22 @@
 //! counts moved and the wheel since the poll before, the buttons held and
 //! pressed (the movement goes where the live mouse's goes: a hooked camera
 //! or the stick);
-//! `<us> R` the mouse let go (not captured).
+//! `<us> R` the mouse let go (not captured);
+//! `<us> W` the first frame of the world was shown
+//! (`victory_gpu::frame::world_began`).
+//!
+//! From version 2 on each time is `<us>:<poll>`, with the count of the title's
+//! keyboard polls by then. Played back, the events before the world are given
+//! by that count (a menu takes its key at its own poll, however long the
+//! loading before it took), and those after it by the time since the replay's
+//! own first frame of the world: a load that takes longer here no longer moves
+//! every step of the walk to another place. A file of version 1 with a `W`
+//! line added by hand plays the part before it by time, held short of the
+//! world until the replay's own is shown. How far each phase drifted is said
+//! in the log.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -30,6 +43,27 @@ pub(super) fn zero() -> Instant {
 
 fn now_us() -> u64 {
     zero().elapsed().as_micros() as u64
+}
+
+/// The title's keyboard polls so far.
+static POLLS: AtomicU64 = AtomicU64::new(0);
+
+/// The title polls its keyboard: counted, and when recording, the first
+/// frame of the world is noted once it was shown.
+pub(super) fn polled() {
+    POLLS.fetch_add(1, Ordering::Relaxed);
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if NOTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let (Some(rec), Some(world)) = (recorder(), victory_gpu::frame::world_began()) else { return };
+    if NOTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let us = world.saturating_duration_since(zero()).as_micros() as u64;
+    let mut rec = rec.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = writeln!(rec.out, "{us}:{} W", POLLS.load(Ordering::Relaxed));
+    let _ = rec.out.flush();
 }
 
 /// The mouse at a poll: moved, wheel, held, pressed; or let go.
@@ -49,7 +83,7 @@ struct Recorder {
 
 impl Recorder {
     fn line(&mut self, text: std::fmt::Arguments) {
-        let _ = writeln!(self.out, "{} {text}", now_us());
+        let _ = writeln!(self.out, "{}:{} {text}", now_us(), POLLS.load(Ordering::Relaxed));
         let _ = self.out.flush();
     }
 }
@@ -69,7 +103,7 @@ fn recorder() -> Option<&'static Mutex<Recorder>> {
             Ok(file) => {
                 tracing::info!(path = %std::path::Path::new(&path).display(), "input recorded (VICTORY_INPUT_RECORD)");
                 let mut out = std::io::BufWriter::new(file);
-                let _ = writeln!(out, "# victory input route 1");
+                let _ = writeln!(out, "# victory input route 2");
                 let _ = out.flush();
                 Some(Mutex::new(Recorder { out, keys: None, pads: [None; 8], held: None, released: None }))
             }
@@ -148,15 +182,41 @@ struct Route {
     /// The mouse events given so far.
     mouse_at: Mutex<usize>,
     end: u64,
+    /// When the world's first frame was shown, if the file says.
+    world: Option<u64>,
+    /// Of events before the world that have a poll count: the count and the
+    /// time, in order.
+    polls: Vec<(u64, u64)>,
 }
 
 fn parse(text: &str) -> Route {
-    let mut route = Route { keys: Vec::new(), pads: vec![Vec::new(); 8], mouse: Vec::new(), mouse_at: Mutex::new(0), end: 0 };
+    let mut route = Route {
+        keys: Vec::new(),
+        pads: vec![Vec::new(); 8],
+        mouse: Vec::new(),
+        mouse_at: Mutex::new(0),
+        end: 0,
+        world: None,
+        polls: Vec::new(),
+    };
+    let mut polls = Vec::new();
     for line in text.lines() {
         let mut words = line.split_whitespace();
-        let Some(us) = words.next().and_then(|w| w.parse::<u64>().ok()) else { continue };
+        let Some(at) = words.next() else { continue };
+        let (us, poll) = match at.split_once(':') {
+            Some((us, poll)) => (us.parse::<u64>().ok(), poll.parse::<u64>().ok()),
+            None => (at.parse::<u64>().ok(), None),
+        };
+        let Some(us) = us else { continue };
         route.end = route.end.max(us);
-        match words.next() {
+        let kind = words.next();
+        if let Some(poll) = poll
+            && kind != Some("W")
+        {
+            polls.push((poll, us));
+        }
+        match kind {
+            Some("W") => route.world = route.world.or(Some(us)),
             Some("K") => {
                 let keys = match words.next() {
                     Some("-") | None => Vec::new(),
@@ -193,7 +253,55 @@ fn parse(text: &str) -> Route {
             _ => {}
         }
     }
+    if let Some(world) = route.world {
+        route.polls = polls.into_iter().filter(|&(_, us)| us < world).collect();
+        route.polls.sort_unstable();
+    }
     route
+}
+
+/// Where in the route the replay is now, in the route's microseconds: before
+/// the world by the title's polls (or by time, for a file without them),
+/// held short of the world until the replay's own world is shown; then the
+/// time since that. A file that does not say when its world began is played
+/// by time from the first poll throughout, as before.
+fn clock(route: &Route) -> u64 {
+    let now = now_us();
+    let Some(world) = route.world else { return now };
+    if let Some(began) = victory_gpu::frame::world_began() {
+        let here = began.saturating_duration_since(zero()).as_micros() as u64;
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                route_ms = world / 1000,
+                replay_ms = here / 1000,
+                drift_ms = (here as i64 - world as i64) / 1000,
+                polls = POLLS.load(Ordering::Relaxed),
+                "route: the world's first frame; from here the route plays by the time since it"
+            );
+        });
+        return world + now.saturating_sub(here);
+    }
+    let at = if route.polls.is_empty() {
+        now
+    } else {
+        let polls = POLLS.load(Ordering::Relaxed);
+        let i = route.polls.partition_point(|&(p, _)| p <= polls);
+        let at = i.checked_sub(1).map_or(0, |i| route.polls[i].1);
+        // Each event before the world as it is reached: how far from its time.
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        if LAST.fetch_max(at, Ordering::Relaxed) < at {
+            tracing::info!(
+                route_ms = at / 1000,
+                replay_ms = now / 1000,
+                drift_ms = (now as i64 - at as i64) / 1000,
+                polls,
+                "route: an event before the world, given at its poll"
+            );
+        }
+        at
+    };
+    at.min(world.saturating_sub(1))
 }
 
 fn replay() -> Option<&'static Route> {
@@ -209,6 +317,8 @@ fn replay() -> Option<&'static Route> {
                         keys = route.keys.len(),
                         mouse = route.mouse.len(),
                         seconds = route.end as f64 / 1e6,
+                        world_s = route.world.map(|w| w as f64 / 1e6),
+                        by_polls = route.polls.len(),
                         "a route is played back (VICTORY_INPUT_REPLAY); live input is left out"
                     );
                     Some(route)
@@ -233,21 +343,42 @@ fn latest<T: Clone>(events: &[(u64, T)], now: u64) -> Option<T> {
     i.checked_sub(1).map(|i| events[i].1.clone())
 }
 
+/// Where the route stops being played (`VICTORY_ROUTE_UNTIL_S`, route
+/// seconds): from there on it gives no keys, empty pads and a still mouse,
+/// and the scripted keys (`VICTORY_KEYS`) walk on alone.
+fn until() -> u64 {
+    static UNTIL: OnceLock<u64> = OnceLock::new();
+    *UNTIL.get_or_init(|| {
+        std::env::var("VICTORY_ROUTE_UNTIL_S").ok().and_then(|v| v.trim().parse::<f64>().ok()).map_or(u64::MAX, |s| (s * 1e6) as u64)
+    })
+}
+
+/// The route's clock ([`clock`]), if it is still played.
+fn playing(route: &Route) -> Option<u64> {
+    let at = clock(route);
+    if at < until() {
+        return Some(at);
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(route_s = at as f64 / 1e6, "route: played up to VICTORY_ROUTE_UNTIL_S; the scripted keys go on"));
+    None
+}
+
 /// The keys the route holds now.
 pub(super) fn replay_keys() -> Vec<u8> {
-    replay().and_then(|r| latest(&r.keys, now_us())).unwrap_or_default()
+    replay().and_then(|r| latest(&r.keys, playing(r)?)).unwrap_or_default()
 }
 
 /// Pad slot `slot` as the route has it now (empty before its first word).
 pub(super) fn replay_pad(slot: usize) -> Option<PadState> {
-    replay().and_then(|r| r.pads.get(slot).and_then(|p| latest(p, now_us()))).flatten()
+    replay().and_then(|r| r.pads.get(slot).and_then(|p| latest(p, playing(r)?))).flatten()
 }
 
 /// The mouse at this poll: what was moved and pressed since the poll before,
 /// summed, with the buttons held now; `Released` if the route let it go.
 pub(super) fn replay_mouse() -> MouseAt {
     let Some(route) = replay() else { return MouseAt::Released };
-    let now = now_us();
+    let Some(now) = playing(route) else { return MouseAt::Moved(0, 0, 0, 0, 0) };
     let mut at = route.mouse_at.lock().unwrap_or_else(|e| e.into_inner());
     let (mut dx, mut dy, mut wheel, mut pressed) = (0, 0, 0, 0);
     let mut held = None;
@@ -297,5 +428,14 @@ mod tests {
         assert_eq!(r.mouse, vec![(30, MouseAt::Moved(3, -4, 0, 1, 1)), (40, MouseAt::Released)]);
         assert_eq!(latest(&r.keys, 45), Some(vec![0x0d, 0x57]));
         assert_eq!(latest(&r.keys, 5), None);
+        assert_eq!(r.world, None);
+    }
+
+    #[test]
+    fn version_two_reads_polls_and_the_world() {
+        let r = parse("# x\n10:1 K 0d\n20:5 K -\n500:40 W\n600:48 K 57\n");
+        assert_eq!(r.world, Some(500));
+        assert_eq!(r.polls, vec![(1, 10), (5, 20)]);
+        assert_eq!(r.keys.len(), 3);
     }
 }

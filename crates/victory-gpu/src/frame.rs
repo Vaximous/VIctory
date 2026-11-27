@@ -84,6 +84,32 @@ pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
+/// When the first frame of the world was shown: the first frame with at
+/// least `VICTORY_WORLD_DRAWS` draws (1,000; the title's menus and loading
+/// screens draw some tens, its world thousands). For input routes, whose
+/// events in the world are timed from it.
+pub fn world_began() -> Option<Instant> {
+    WORLD.get().copied()
+}
+
+static WORLD: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// A frame was shown; `drawn` is the count of draws so far.
+pub(crate) fn shown(drawn: u64) {
+    static BEFORE: AtomicU64 = AtomicU64::new(0);
+    static AT_LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let before = BEFORE.swap(drawn, Ordering::Relaxed);
+    if WORLD.get().is_some() {
+        return;
+    }
+    let at_least = *AT_LEAST.get_or_init(|| {
+        std::env::var("VICTORY_WORLD_DRAWS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000)
+    });
+    if drawn.saturating_sub(before) >= at_least && WORLD.set(Instant::now()).is_ok() {
+        tracing::info!(frame = current(), draws = drawn - before, "the first frame of the world was shown");
+    }
+}
+
 /// For tests of what is done once a frame.
 #[cfg(test)]
 pub(crate) fn test_advance() {

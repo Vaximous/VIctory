@@ -10629,6 +10629,7 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        crate::frame::shown(crate::draw::drawn());
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
