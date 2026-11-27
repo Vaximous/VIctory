@@ -91,6 +91,13 @@ pub fn slot_feedback() -> u8 {
     })
 }
 
+/// `VICTORY_SLOT_OWN_WRITES=1`: programs that store to memory of their own note their
+/// slots too (by default they do not).
+fn feedback_own_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SLOT_OWN_WRITES").as_deref().map(str::trim) == Ok("1"))
+}
+
 /// `VICTORY_SLOT_EARLY_DEPTH=1`: a pixel program that notes its slots, with a colour
 /// output and nothing a depth test first would change, is marked `[earlydepthstencil]`.
 /// Off by default: with it the sun's shadows came out black and far too large (fg-move3,
@@ -732,7 +739,14 @@ impl Shader {
         // that (no discard, depth, coverage or stencil output, no store of its own). One
         // that cannot keeps its stores (`VICTORY_SLOT_FEEDBACK=3`: leaves them out).
         // A pixel program without a colour output (a depth or shadow pass) notes nothing.
-        if self.pixel && self.touched_frame.is_some() {
+        // A program that writes memory of its own notes nothing (`VICTORY_SLOT_OWN_WRITES=1`:
+        // it does): with feedback on, surfaces in shadow lost their ambient light (fm10,
+        // fg-move3), and the passes that gather it write their own buffers. Which one
+        // went wrong is not known; translations compared with and without feedback differ
+        // in nothing but the feedback.
+        if self.touched_frame.is_some() && !feedback_own_writes() && self.m.usage().own_writes {
+            self.m.drop_tagged(&[super::bitcode::Tag::Repeat, super::bitcode::Tag::FirstLane]);
+        } else if self.pixel && self.touched_frame.is_some() {
             let colour = self.outputs.iter().any(|o| o.kind == 16);
             let late = self.m.usage().late_effects
                 || self.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20));
