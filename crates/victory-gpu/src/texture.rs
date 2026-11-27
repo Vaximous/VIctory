@@ -728,6 +728,13 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(u128);
 
+impl Digest {
+    /// Its 128 bits.
+    pub(crate) fn value(self) -> u128 {
+        self.0
+    }
+}
+
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
@@ -1613,6 +1620,69 @@ impl Staging {
                 return;
             }
         }
+        if self.on_demand && crate::texstore::on() {
+            self.through_store(held);
+        }
+    }
+
+    /// The texture store (`crate::texstore`), for a texture made level by
+    /// level, just detiled with the levels `held` the title's: all of them
+    /// are stored by its smaller ones; levels missing are filled from the
+    /// store, if it has the texture, and count as held from now on.
+    fn through_store(&self, held: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.footprints.len() != (self.mips - self.first) as usize || self.footprints.is_empty() {
+            return;
+        }
+        let parts: Vec<(u32, usize, usize)> = self
+            .footprints
+            .iter()
+            .zip(&self.rows)
+            .enumerate()
+            .map(|(i, (footprint, &rows))| {
+                let f = footprint.Footprint;
+                let len = (f.RowPitch as usize * rows as usize * f.Depth as usize)
+                    .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+                (self.part(i).0, footprint.Offset as usize, len)
+            })
+            .collect();
+        let sizes: Vec<usize> = parts.iter().map(|p| p.2).collect();
+        let Some(k) = crate::texstore::key_level(&sizes) else {
+            return;
+        };
+        let has = |mip: u32| mip >= 32 || held & (1 << mip) != 0;
+        if !parts[k..].iter().all(|p| has(p.0)) {
+            return;
+        }
+        // SAFETY: parts of the mapped staging buffer, within its bytes.
+        let bytes = |at: usize, len: usize| unsafe { std::slice::from_raw_parts(self.data.add(at), len) };
+        let f0 = self.footprints[0].Footprint;
+        let shape = [f0.Width, f0.Height, f0.Format.0 as u32, self.mips << 8 | self.first];
+        let small: Vec<&[u8]> = parts[k..].iter().map(|&(_, at, len)| bytes(at, len)).collect();
+        let key = crate::texstore::key(shape, &small);
+        if parts[..k].iter().all(|p| has(p.0)) {
+            if !crate::texstore::known(key) {
+                crate::texstore::store(key, parts[..k].iter().map(|&(_, at, len)| bytes(at, len).to_vec()).collect());
+            }
+            return;
+        }
+        let Some(levels) = crate::texstore::find(key) else {
+            return;
+        };
+        if levels.len() != k {
+            return;
+        }
+        let mut now = held;
+        for (j, &(mip, at, len)) in parts[..k].iter().enumerate() {
+            if has(mip) || levels[j].len() != len {
+                continue;
+            }
+            // SAFETY: as above; this part only.
+            unsafe { std::ptr::copy_nonoverlapping(levels[j].as_ptr(), self.data.add(at), len) };
+            now |= 1 << mip;
+            crate::texstore::STATS[4].fetch_add(1, Relaxed);
+        }
+        self.detiled.store(now, Relaxed);
     }
 }
 

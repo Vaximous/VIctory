@@ -9463,6 +9463,9 @@ impl Meter {
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
                 );
                 crate::tiles::status();
+                if let Some(line) = crate::texstore::line() {
+                    tracing::info!("{line}");
+                }
                 {
                     let [queued, due, away, partly, oldest] =
                         [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
