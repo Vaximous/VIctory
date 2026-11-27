@@ -456,15 +456,30 @@ fn copy_in_pieces(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+///
+/// Re-entrant: the buffer is taken out while `f` runs, so a texture refresh
+/// that a thread runs inside `f` (a wide job it takes while it waits for its
+/// pieces) gets one of its own. A buffer bigger than [`READ_KEPT`] is let go
+/// after the read, not kept by every thread that ever read a big texture.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    READ.with(|read| {
-        let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
-        }
-        f(&mut read[..size])
-    })
+    let mut read = READ.with(|read| std::mem::take(&mut *read.borrow_mut()));
+    if read.len() < size {
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    if read.len() <= READ_KEPT {
+        READ.with(|kept| {
+            let mut kept = kept.borrow_mut();
+            if kept.len() < read.len() {
+                *kept = read;
+            }
+        });
+    }
+    out
 }
+
+/// The most a thread's read buffer keeps between reads ([`with_read`]).
+const READ_KEPT: usize = 16 << 20;
 
 /// Whether a texture all of whose memory is mapped is read through the
 /// kernel's copy instead of in place (`VICTORY_TEXTURE_COPY=1`; off by

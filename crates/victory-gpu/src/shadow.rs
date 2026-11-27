@@ -1600,7 +1600,8 @@ fn wide_pieces() -> (usize, usize) {
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    /// The jobs, each with the number of the [`wide`] call that gave it.
+    jobs: Mutex<std::collections::VecDeque<(u64, Job)>>,
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
@@ -1652,7 +1653,7 @@ fn workers() -> &'static Workers {
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if let Some((_, job)) = jobs.pop_front() {
                                 workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
@@ -1692,19 +1693,25 @@ fn wide(jobs: Vec<Job>) {
     // Ported from VIctory-NVIDIA 8c1fa5d57 (GPL-3.0).
     let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    // This call's number: the jobs this thread takes while it waits are its
+    // own only. Taking any (a refresh of another call, run inside one of
+    // this thread's jobs) re-entered what that job held: a texture refresh
+    // inside a texture refresh's read buffer panicked (run ow20-move).
+    static CALLS: AtomicU64 = AtomicU64::new(1);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
+            queue.push_back((call, Box::new(move || {
                 job();
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
                     left.1.notify_all();
                 }
-            }));
+            }) as Job));
         }
     }
     if wake >= wide_threads() || !wake_few() {
@@ -1713,7 +1720,10 @@ fn wide(jobs: Vec<Job>) {
         (0..wake).for_each(|_| workers.more.notify_one());
     }
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let job = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            queue.iter().position(|j| j.0 == call).and_then(|at| queue.remove(at)).map(|j| j.1)
+        };
         match job {
             Some(job) => {
                 workers.there.fetch_sub(1, Ordering::AcqRel);
