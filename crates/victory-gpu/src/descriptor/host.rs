@@ -2423,7 +2423,7 @@ impl HostHeap {
                 kin => (keep_when_full() || crate::resource::room_lately()) && kin.kept(keep_shown()),
             });
             if shown != 0 && !kept && old.as_ref().is_some_and(is_texture_view) {
-                went_grey(index);
+                went_grey(index, 0, old.as_ref().map(|old| kin(old, &view)));
             }
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3643,7 +3643,7 @@ impl HostHeap {
                 && is_texture_view(&view)
                 && view_at(shown as u32, (shown >> 32) as u32).as_ref().is_some_and(is_texture_view)
             {
-                went_grey(index);
+                went_grey(index, 1, None);
             }
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
@@ -3674,7 +3674,7 @@ impl HostHeap {
                         self.unmake_stale(index, stale);
                         return Some(view);
                     }
-                    went_grey(index);
+                    went_grey(index, 2, Some(kin));
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -4992,13 +4992,33 @@ fn keep_when_full() -> bool {
 /// neutral texture) while a new one was made: should stay 0.
 pub(crate) static WENT_GREY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn went_grey(index: u32) {
-    let n = WENT_GREY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+/// [`WENT_GREY`] by where (0: a view left for later, [`Slots::show_later`];
+/// 1: a view that waits, views not kept; 2: one that waits, not kept) and
+/// by the [`Kin`] of the two views (same, moved, sized, other, none, not
+/// known).
+static WENT_GREY_BY: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+
+fn went_grey(index: u32, at: usize, kin: Option<Kin>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let class = match kin {
+        Some(Kin::Same) => 0,
+        Some(Kin::Moved) => 1,
+        Some(Kin::Sized) => 2,
+        Some(Kin::Other) => 3,
+        Some(Kin::None) => 4,
+        None => 5,
+    };
+    WENT_GREY_BY[at * 6 + class].fetch_add(1, Relaxed);
+    let n = WENT_GREY.fetch_add(1, Relaxed) + 1;
     if n.is_power_of_two() {
+        let by: Vec<u64> = WENT_GREY_BY.iter().map(|n| n.load(Relaxed)).collect();
         tracing::info!(
             so_far = n,
             slot = index,
-            "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen)"
+            "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen); by where (left for later, waits, waits not kept) and kin (same, moved, sized, other, none, not known): {:?} {:?} {:?}",
+            &by[0..6],
+            &by[6..12],
+            &by[12..18]
         );
     }
 }

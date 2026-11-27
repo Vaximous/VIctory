@@ -915,7 +915,6 @@ pub(crate) fn take_frame_times() -> String {
     text
 }
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
