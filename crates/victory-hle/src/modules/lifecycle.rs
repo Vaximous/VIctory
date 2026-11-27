@@ -237,7 +237,44 @@ fn hook(hwnd: HWND) {
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        if wm::GetParent(hwnd).is_null() {
+            fullscreen(hwnd);
+        }
     }
+}
+
+/// The title's top-level window made borderless and as big as the screen
+/// (`VICTORY_FULLSCREEN`, on; =0 a window as before;
+/// `VICTORY_FULLSCREEN_RES=WIDTHxHEIGHT` another size). After
+/// trustno1-coder/VIctory-NVIDIA 4a0c8ea37 (GPL-3.0); the mouse there is
+/// left out: ours (`gameinput::mouse`) captures it already.
+fn fullscreen(hwnd: HWND) {
+    if std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "0") {
+        return;
+    }
+    // SAFETY: this thread owns the newly created top-level window.
+    unsafe {
+        let (width, height) = std::env::var("VICTORY_FULLSCREEN_RES")
+            .ok()
+            .as_deref()
+            .and_then(parse_window_limit)
+            .unwrap_or_else(|| (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)));
+        let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE) as u32;
+        let ex = wm::GetWindowLongW(hwnd, wm::GWL_EXSTYLE) as u32;
+        wm::SetWindowLongW(hwnd, wm::GWL_STYLE, ((style & !wm::WS_OVERLAPPEDWINDOW) | wm::WS_POPUP) as i32);
+        let edges = wm::WS_EX_CLIENTEDGE | wm::WS_EX_WINDOWEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE;
+        wm::SetWindowLongW(hwnd, wm::GWL_EXSTYLE, (ex & !edges) as i32);
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            width,
+            height,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+        );
+    }
+    tracing::info!("title window borderless over the screen (VICTORY_FULLSCREEN=0: a window)");
 }
 
 extern "system" fn window_proc(
