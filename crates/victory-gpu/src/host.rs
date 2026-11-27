@@ -2679,7 +2679,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 }
 
 /// Of the `n` landable things at the front of the line ([`landable`]), how
-/// many to land now with `VICTORY_LAND_TELL_FIRST=1`: up to the end of the
+/// many to land now with `VICTORY_LAND_TELL_FIRST` (on unless `=0`): up to the end of the
 /// first writes and signals with a flight behind them, so what tells the
 /// title its work is done does not wait for the landing of later flights the
 /// card ran meanwhile (they land next, at once).
@@ -2693,7 +2693,11 @@ fn told_first(line: &[Option<u64>], n: usize) -> usize {
 
 fn tell_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TELL_FIRST").is_some_and(|v| v == "1"))
+    // On: run ow13 had each of the title's fences wait for the landing of
+    // 1.3-2.7 more flights of the same landing (4-8 ms after it began on
+    // average, the longest 40-65 ms), while the card mostly stood idle
+    // until the title submitted again.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TELL_FIRST").is_none_or(|v| v != "0"))
 }
 
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
@@ -3854,6 +3858,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::fence::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
