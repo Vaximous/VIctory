@@ -43,12 +43,30 @@ route in every run (about 5,000-6,500 draws a frame).
 | bench17 | ~44 | ~22.7 | | changed-part compare done in place (AVX2), alignment-correct |
 | bench18 | 42.5 | 23.5 | 66 ms | scalar buffer loads read four dwords a call, fitted to the view's end |
 | bench19 | 41.4 | 24.1 | 70 ms | the graphics heap is write-watched by the kernel instead of guarded; landing merge fixed |
-| **bench20** | **42.3** | **23.6** | **74 ms** | kernel writes into title memory noted (banding fixed); decal bake asynchronous; small copies cut from shared buffers |
+| bench20 | 42.3 | 23.6 | 74 ms | kernel writes into title memory noted (banding fixed); decal bake asynchronous; small copies cut from shared buffers |
 
 bench20 drew about 6,900 draws a frame on the route against bench19's 6,000, so
 its raw time is slightly higher; per 1000 draws both cost 7.27 ms a frame, with
 bench20's preparing 0.4 ms lower (6.11 against 6.53) and its worst frame 113 ms
 (bench19: 124 ms). It is the base because it fixes the last cause of banding.
+
+### Outdoor benchmark (from bench21)
+
+The walk above started in a bedroom, and whether the measured stretch ended up
+indoors or on the street depended on timing, so runs were often not comparable.
+From bench21 the benchmark replays a recorded human route instead
+(`VICTORY_INPUT_RECORD` / `VICTORY_INPUT_REPLAY`): menu input is replayed by input
+poll, and input in the world is timed from the moment frame times settle, so a
+build that loads slower still walks the same way. The character leaves the house
+and sits in a pickup on the street; the window is 60-105 s after the world
+appears, at about 9,400-9,700 draws a frame.
+
+| Build | ms / frame | fps | p99 | worst | per 1000 draws (frame / prep / GPU) | Notes |
+|---|---|---|---|---|---|---|
+| bench20 | 47.7 | 21.0 | 120 ms | 654 ms | 4.99 / 4.07 / 4.35 | outdoor baseline |
+| **bench21** | **45.7** | **21.9** | **75 ms** | **216 ms** | **4.71 / 3.77 / 4.40** | front spans of a copy joined; sends streamed into upload memory |
+
+(ms, fps, p99 and worst over world frames 1000-3000; per-draw figures over the window.)
 
 ### Where a frame goes (bench19, moving)
 
@@ -99,6 +117,17 @@ What was learned along the way:
   trace, so our copies of them stayed stale and the picture banded now and then.
   Noting those ranges ourselves when each read completes cleared it: a sampled
   check of 17,000 copies found none changed without a write being noted.
+- **Benchmarks need a fixed scene.** A scripted key walk from a save drifted with
+  load time and frame rate; the same keys left the house in one run and stayed in
+  the bedroom in the next. Replaying recorded input from the moment the world
+  settles made runs land in the same scene.
+- **More threads on the texture pass broke textures.** Splitting texture refreshes
+  finer, or running the view pass on 8 threads, gave blotchy skin and blocky sky;
+  4 threads and whole-texture items stay clean. A race in concurrent texture work
+  is suspected.
+- **Making memory resident one object at a time blocks.** Thousands of blocking
+  residency calls at world entry cost over 2 s; creating memory resident lets the
+  system page it in without holding the thread (in testing).
 - **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
   between the title's first list call and its first submission are not waits on
   us: its submitting thread waits on no fence, event or label at all.
@@ -166,6 +195,8 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_COPY_CHECK` | One refresh in 16 checks a copied part against title memory later and logs any change no write explains. |
 | `VICTORY_SUBALLOC_COPIES` | CPU sides of small title-buffer copies are cut from shared buffers instead of made one by one. |
 | `VICTORY_BAKE_SLICE_MS` | The decal bake's texture pass runs in time slices with a catch-up of the slots written lately. |
+| `VICTORY_JOIN_SPANS` | Front spans of one copy that touch or overlap are joined before they are looked at, so fewer looks and refresh items. |
+| `VICTORY_STREAM_SENDS` | Bytes sent up at a submission are written into upload memory with streaming stores. |
 
 The grey placeholder is kept on purpose: it shows what hasn't streamed in yet.
 
