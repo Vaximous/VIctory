@@ -307,6 +307,195 @@ impl Player {
         after
     }
 
+    /// What each of `candidates` (as `--skip-shader` takes them) changes: the
+    /// frame is run unchanged `runs` times, and once with what runs each
+    /// candidate's pipelines left out, and the contents of everything the
+    /// frame writes are compared at its end. Parts that differ between the
+    /// unchanged runs are noise (places given out by atomics); a candidate
+    /// that changes any other part, or the picture, has an effect. One that
+    /// changes nothing beyond the noise leaves no trace the next frame or the
+    /// title could read either: what it wrote was written over, or never read.
+    pub fn effects(&mut self, o: &Options, candidates: &[String], runs: u32, say: &mut dyn FnMut(String)) -> Result<()> {
+        let ids: Vec<u32> = self.masters.iter().map(|m| m.0).collect();
+        let reader = self.reader(&ids)?;
+        let start = self.start_states();
+        let base = Options { loops: 1, compare: false, ..o.clone() };
+        // Each candidate is judged twice: from the recorded memory, and from
+        // memory where all the frame writes is zeros. In a still scene a pass
+        // may write what is already there (its last frame's work), and so look
+        // dead from the recorded memory alone; from zeros it does not.
+        // Per memory, per candidate: whether something was left out, the picture
+        // was kept, and the parts it changed beyond the noise.
+        let mut found: Vec<Vec<(bool, Vec<usize>)>> = Vec::new();
+        for zeroed in [false, true] {
+            let end = |this: &mut Self, o: &Options| -> Result<(Vec<Vec<u64>>, Option<String>, Report)> {
+                this.restore(true)?;
+                if zeroed {
+                    this.zero_written(&ids)?;
+                }
+                let report = this.run(o)?;
+                let states = {
+                    let end: Vec<(u32, Vec<u32>)> = this.end.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    let mut s = start.clone();
+                    for (id, v) in end {
+                        for (sub, st) in v.iter().enumerate() {
+                            let sub = if v.len() == 1 { ALL } else { sub as u32 };
+                            s.change(&states::Change { res: id, sub, after: *st, promoted: false, alias: false });
+                        }
+                    }
+                    s
+                };
+                let hashes = this.hashes_now(&reader, &states)?;
+                let picture = this.picture_now()?.map(|p| p.2);
+                this.restore(true)?;
+                Ok((hashes, picture, report))
+            };
+            let from = if zeroed { "from zeros" } else { "from the recorded memory" };
+            let mut here = Vec::new();
+            let (first, first_picture, base_report) = end(self, &base)?;
+            let base_left = base_report.notes.iter().find(|n| n.contains("--skip-shader left out")).cloned();
+            let mut noise: HashSet<usize> = HashSet::new();
+            let mut pictures: HashSet<Option<String>> = HashSet::from([first_picture]);
+            for _ in 1..runs.max(2) {
+                let (again, picture, _) = end(self, &base)?;
+                noise.extend((0..first.len()).filter(|&i| first[i] != again[i]));
+                pictures.insert(picture);
+            }
+            say(format!(
+                "{from}: {} parts of {} resources the frame writes; {} differ between unchanged runs (noise); {} pictures among them",
+                reader.parts.len(),
+                ids.len(),
+                noise.len(),
+                pictures.len()
+            ));
+            for candidate in candidates {
+                let mut skip = base.skip_shaders.clone();
+                skip.push(candidate.clone());
+                let o = Options { skip_shaders: skip, ..base.clone() };
+                let (hashes, picture, report) = end(self, &o)?;
+                let skipped = report.notes.iter().find(|n| n.contains("--skip-shader left out")).cloned();
+                let left_out = skipped.is_some() && skipped != base_left;
+                let changed: Vec<usize> = (0..first.len()).filter(|&i| first[i] != hashes[i] && !noise.contains(&i)).collect();
+                let same_picture = pictures.contains(&picture);
+                let dead = changed.is_empty() && same_picture && left_out;
+                here.push((same_picture && left_out, changed.clone()));
+                say(format!(
+                    "{from}: {candidate}: {}: {}; {} parts changed beyond the noise; picture {}",
+                    if dead { "NO EFFECT" } else { "effect" },
+                    skipped.unwrap_or_else(|| "nothing left out".into()),
+                    changed.len(),
+                    if same_picture { "as unchanged" } else { "changed" }
+                ));
+                for &i in changed.iter().take(8) {
+                    let p = &reader.parts[i];
+                    say(format!("    {} {:?}", self.called(p.id), p.sub.map(|s| s.0)));
+                }
+            }
+            found.push(here);
+        }
+        // A part that many candidates change (a quarter, and three at least),
+        // unrelated as they are, varies between runs more rarely than the
+        // unchanged runs showed: noise too.
+        let mut dead_in_both = vec![true; candidates.len()];
+        for here in &found {
+            let mut times: HashMap<usize, usize> = HashMap::new();
+            for (_, changed) in here {
+                for &i in changed {
+                    *times.entry(i).or_default() += 1;
+                }
+            }
+            let rare: HashSet<usize> = times.into_iter().filter(|&(_, n)| n >= 3 && 4 * n >= here.len()).map(|(i, _)| i).collect();
+            if !rare.is_empty() {
+                say(format!("{} parts changed by many candidates: counted as noise", rare.len()));
+            }
+            for (c, (kept, changed)) in here.iter().enumerate() {
+                if !(*kept && changed.iter().all(|i| rare.contains(i))) {
+                    dead_in_both[c] = false;
+                }
+            }
+        }
+        let dead: Vec<&str> = candidates.iter().zip(&dead_in_both).filter(|(_, d)| **d).map(|(c, _)| c.as_str()).collect();
+        say(format!("no effect from either memory: {}", if dead.is_empty() { "none".to_owned() } else { dead.join(" ") }));
+        Ok(())
+    }
+
+    /// For [`Self::effects`]: every resource of `ids` the card alone holds
+    /// is set to zeros, as memory no pass wrote yet; their states are kept.
+    fn zero_written(&mut self, ids: &[u32]) -> Result<()> {
+        let mut most = 0u64;
+        let mut jobs: Vec<(u32, Option<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, u32)> = Vec::new();
+        for id in ids {
+            let Some(o) = self.objects.get(id) else { continue };
+            let r = &self.frame.resources[o.index];
+            let own = match &r.place {
+                Place::Committed { props, .. } => gpu::seen(props) == Seen::No,
+                _ => true,
+            };
+            if !own || r.desc.samples[0] > 1 || !self.start.contains_key(id) {
+                continue;
+            }
+            if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                most = most.max(r.desc.width);
+                jobs.push((*id, None, 0));
+            } else {
+                let desc = gpu::to_desc(&r.desc);
+                for sub in 0..o.subs {
+                    let (f, total) = gpu::footprints(&self.device, &desc, sub, 1);
+                    most = most.max(total);
+                    jobs.push((*id, Some(f[0]), sub));
+                }
+            }
+        }
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // A buffer of the card's, which starts as zeros.
+        let (zeros, _) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_DEFAULT, most.next_multiple_of(512), D3D12_RESOURCE_FLAG_NONE)?;
+        let (mut into, mut back) = (Vec::new(), Vec::new());
+        let mut seen = HashSet::new();
+        for (id, _, _) in &jobs {
+            if seen.insert(*id) {
+                let start = &self.start[id];
+                gpu::moves(&self.objects[id].res, start, &[COPY_DEST], &mut into);
+                gpu::moves(&self.objects[id].res, &[COPY_DEST], start, &mut back);
+            }
+        }
+        let objects = &self.objects;
+        self.worker.run(|list| {
+            // SAFETY: an open list; live resources; each copy within the
+            // zero buffer and its destination's own layout.
+            unsafe {
+                barriers(list, &[alias()]);
+                barriers(list, &into);
+                for (id, foot, sub) in &jobs {
+                    let res = &objects[id].res;
+                    match foot {
+                        None => list.CopyBufferRegion(res, 0, &zeros, 0, res.GetDesc().Width),
+                        Some(f) => {
+                            let mut f = *f;
+                            f.Offset = 0;
+                            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::ManuallyDrop::new(Some(res.clone())),
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: *sub },
+                            };
+                            let src = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::ManuallyDrop::new(Some(zeros.clone())),
+                                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                            };
+                            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                            drop(std::mem::ManuallyDrop::into_inner(dst.pResource));
+                            drop(std::mem::ManuallyDrop::into_inner(src.pResource));
+                        }
+                    }
+                }
+                barriers(list, &back);
+            }
+        })?;
+        Ok(())
+    }
+
     /// Says which resources that are not put back before a run are changed
     /// by one all the same.
     pub fn check_written(&mut self, say: &mut dyn FnMut(String)) -> Result<()> {
