@@ -3696,6 +3696,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
+    crate::readprobe::freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {

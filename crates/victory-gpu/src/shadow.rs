@@ -97,6 +97,9 @@ pub(crate) struct Shadow {
     /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
     /// 0 not known yet, 1 no, 2 yes.
     wc: AtomicU8,
+    /// What the title's CPU reads of it, and whether its shader writes stay
+    /// on the card (`crate::readprobe`); made when first asked.
+    pub(crate) probe: std::sync::OnceLock<Arc<crate::readprobe::Probed>>,
     /// The frame (+1) whose writes left on the card were counted for this
     /// copy ([`WC_LEFT`]).
     wc_frame: AtomicU64,
@@ -3662,6 +3665,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             wc: AtomicU8::new(0),
+            probe: std::sync::OnceLock::new(),
             wc_frame: AtomicU64::new(0),
             mapped: false,
             place: None,
@@ -4442,6 +4446,12 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        // Left on the card (`crate::readprobe`): the title wrote nothing of
+        // it (a write would have it fetched first), and title memory has not
+        // what shaders wrote.
+        if crate::readprobe::left_now(self) {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -5086,9 +5096,14 @@ impl Shadow {
         card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
     }
 
-    /// `[from, to)` (offsets in the copy) widened to the edges of the hashed
-    /// pieces it touches, within the copy.
-    pub(crate) fn card_pieces_around(&self, from: usize, to: usize) -> (usize, usize) {
+    /// The declared range `[address, end)` (title addresses), as offsets in
+    /// the copy widened to the edges of the hashed pieces it touches, within
+    /// the copy (empty if none of it lies in the copy).
+    pub(crate) fn card_pieces_around(&self, address: usize, end: usize) -> (usize, usize) {
+        let (from, to) = self.inside(address, end.saturating_sub(address));
+        if from >= to {
+            return (0, 0);
+        }
         let start = self.start as usize;
         let lo = ((start + from) & !(PIECE - 1)).saturating_sub(start);
         let hi = ((start + to).next_multiple_of(PIECE) - start).min(self.len as usize);
