@@ -1586,8 +1586,7 @@ fn port6_count(what: usize, n: u64) {
 }
 
 /// Whether a block the title writes at every asking is left unguarded and
-/// compared in place instead (`VICTORY_HOT_UNGUARDED`, on unless `=0`;
-/// renderer port #6).
+/// compared in place instead (`VICTORY_HOT_UNGUARDED=1`; renderer port #6).
 ///
 /// Some 700-850 write faults a frame, 13-15 us of the guards' lock each and
 /// more of the title's thread, fell on blocks the title writes every frame,
@@ -1598,8 +1597,14 @@ fn port6_count(what: usize, n: u64) {
 /// only what changed. Once their compares found it the same [`HOT_SAME`]
 /// times running and for at least [`HOT_TICK`], or none looked at it for
 /// [`HOT_UNSEEN`], it is guarded again. At most [`HOT_MOST`] blocks.
+///
+/// Off unless `=1`: in run ow51-move the set held 10-45 blocks at a time,
+/// some 4 made hot and as many guarded again a frame; their compares found
+/// next to nothing changed, and faults fell by a tenth (687 a frame against
+/// 756) while frames per draw were no shorter.
 fn hot_unguarded() -> bool {
-    crate::toggled!("VICTORY_HOT_UNGUARDED") && port_guard()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOT_UNGUARDED").is_some_and(|v| v == "1")) && port_guard()
 }
 
 const HOT_STREAK: u8 = 3;
