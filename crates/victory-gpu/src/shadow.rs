@@ -2134,7 +2134,9 @@ fn land_echo() -> bool {
 /// Whether a refresh of a copy in the card's memory whose title memory is
 /// not watched (neither the write watch nor the guards see it: every
 /// refresh takes it whole) sends up only the 4 KiB parts that differ from
-/// its CPU side (`VICTORY_WHOLE_CHANGED=1`; off: all of it, as before).
+/// its CPU side (`VICTORY_WHOLE_CHANGED`, on unless `=0`: all of it, as
+/// before; on by default since run ow19-move: 21 MB a frame of the same
+/// bytes went up for the upscaler's buffer alone, of 98 MB up in all).
 /// FSR4's 20 MB buffer is such a copy: shaders write all of it, it is
 /// fetched and landed, then every refresh took it whole and sent the same
 /// bytes back up, 21 MB a frame. It rests on what every send up rests on:
@@ -2142,7 +2144,7 @@ fn land_echo() -> bool {
 /// card side holds (`VICTORY_UPCOPY_CHECK=1` looks at that at rest).
 fn whole_changed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_CHANGED").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_CHANGED").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of [`whole_changed`] refreshes: bytes

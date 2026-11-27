@@ -53,7 +53,7 @@ pub(super) fn line(frames: f64) {
     );
     tracing::info!(
         "refreshes of copies in the card's memory whose title memory is not watched, per frame \
-         (VICTORY_WHOLE_CHANGED=1; else sent up whole): {:.1} MB as the CPU's side held it, {:.1} MB taken and sent up",
+         (VICTORY_WHOLE_CHANGED=0: sent up whole): {:.1} MB as the CPU's side held it, {:.1} MB taken and sent up",
         mb(crate::shadow::WHOLE_CHANGED[0].swap(0, std::sync::atomic::Ordering::Relaxed)),
         mb(crate::shadow::WHOLE_CHANGED[1].swap(0, std::sync::atomic::Ordering::Relaxed)),
     );
