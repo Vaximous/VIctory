@@ -17,7 +17,8 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY, M128A,
+    RtlLookupFunctionEntry,
     RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -678,6 +679,14 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // A function that keeps a frame register (`rbp` mostly) is
+            // unwound from that register's value: one that is not in the
+            // stack (a sampled thread stopped in code that uses `rbp` as an
+            // ordinary register, or before its prologue set it) faulted
+            // inside `RtlVirtualUnwind` (a profile run). Stop there.
+            if !frame_in_stack(context, image, entry, low, high) {
+                break;
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
@@ -698,6 +707,32 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         }
         frames.push(context.Rip);
     }
+}
+
+/// Whether the frame register of the function of `entry` (in `image`), if
+/// it keeps one, holds an address in the stack `low..high`.
+fn frame_in_stack(context: &CONTEXT, image: u64, entry: *const IMAGE_RUNTIME_FUNCTION_ENTRY, low: usize, high: usize) -> bool {
+    // SAFETY: a function table entry of a loaded image; its unwind data (an
+    // UNWIND_INFO: version and flags, prologue size, code count, frame
+    // register and offset) lies in that image.
+    let register = unsafe {
+        let info = image + u64::from((*entry).Anonymous.UnwindInfoAddress);
+        ((info + 3) as *const u8).read() & 0x0F
+    };
+    let value = match register {
+        0 => return true,
+        3 => context.Rbx,
+        5 => context.Rbp,
+        6 => context.Rsi,
+        7 => context.Rdi,
+        12 => context.R12,
+        13 => context.R13,
+        14 => context.R14,
+        15 => context.R15,
+        _ => return false,
+    } as usize;
+    // The frame register is the frame's base less up to 240 bytes.
+    value >= low && value < high
 }
 
 /// `module+rva`, or the bare address.
