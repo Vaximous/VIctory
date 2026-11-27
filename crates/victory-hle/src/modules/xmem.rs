@@ -399,9 +399,64 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Runs of its pages whose bytes live in write-watched private memory at
+    /// the one address the title shows them, not in the section
+    /// ([`own_pages`]): first page, pages, address.
+    private: RwLock<Vec<(usize, usize, usize)>>,
+    /// Whether `private` holds anything (a look without its lock).
+    any_private: std::sync::atomic::AtomicBool,
 }
 
 impl Section {
+    fn new(handle: HANDLE, pages: usize, whole: bool) -> Section {
+        Section {
+            handle,
+            pages,
+            whole,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            private: RwLock::new(Vec::new()),
+            any_private: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Where pages `[index, index + n)` live in private memory, if one run
+    /// of [`Section::private`] holds them all; `Err` if some of them do and
+    /// some not.
+    fn private_at(&self, index: usize, n: usize) -> Result<Option<usize>, ()> {
+        if !self.any_private.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let runs = self.private.read().unwrap_or_else(|e| e.into_inner());
+        for &(first, pages, at) in runs.iter() {
+            if first <= index && index + n <= first + pages {
+                return Ok(Some(at + (index - first) * PAGE));
+            }
+            if first < index + n && index < first + pages {
+                return Err(());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether none of pages `[index, index + n)` was ever committed (never
+    /// shown, never written through a view of ours) nor is private memory
+    /// (whose bytes are not the section's until given back, which commits
+    /// them).
+    fn fresh(&self, index: usize, n: usize) -> bool {
+        !self.whole
+            && index + n <= self.pages
+            && (index..index + n).all(|p| self.committed[p / 64].load(Ordering::Acquire) >> (p % 64) & 1 == 0)
+            && self.private_at(index, n) == Ok(None)
+    }
+
+    /// Notes pages `[index, index + n)` committed.
+    fn note_committed(&self, index: usize, n: usize) {
+        for p in index..(index + n).min(self.pages) {
+            self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+        }
+    }
+
     /// Where bytes of `n` pages from page `index` on can be written,
     /// whether or not the pages are mapped anywhere, committed.
     ///
@@ -417,6 +472,14 @@ impl Section {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
+        // Pages in private memory: there, wherever the title shows them.
+        match self.private_at(index, n) {
+            Ok(Some(at)) => return Some(at),
+            Ok(None) => {}
+            Err(()) => {
+                tracing::warn!(index, n, "physical pages partly in private memory written through the section: the private part misses it");
+            }
+        }
         if !*ON || index + n > self.pages {
             return None;
         }
@@ -522,19 +585,21 @@ struct Physical {
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
     holes: HashMap<usize, usize>,
+    /// Pages shown in write-watched private memory instead of a view
+    /// ([`own_pages`]), by address: their length and the first page.
+    private: BTreeMap<usize, (usize, Slice)>,
 }
 
 impl Physical {
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
-        self.views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
+        let found = |map: &BTreeMap<usize, (usize, Slice)>| {
+            map.range(..=at).next_back().filter(|(base, (size, _))| at < *base + size).map(|(base, (_, s))| Slice {
                 index: s.index + (at - base) / PAGE,
                 section: s.section.clone(),
             })
+        };
+        found(&self.views).or_else(|| found(&self.private))
     }
 }
 
@@ -683,13 +748,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         // For the GPU side's in-place census: only a committed section can
         // be opened as a host heap.
         victory_gpu::title_memory_section(handle as usize, size as u64, whole);
-        sections.push(Arc::new(Section {
-            handle,
-            pages: pages_here,
-            whole,
-            window: std::sync::OnceLock::new(),
-            committed: (0..pages_here.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-        }));
+        sections.push(Arc::new(Section::new(handle, pages_here, whole)));
         from += pages_here;
     }
     if committed_pool {
@@ -845,6 +904,8 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
+        // Written through us: no longer fresh ([`own_pages`]).
+        slice.section.note_committed(slice.index, n);
         Some(view)
     }
 
@@ -1214,7 +1275,12 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        // Pages private elsewhere go back to their section first: one page
+        // shown at two addresses must be one page.
+        unown_pages(&mut physical, &first, run);
+        let (at, len) = (base + i * PAGE, run * PAGE);
+        let owned = own_pages(at, len, &first) && map_own(&mut physical, at, len, first.clone());
+        if !owned && !map(&mut physical, at, len, first) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -1278,6 +1344,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     if from == 0 {
         return true;
     }
+    // A source in private memory goes back to a view, to be shown twice.
+    unown_in(&mut physical, from, len);
     let mut k = 0;
     while k < len {
         let Some(slice) = physical.slice_at(from + k) else {
@@ -1486,6 +1554,9 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
                 break;
             }
+            if let Some(from) = from {
+                unown_in(&mut physical, from, PAGE);
+            }
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
             touched.insert(to);
@@ -1679,6 +1750,11 @@ impl Op {
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     for op in &mut ops {
+        // Private runs, here or of the page to be shown, become views first.
+        unown_in(physical, op.at, PAGE);
+        if let Some(slice) = &op.slice {
+            unown_pages(physical, slice, 1);
+        }
         let there = physical
             .views
             .range(..=op.at)
@@ -1871,6 +1947,173 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
+// Pages the kernel watches. A view of a section cannot be write-watched, so
+// the GPU side learns the title's writes to physical pages by guards: each
+// first write to a guarded 64 KiB block faults into our handler (about 15
+// microseconds, with its locks). The title's 32-bit graphics heap (185 MB,
+// mapped once, in order, from one allocation of fresh pages, never shown
+// anywhere else) takes most of those faults: its ring of constants is
+// rewritten every frame. Its pages are given private memory at the title's
+// address instead, made with `MEM_WRITE_WATCH`: the kernel notes the
+// writes and the GPU side asks it, as for the title's other graphics
+// memory. The section's pages stay the pages' own: a page that is later
+// shown anywhere else, or unmapped, has its run's bytes copied back into
+// the section and a view mapped there again first ([`unown`]).
+
+/// `VICTORY_WATCHED_PAGES`: 1 (default) runs of fresh physical pages the
+/// title maps below 4 GiB are write-watched private memory ([`own_pages`]);
+/// 2 runs anywhere; 0 every mapping a view, as before.
+fn watched_pages() -> u8 {
+    static MODE: LazyLock<u8> =
+        LazyLock::new(|| std::env::var("VICTORY_WATCHED_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1));
+    *MODE
+}
+
+/// The fewest pages of a run made private: the heap is mapped in a few long
+/// runs; single pages come and go.
+const OWN_FEWEST: usize = 16;
+
+/// Since the start: runs made private and their bytes; runs given back to
+/// views and their bytes; runs the host refused.
+static OWNED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether `len` bytes of `slice` on, to be shown at `base`, go in private
+/// memory: the switch, the address, a run long enough, and pages never
+/// committed (nothing in the section to keep).
+fn own_pages(base: usize, len: usize, slice: &Slice) -> bool {
+    let mode = watched_pages();
+    mode != 0
+        && !on_wine()
+        && len >= OWN_FEWEST * PAGE
+        && (mode >= 2 || base.saturating_add(len) <= 1 << 32)
+        && slice.section.fresh(slice.index, len / PAGE)
+}
+
+/// Shows `len` bytes of physical pages from `slice` on at `base` as
+/// write-watched private memory; false (nothing changed) if the host
+/// refuses, and the caller maps a view.
+fn map_own(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    let n = len / PAGE;
+    if physical.holes.get(&base) != Some(&len) {
+        split(base, len);
+    }
+    // SAFETY: replaces the placeholder `[base, base + len)` of the title's
+    // reservation.
+    let at = counted(Call::Map, || unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            base as *const c_void,
+            len,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    });
+    if at as usize != base {
+        let k = OWNED[4].fetch_add(1, Ordering::Relaxed) + 1;
+        if k <= 4 || k.is_power_of_two() {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                error = %std::io::Error::last_os_error(),
+                "physical pages not given write-watched private memory: a view as before"
+            );
+        }
+        return false;
+    }
+    physical.holes.remove(&base);
+    {
+        let mut runs = slice.section.private.write().unwrap_or_else(|e| e.into_inner());
+        runs.push((slice.index, n, base));
+        slice.section.any_private.store(true, Ordering::Release);
+    }
+    shown_mut().note(base, len, &slice);
+    // New contents, read-write, private: the GPU side asks the kernel.
+    victory_gpu::title_memory_remapped(base, len);
+    physical.private.insert(base, (len, slice));
+    let runs = OWNED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    OWNED[1].fetch_add(len as u64, Ordering::Relaxed);
+    tracing::info!(
+        address = format_args!("{base:#x}"),
+        len,
+        runs,
+        "physical pages shown as write-watched private memory: the kernel notes the title's writes, no guard faults (VICTORY_WATCHED_PAGES=0: a view)"
+    );
+    true
+}
+
+/// Gives the private run at `base` back to its section: its bytes copied
+/// into the section's pages and a view of them mapped at `base`.
+///
+/// shortcut: a title thread writing the run while this runs loses its write
+/// or faults; the heap is never remapped in the title's runs, and the log
+/// says so if it is.
+fn unown(physical: &mut Physical, base: usize) {
+    let Some((len, slice)) = physical.private.remove(&base) else {
+        return;
+    };
+    let n = len / PAGE;
+    {
+        let mut runs = slice.section.private.write().unwrap_or_else(|e| e.into_inner());
+        runs.retain(|r| r.2 != base);
+        slice.section.any_private.store(!runs.is_empty(), Ordering::Release);
+    }
+    shown_mut().forget(base, len, &slice);
+    victory_gpu::title_memory_unmapping(base, len);
+    // SAFETY: the run's committed private bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
+    let copied = match slice.section.window(slice.index, n) {
+        Some(to) => {
+            // SAFETY: committed bytes of the section's view, `len` of them.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, len) };
+            true
+        }
+        None => View::map(&slice, n).map(|mut view| view.bytes().copy_from_slice(bytes)).is_some(),
+    };
+    // SAFETY: our private allocation over the title's placeholder, back to one.
+    let freed = unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } != 0;
+    let mapped = freed && map(physical, base, len, slice);
+    OWNED[2].fetch_add(1, Ordering::Relaxed);
+    OWNED[3].fetch_add(len as u64, Ordering::Relaxed);
+    tracing::warn!(
+        address = format_args!("{base:#x}"),
+        len,
+        copied,
+        freed,
+        mapped,
+        "write-watched physical pages given back to a view (the title shows or unmaps them elsewhere)"
+    );
+}
+
+/// Gives back every private run that `[base, base + len)` touches.
+fn unown_in(physical: &mut Physical, base: usize, len: usize) {
+    if physical.private.is_empty() || len == 0 {
+        return;
+    }
+    let end = base.saturating_add(len);
+    let hit: Vec<usize> =
+        physical.private.range(..end).filter(|(at, (size, _))| **at + *size > base).map(|(at, _)| *at).collect();
+    for at in hit {
+        unown(physical, at);
+    }
+}
+
+/// Gives back the private runs that hold any of pages `[slice.index,
+/// slice.index + n)`: they are to be shown elsewhere.
+fn unown_pages(physical: &mut Physical, slice: &Slice, n: usize) {
+    if !slice.section.any_private.load(Ordering::Acquire) {
+        return;
+    }
+    let hit: Vec<usize> = {
+        let runs = slice.section.private.read().unwrap_or_else(|e| e.into_inner());
+        runs.iter().filter(|r| r.0 < slice.index + n && slice.index < r.0 + r.1).map(|r| r.2).collect()
+    };
+    for at in hit {
+        unown(physical, at);
+    }
+}
+
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
 /// harmlessly when the range is the whole placeholder).
 fn split(base: usize, len: usize) {
@@ -2013,6 +2256,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
+    // Private runs there become views first, and go with the views.
+    unown_in(physical, base, len);
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
@@ -2780,6 +3025,83 @@ mod tests {
         );
         assert_eq!(given, n);
         pages
+    }
+
+    /// A long run of fresh pages mapped below 4 GiB is write-watched private
+    /// memory: the kernel names the pages written. Shown at a second address
+    /// it goes back to a view of its section first, bytes kept, and both
+    /// addresses show one page; unmapped, it is a placeholder again.
+    #[test]
+    fn fresh_pages_below_4_gib_are_watched_by_the_kernel() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_MAPPED, MEM_PRIVATE};
+        if watched_pages() == 0 || on_wine() {
+            return;
+        }
+        let n = OWN_FEWEST + 2;
+        let pages = allocate(n);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * n * PAGE, MEM_RESERVE | PAGES_64K, ADDRESS_32BIT | GRAPHICS, PAGE_READWRITE);
+        assert!(!a.is_null() && (a as usize) < 1 << 32);
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        assert_eq!(XMemMapPhysicalPages(at(0), n, pages.as_ptr()), at(0));
+        assert_eq!(query(at(0)).host.Type, MEM_PRIVATE, "private memory");
+        assert!(physical().private.contains_key(&(a as usize)));
+        // SAFETY (the rest): mapped read-write.
+        unsafe {
+            let mut found = vec![0usize; n * 16];
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            // Clear what mapping wrote, then write two pages.
+            GetWriteWatch(1, at(0), n * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity);
+            at(3).cast::<u64>().write(0x1234);
+            at(5).cast::<u64>().add(1000).write(0x5678);
+            count = found.len();
+            assert_eq!(GetWriteWatch(1, at(0), n * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity), 0);
+            assert_eq!(count, 2, "two 4 KiB pages written");
+            assert_eq!(found[0], at(3) as usize);
+            // Bytes written through the section reach the private pages.
+            assert!(write_physical(&pages, 4 * PAGE + 8, &[7u8; 16]));
+            assert_eq!(at(4).cast::<u8>().add(8).read(), 7);
+            // Page 5 shown a second time: the run is a view again, bytes kept.
+            assert_eq!(XMemMapPhysicalPages(at(n + 1), 1, &pages[5]), at(n + 1));
+            assert!(!physical().private.contains_key(&(a as usize)));
+            assert_eq!(query(at(0)).host.Type, MEM_MAPPED);
+            assert_eq!(at(3).cast::<u64>().read(), 0x1234);
+            assert_eq!(at(4).cast::<u8>().add(8).read(), 7);
+            assert_eq!(at(n + 1).cast::<u64>().add(1000).read(), 0x5678);
+            at(5).cast::<u64>().write(99);
+            assert_eq!(at(n + 1).cast::<u64>().read(), 99, "one page at two addresses");
+        }
+        assert_eq!(XMemMapPhysicalPages(at(0), 2 * n, std::ptr::null()), at(0));
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        // Mapped anew: not fresh any more, a view.
+        assert_eq!(XMemMapPhysicalPages(at(0), n, pages.as_ptr()), at(0));
+        assert_eq!(query(at(0)).host.Type, MEM_MAPPED);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(3).cast::<u64>().read() }, 0x1234);
+        assert_eq!(XMemMapPhysicalPages(at(0), n, std::ptr::null()), at(0));
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+    }
+
+    /// Unmapping a private run keeps its bytes in its pages.
+    #[test]
+    fn private_pages_unmapped_keep_their_bytes() {
+        if watched_pages() == 0 || on_wine() {
+            return;
+        }
+        let n = OWN_FEWEST;
+        let pages = allocate(n);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * n * PAGE, MEM_RESERVE | PAGES_64K, ADDRESS_32BIT | GRAPHICS, PAGE_READWRITE);
+        let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+        assert_eq!(XMemMapPhysicalPages(at(0), n, pages.as_ptr()), at(0));
+        assert!(physical().private.contains_key(&(a as usize)));
+        // SAFETY: mapped read-write.
+        unsafe { at(2).cast::<u32>().write(0xabcd) };
+        assert_eq!(XMemMapPhysicalPages(at(0), n, std::ptr::null()), at(0));
+        assert_eq!(query(at(0)).host.State, MEM_RESERVE);
+        assert_eq!(XMemMapPhysicalPages(at(n), n, pages.as_ptr()), at(n));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(n + 2).cast::<u32>().read() }, 0xabcd);
+        assert_eq!(XMemMapPhysicalPages(at(n), n, std::ptr::null()), at(n));
+        assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
     }
 
     /// The bytes of one page, through a view of our own.
