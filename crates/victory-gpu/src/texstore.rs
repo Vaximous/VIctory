@@ -116,7 +116,12 @@ pub(crate) fn key_level(sizes: &[usize]) -> Option<usize> {
     for level in (0..sizes.len()).rev() {
         rest += sizes[level];
         if rest >= KEY_BYTES {
-            return (level > 0).then_some(level);
+            if level > 0 {
+                return Some(level);
+            }
+            // Only with the first level is there enough: the rest if it
+            // is half enough still.
+            return (sizes.len() > 1 && rest - sizes[0] >= KEY_BYTES / 2).then_some(1);
         }
     }
     None
