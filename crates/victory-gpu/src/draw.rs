@@ -2723,7 +2723,7 @@ impl State {
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
-        if !self.is_bake_draw(&p) {
+        if !self.is_bake_draw(p) {
             return;
         }
         let frame = crate::frame::current();
