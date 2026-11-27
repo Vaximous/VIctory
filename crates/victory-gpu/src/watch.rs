@@ -2464,7 +2464,7 @@ fn take_apart(runs: &[(usize, usize, std::sync::Arc<std::sync::atomic::AtomicU8>
         let mut done = unsafe {
             VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
         };
-        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        if done && !matches!(old & !windows_sys::Win32::System::Memory::PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
             // SAFETY: as above; what it was.
             unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
             done = false;
@@ -3072,7 +3072,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
         tally(5, 1);
         tally(8, started.elapsed().as_nanos() as u64);
     }
-    if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+    if done && matches!(old & !windows_sys::Win32::System::Memory::PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
         g.protected.insert(block);
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
@@ -3103,7 +3103,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
-        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        if done && !matches!(old & !windows_sys::Win32::System::Memory::PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
             // SAFETY: as above.
@@ -3235,7 +3235,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         // SAFETY: a block we made read-only.
         unsafe {
             if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+                && !matches!(old & !windows_sys::Win32::System::Memory::PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
             {
                 // Not what we left there: the address is other memory's
                 // (code's, say), which keeps its protection.
@@ -3589,7 +3589,7 @@ fn readable_view(at: usize) -> bool {
     n != 0
         && info.State == MEM_COMMIT
         && info.Type == MEM_MAPPED
-        && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+        && matches!(info.Protect & !windows_sys::Win32::System::Memory::PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
 }
 
 /// Title memory that could not be written with what was to go there (what a
@@ -3806,6 +3806,14 @@ pub(crate) fn install() {
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
         const WRITE: usize = 1;
+        // A page the read probe armed, touched first (`crate::readprobe`):
+        // the guard is off now, and the access goes on.
+        if r.ExceptionCode == windows_sys::Win32::Foundation::STATUS_GUARD_PAGE_VIOLATION
+            && r.NumberParameters >= 2
+            && crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE, r.ExceptionAddress as usize)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
         let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
@@ -3895,7 +3903,7 @@ fn writable(at: usize) -> bool {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0 && info.State == MEM_COMMIT && info.Protect & !windows_sys::Win32::System::Memory::PAGE_GUARD == PAGE_READWRITE
 }
 
 #[cfg(test)]
