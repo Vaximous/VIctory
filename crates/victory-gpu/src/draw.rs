@@ -311,6 +311,48 @@ fn world_ms() -> Option<u64> {
 /// made ahead (for the lines of slow passes).
 pub(crate) static PASS_PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Bake targets' title memory (start, end), the frame, the resource
+/// (`VICTORY_BAKE_TRACE`).
+static BAKE_TARGETS: std::sync::Mutex<Vec<(u64, u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether bake draws are traced (`VICTORY_BAKE_TRACE=1`).
+fn bake_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_TRACE").is_some_and(|v| v != "0"))
+}
+
+/// A texture slot the texture pass is at whose texture lies in a bake
+/// target's memory (`VICTORY_BAKE_TRACE`): is it the bake's output, read
+/// through another resource, and would the pass upload title memory over
+/// it (`title_fills`)?
+fn trace_bake_output_read(index: u32, resource: This, title_fills: bool, frame: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let Some((at, len)) = crate::texture::title_span(resource, 0) else { return };
+    let hit = BAKE_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|k| at < k.1 && k.0 < at + len)
+        .copied();
+    let Some((start, end, baked, target)) = hit else { return };
+    if N.fetch_add(1, Ordering::Relaxed) >= 400 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        slot = index,
+        resource = format_args!("{:#x}", resource as usize),
+        kind = ?crate::resource::texture_kind(resource),
+        at = format_args!("{at:#x}+{len:#x}"),
+        same_resource = resource as usize == target,
+        bake_target = format_args!("{target:#x} {:?} at {start:#x}..{end:#x}", crate::resource::texture_kind(target as This)),
+        baked_in_frame = baked,
+        title_fills,
+        print = format_args!("{:#x}", crate::texture::fingerprint(at, len.min(48 << 10))),
+        "bake trace: a texture slot reads a bake target's memory (title_fills=true: the pass uploads title memory into it)"
+    );
+}
+
 /// Host textures made ahead of a texture pass (`VICTORY_PREMAKE`).
 pub(crate) static PREMADE: AtomicU64 = AtomicU64::new(0);
 
@@ -318,14 +360,14 @@ pub(crate) static PREMADE: AtomicU64 = AtomicU64::new(0);
 /// as one (`VICTORY_PREMAKE`, 32; 0: none).
 fn premake() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("VICTORY_PREMAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32))
+    *N.get_or_init(|| std::env::var("VICTORY_PREMAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
 /// Whether the due slots shaders read lately are taken first
 /// (`VICTORY_TOUCHED_FIRST=0`: only with eviction).
 fn touched_first() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TOUCHED_FIRST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TOUCHED_FIRST").is_some_and(|v| v != "0"))
 }
 
 /// Microseconds the residency's steering took on its thread, since the
@@ -2540,6 +2582,54 @@ impl State {
                 .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
     }
 
+    /// A bake draw, traced (`VICTORY_BAKE_TRACE=1`): its programs, its
+    /// targets and where they lie in title memory, and whether the pass
+    /// before it served all that was due (if not, slots it samples may
+    /// show stand-ins). The targets' memory is kept to find texture slots
+    /// that read it later ([`trace_bake_output_read`]).
+    fn trace_bake(&self, p: &HostPipeline, frame: u64, run_pass: bool, served: bool, published: usize) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let hashes: Vec<&str> = p.stages.iter().map(|s| s.shader.hash.as_str()).collect();
+        let mut targets = Vec::new();
+        let mut kept = BAKE_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+        for &t in &self.targets {
+            let kind = crate::resource::texture_kind(t as This);
+            let span = crate::texture::title_span(t as This, 0);
+            if let Some((at, len)) = span {
+                if !kept.iter().any(|k| k.0 == at) {
+                    kept.push((at, at + len, frame, t));
+                    if kept.len() > 256 {
+                        kept.remove(0);
+                    }
+                }
+            }
+            targets.push(format!(
+                "{t:#x} {:?} at {:#x}+{:#x}",
+                kind,
+                span.map_or(0, |s| s.0),
+                span.map_or(0, |s| s.1)
+            ));
+        }
+        drop(kept);
+        if n < 400 {
+            let [queued, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+            tracing::info!(
+                frame,
+                bake = n,
+                programs = ?hashes,
+                targets = ?targets,
+                depth = self.depth != 0,
+                run_pass,
+                served,
+                published,
+                queued,
+                due,
+                "bake trace: a bake draw (served=false: the pass before it ran out of time, and slots it samples may show stand-ins)"
+            );
+        }
+    }
+
     /// Runs the pass that uploads textures picked by index
     /// ([`State::heap_textures`]) where nothing has asked for it yet
     /// ([`early_budgets`]): once a frame for a few milliseconds, at the
@@ -2632,12 +2722,16 @@ impl State {
                 } else if !sync.publish.is_empty() {
                     crate::host::settle_for_fence();
                 }
+                let published = sync.publish.len();
                 for (index, handle, key) in sync.publish {
                     let _ = host.publish_uploaded_slot(index, handle, key);
                 }
                 host.texture_views_remade();
                 host.texture_slots_flip();
                 drop(sync.keep);
+                if bake_trace() {
+                    self.trace_bake(p, frame, run_pass, served, published);
+                }
                 if run_pass && served && exact {
                     BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
                 }
@@ -3365,6 +3459,9 @@ impl State {
                 break;
             }
             let title_fills = texture.is_some_and(crate::texture::title_written);
+            if bake_trace() {
+                trace_bake_output_read(index, resource, title_fills, frame);
+            }
             if !title_fills {
                 at_once();
                 // a render target, a depth or unordered access texture: the host's own
