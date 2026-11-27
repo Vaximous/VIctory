@@ -2515,6 +2515,15 @@ fn send_parts() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Whether the compares of [`send_parts`], [`landed_parts`] and
+/// [`whole_changed`] read title memory once, in place, against the CPU's
+/// side (`safecopy::changed`: 32 bytes a step, put in where they differ),
+/// and not through a copy of every 4 KiB first, compared and copied again
+/// (`VICTORY_COMPARE_IN_PLACE`, on unless `=0`). With [`landed_parts`] run
+/// ow29-move compared 100 MB a frame to send 4.9 MB, and the copies' time
+/// went from 19.4 to 26.4 ms a frame. What is sent is the same: each
+/// 4 KiB piece in which a byte differed, whole.
+///
 /// Whether a refresh of a copy that landings were noted in ([`land_echo`])
 /// takes the pages no landing was noted in as [`send_parts`] does, the 4 KiB
 /// parts that differ from the CPU's side (`VICTORY_LANDED_PARTS`, on unless
@@ -2524,6 +2533,10 @@ fn send_parts() -> bool {
 /// ow26-move the 174 MB copy sent 107 MB a frame in 656 pieces while
 /// [`send_parts`] saw 7.5 MB. The pages are ones the copy held before
 /// (`known`), the case [`send_parts`] covers, on what it rests on.
+fn compare_in_place() -> bool {
+    crate::toggled!("VICTORY_COMPARE_IN_PLACE")
+}
+
 fn landed_parts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_PARTS").is_none_or(|v| v != "0"))
@@ -3290,6 +3303,51 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
         }
     }
     out
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::{KERNEL_PAGE, Shadow, WHOLE_CHANGED};
+
+    /// The compare in place puts in and sends what the staged one does: the
+    /// 4 KiB pieces with a byte that differs, whole, from an unaligned start
+    /// and to an unaligned end too.
+    #[test]
+    fn in_place_takes_what_the_staged_compare_takes() {
+        assert!(crate::safecopy::on());
+        const PAGES: usize = 5;
+        let room = vec![7u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = room.as_ptr() as usize;
+        let title = title.next_multiple_of(KERNEL_PAGE);
+        let put = |at: usize, v: u8| {
+            // SAFETY: in `room`.
+            unsafe { ((title + at) as *mut u8).write_volatile(v) }
+        };
+        // A byte in page 1, one in the last record of page 3, one in the
+        // tail of the range (page 4).
+        put(KERNEL_PAGE + 100, 1);
+        put(4 * KERNEL_PAGE - 1, 2);
+        put(4 * KERNEL_PAGE + 40, 3);
+        let (from, to) = (title + 3, title + 4 * KERNEL_PAGE + 45);
+        let mut results = Vec::new();
+        for in_place in [true, false] {
+            let mut side = vec![7u8; PAGES * KERNEL_PAGE];
+            let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+            if in_place {
+                assert!(copy.copy_changed_in_place(from, to, &WHOLE_CHANGED));
+            } else {
+                copy.copy_changed_staged(from, to, &WHOLE_CHANGED);
+            }
+            let mut dirty = copy.take_dirty();
+            dirty.sort_unstable();
+            drop(copy);
+            results.push((super::joined(dirty), side));
+        }
+        assert_eq!(results[0].0, results[1].0);
+        assert!(results[0].1 == results[1].1, "the CPU's sides differ");
+        assert_eq!(results[0].0, [(KERNEL_PAGE, 2 * KERNEL_PAGE), (3 * KERNEL_PAGE, 4 * KERNEL_PAGE + 45)]);
+        drop(room);
+    }
 }
 
 #[cfg(test)]
@@ -4797,6 +4855,88 @@ impl Shadow {
 
     /// [`Shadow::copy_changed`] of one part, on this thread.
     fn copy_changed_part(&self, from: usize, to: usize, counted: &'static [AtomicU64; 2]) {
+        if compare_in_place() && crate::safecopy::on() && !crate::host::upcheck::on() && self.copy_changed_in_place(from, to, counted) {
+            return;
+        }
+        self.copy_changed_staged(from, to, counted);
+    }
+
+    /// [`Shadow::copy_changed_part`] read once from title memory, compared
+    /// with the CPU's side where it lies and put in where it differs
+    /// ([`compare_in_place`]), with no copy of it in between. False (and
+    /// nothing counted) if a page of title memory could not be read: what
+    /// was put in before stays put in, and the caller does it all again the
+    /// staged way, which reads such a page as zeros.
+    fn copy_changed_in_place(&self, from: usize, to: usize, counted: &'static [AtomicU64; 2]) -> bool {
+        thread_local! {
+            static BITS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        /// Compared a call at a time: one 64 KiB block's records.
+        const CHUNK: usize = 64 << 10;
+        const RECORD: usize = 32;
+        let start = self.start as usize;
+        let (mut same, mut new) = (0u64, 0u64);
+        let mut all = true;
+        BITS.with_borrow_mut(|bits| {
+            let mut at = from;
+            while at < to {
+                let next = ((at / CHUNK + 1) * CHUNK).min(to);
+                let records = (next - at) / RECORD;
+                let tail = at + records * RECORD;
+                bits.clear();
+                bits.resize(records.div_ceil(64).max(1), 0);
+                // SAFETY: the CPU's side holds the copy's bytes at its
+                // offsets, and nothing else reads or writes these (no
+                // shader's range holds them, and the parts lie apart); the
+                // bits are zeroed and enough for the records.
+                let read = records == 0
+                    || unsafe { crate::safecopy::changed(at as *const u8, self.data.add(at - start), records, bits) };
+                // The bytes behind the last record, as the staged way does.
+                let mut tail_new = false;
+                if read && tail < next {
+                    let mut title = [0u8; RECORD];
+                    let title = &mut title[..next - tail];
+                    crate::host::copy_mapped(title.as_mut_ptr(), tail as *const u8, next - tail, false);
+                    // SAFETY: as above.
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(tail - start), next - tail) };
+                    if title != held {
+                        held.copy_from_slice(title);
+                        tail_new = true;
+                    }
+                }
+                // Each 4 KiB piece with a record that differed goes up whole,
+                // as the staged way sends it.
+                let mut piece = at;
+                while piece < next {
+                    let end = ((piece / KERNEL_PAGE + 1) * KERNEL_PAGE).min(next);
+                    let (r0, r1) = ((piece - at) / RECORD, (end - at).div_ceil(RECORD).min(records));
+                    let differed = (r0..r1).any(|r| bits[r / 64] >> (r % 64) & 1 != 0) || tail_new && end > tail;
+                    if differed {
+                        new += (end - piece) as u64;
+                        self.changed(piece - start, end - start);
+                        self.card_changed(piece - start, end - start);
+                    } else {
+                        same += (end - piece) as u64;
+                    }
+                    piece = end;
+                }
+                if !read {
+                    all = false;
+                    return;
+                }
+                at = next;
+            }
+        });
+        if all {
+            counted[0].fetch_add(same, Ordering::Relaxed);
+            counted[1].fetch_add(new, Ordering::Relaxed);
+        }
+        all
+    }
+
+    /// [`Shadow::copy_changed_part`] through a copy of each 4 KiB of title
+    /// memory (`copy_mapped`, which reads pages that are not there as zeros).
+    fn copy_changed_staged(&self, from: usize, to: usize, counted: &'static [AtomicU64; 2]) {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
