@@ -4055,6 +4055,11 @@ fn late_line(frames: f64) {
             ms(4),
             u[8],
         );
+        let [parted, left_out] = crate::shadow::under_parts_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            "of the stale pages, {parted:.0} a frame compared only in their 4 KiB parts written since (VICTORY_UNDER_PARTS=0: whole), {:.1} MB a frame left out",
+            left_out / (1 << 20) as f64
+        );
     }
 }
 

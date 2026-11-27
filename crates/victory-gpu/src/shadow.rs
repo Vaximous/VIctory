@@ -2759,6 +2759,26 @@ unsafe fn word_runs_put_avx2(title: &[u8], held: &mut [u8]) -> Vec<(usize, usize
     runs
 }
 
+/// Whether [`Shadow::merge_under_writes`] compares, of a page the copy took
+/// before, only the 4 KiB parts the write watch's journal found written since
+/// (`VICTORY_UNDER_PARTS`, on unless `=0`: the whole 64 KiB page, as before).
+/// The others are as the copy took them, which is what the refresh's own
+/// cut to parts rests on ([`by_parts`]); a page whose parts are not known
+/// is compared whole. Run ow26-move compared 1,305 pages a frame (85 MB)
+/// to find 1 MB, 5.7 ms a frame of the submitting thread.
+fn under_parts() -> bool {
+    crate::toggled!("VICTORY_UNDER_PARTS")
+}
+
+/// Since the last frame-rate line, of [`under_parts`]: pages compared in
+/// part, and the bytes of them left out.
+static UNDER_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`UNDER_PARTS`], taken.
+pub(crate) fn under_parts_stats() -> [u64; 2] {
+    [0, 1].map(|i| UNDER_PARTS[i].swap(0, Ordering::Relaxed))
+}
+
 /// Whether the pages of [`Shadow::merge_under_writes`] are compared on several
 /// threads (`VICTORY_UNDER_WIDE=0`: on the submitting one).
 fn under_wide() -> bool {
@@ -3277,7 +3297,8 @@ mod landing_tests {
     use super::{KERNEL_PAGE, Shadow};
 
     /// A page that only a landing wrote is not sent up again; one the title
-    /// wrote too is, and so is every page no landing was noted in.
+    /// wrote too is, and so is every page no landing was noted in that the
+    /// title wrote.
     #[test]
     fn what_a_landing_wrote_is_not_sent_up_again() {
         const PAGES: usize = 6;
@@ -3292,8 +3313,12 @@ mod landing_tests {
         };
         let page = |from: usize, to: usize| (title + from * KERNEL_PAGE, title + to * KERNEL_PAGE);
         copy.note_landing(KERNEL_PAGE, 4 * KERNEL_PAGE);
-        // Page 2: the title's too.
+        // Page 2: the title's too. Pages no landing was noted in that the
+        // title wrote go up whatever `landed_parts` says.
         write(2);
+        for page in [0, 4, 5] {
+            write(page);
+        }
         let (from, to) = page(0, 6);
         copy.take_landed(from, to);
         let mut dirty = copy.take_dirty();
@@ -3302,6 +3327,7 @@ mod landing_tests {
         assert_eq!(super::joined(dirty), [part(0, 1), part(2, 3), part(4, 6)]);
         assert_eq!(side[2 * KERNEL_PAGE + 9], 8);
         // Looked at: from here on as any other.
+        write(1);
         let (from, to) = page(1, 2);
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), [part(1, 2)]);
@@ -4368,11 +4394,26 @@ impl Shadow {
                 return true;
             };
             let t = under_ns(0, t);
-            let stale: Vec<usize> = {
+            let (stale, taken_at): (Vec<usize>, Vec<u64>) = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                let stale = stale_pages_in(base, &copied, a, e, &written);
+                let taken_at = stale.iter().map(|&page| copied.get(page - base).copied().unwrap_or(0)).collect();
+                (stale, taken_at)
             };
             UNDER_NS[8].fetch_add(stale.len() as u64, Ordering::Relaxed);
+            // Of each page, the 4 KiB parts written since the copy took it
+            // ([`under_parts`]); all of a page never taken, or not known.
+            let masks: Vec<u16> = if under_parts() {
+                let known: Vec<(usize, u64)> =
+                    stale.iter().zip(&taken_at).filter(|&(_, &t)| t != 0).map(|(&p, &t)| (p, t)).collect();
+                let mut parts = crate::watch::parts_written(&known).into_iter();
+                taken_at
+                    .iter()
+                    .map(|&t| if t == 0 { u16::MAX } else { parts.next().filter(|&m| m != 0).unwrap_or(u16::MAX) })
+                    .collect()
+            } else {
+                vec![u16::MAX; stale.len()]
+            };
             let t = under_ns(1, t);
             if stale.is_empty() {
                 continue;
@@ -4412,7 +4453,51 @@ impl Shadow {
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
                     // no two pages are the same.
-                    let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
+                    let runs = if masks[i] == u16::MAX {
+                        unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) }
+                    } else {
+                        // Only the parts written since: the others hold what
+                        // the reference holds.
+                        const PART: usize = PAGE / 16;
+                        let page = stale[i] * PAGE;
+                        let mask = masks[i];
+                        let mut all: Option<Vec<(usize, usize)>> = Some(Vec::new());
+                        let mut result = Ok(());
+                        let mut looked = 0u64;
+                        let mut k = 0;
+                        while k < 16 {
+                            if mask >> k & 1 == 0 {
+                                k += 1;
+                                continue;
+                            }
+                            let first = k;
+                            while k < 16 && mask >> k & 1 != 0 {
+                                k += 1;
+                            }
+                            let (pa, pb) = ((page + first * PART).max(lo), (page + k * PART).min(hi));
+                            if pa >= pb {
+                                continue;
+                            }
+                            looked += (pb - pa) as u64;
+                            // SAFETY: as above, a part of the same page.
+                            match unsafe { self.merge_page_under_writes(pa, pb - pa, held as *mut u8, &left) } {
+                                Ok(Some(runs)) => {
+                                    if let Some(all) = all.as_mut() {
+                                        all.extend(runs.into_iter().map(|(r, m)| (pa - lo + r, m)));
+                                    }
+                                }
+                                // Not there: the page is looked at again.
+                                Ok(None) => all = None,
+                                Err(()) => {
+                                    result = Err(());
+                                    break;
+                                }
+                            }
+                        }
+                        UNDER_PARTS[0].fetch_add(1, Ordering::Relaxed);
+                        UNDER_PARTS[1].fetch_add(((hi - lo) as u64).saturating_sub(looked), Ordering::Relaxed);
+                        result.map(|()| all)
+                    };
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
                         Err(()) => over.store(true, Ordering::Relaxed),
