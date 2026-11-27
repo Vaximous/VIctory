@@ -562,13 +562,13 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    let put = unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) };
+    // (What it writes is no touch of a copy left on the card.)
+    let put = crate::readprobe::as_landing(|| unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) });
     if !copy.is_null()
-        && crate::readprobe::every() != 0
         && let (Some(from), Some(to)) = (parts.first(), parts.last())
     {
         // SAFETY: the caller's copy.
-        crate::readprobe::landed(unsafe { (*copy).span() }, title + from.0, title + to.1);
+        crate::readprobe::landed(unsafe { &*copy }, title + from.0, title + to.1);
     }
     put
 }

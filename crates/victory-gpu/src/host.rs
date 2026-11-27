@@ -2919,6 +2919,19 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 }
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
+/// A copy left on the card could not be fetched: said, once per copy.
+fn lost_left(shadow: &crate::shadow::Shadow, why: &str) {
+    let (start, len) = shadow.span();
+    tracing::warn!(start = format_args!("{start:#x}"), len, "a copy left on the card could not be fetched back: {why}");
+}
+
+/// Of picked views' ranges, those of copies left on the card
+/// (`crate::readprobe`) out: neither declared nor looked at.
+fn unleft(picked: &mut crate::picked::Ranges) {
+    picked.written.retain(|r| !crate::readprobe::left(&r.0));
+    picked.looked.retain(|r| !crate::readprobe::left(&r.0));
+}
+
 /// `more` added to `into`, copy by copy (the ranges of one copy joined).
 fn merge_declared(into: &mut Vec<Declared>, more: impl IntoIterator<Item = Declared>) {
     for (shadow, ranges) in more {
@@ -4057,6 +4070,9 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
+                if crate::readprobe::left(shadow) {
+                    continue;
+                }
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
                 if !seen.insert((key, *address, *len)) {
                     continue;
@@ -4621,6 +4637,9 @@ impl Host {
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
+                        if bytes > 0 {
+                            crate::readprobe::sent_up(shadow);
+                        }
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
@@ -5799,6 +5818,9 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Copies left on the card (`crate::readprobe`): decided for the
+        // whole submission here.
+        crate::readprobe::submission_begins();
         let was_working = working(true);
         submitting(1, runs.len());
         // With [`heap_sync_first`]: the heaps' records begun now, beside the
@@ -6026,7 +6048,8 @@ impl Host {
             // What shaders may write through views they pick, declared from
             // here on: a part goes on with the next if the rest refreshes it
             // (a refresh leaves a range being written alone).
-            let picked = crate::picked::declare(group);
+            let mut picked = crate::picked::declare(group);
+            unleft(&mut picked);
             if !picked.written.is_empty() {
                 let mut ranges = Vec::new();
                 join_ranges(&mut ranges, picked.written.iter().map(|(_, at, len)| (*at, *at + *len)));
@@ -6143,6 +6166,7 @@ impl Host {
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let mut picked = crate::picked::declare(runs);
+        unleft(&mut picked);
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
@@ -7959,6 +7983,10 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
+                    // Left on the card (`crate::readprobe`): not declared.
+                    if crate::readprobe::left(shadow) {
+                        continue;
+                    }
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -9616,6 +9644,93 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    /// A copy whose shader writes were left on the card
+    /// (`crate::readprobe`): all of it fetched now and put into title
+    /// memory, behind everything on the queue (`locked`: the caller holds
+    /// the submission lock; else it is taken, so that no submission is half
+    /// prepared meanwhile).
+    pub(crate) fn fetch_left(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, locked: bool) {
+        struct Fetch {
+            list: Prelude,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            sent: u64,
+            buffer: Option<(ID3D12Resource, usize, u64)>,
+        }
+        // SAFETY: the event handle is only waited on by the holder of the lock.
+        unsafe impl Send for Fetch {}
+        static FETCH: Mutex<Option<Fetch>> = Mutex::new(None);
+        let _submission = (!locked).then(|| self.submitted.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut held = FETCH.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            // SAFETY: plain objects of our own.
+            *held = unsafe {
+                (|| {
+                    let list = self.make_prelude()?;
+                    let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                    let event = CreateEventW(None, false, false, None).ok()?;
+                    Some(Fetch { list, fence, event, sent: 0, buffer: None })
+                })()
+            };
+        }
+        let Some(f) = held.as_mut() else {
+            lost_left(shadow, "no list to fetch it");
+            return;
+        };
+        let len = shadow.span().1;
+        if f.buffer.as_ref().is_none_or(|b| b.2 < len) {
+            let size = len.next_multiple_of(1 << 20);
+            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        }
+        let Some((buffer, data, _)) = f.buffer.clone() else {
+            lost_left(shadow, "no memory to fetch it into");
+            return;
+        };
+        f.sent += 1;
+        let (allocator, list) = &f.list;
+        // SAFETY: the list's last run was waited for under the lock; live
+        // buffers; the fence and event are ours.
+        let ran = unsafe {
+            (|| -> windows::core::Result<u64> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.CopyBufferRegion(&buffer, 0, &shadow.buffer, 0, len);
+                list.Close()?;
+                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                self.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                let after = *order;
+                drop(order);
+                self.card_sent();
+                self.queue.Signal(&f.fence, f.sent)?;
+                f.fence.SetEventOnCompletion(f.sent, f.event)?;
+                WaitForSingleObject(f.event, INFINITE);
+                Ok(after)
+            })()
+        };
+        let after = match ran {
+            Ok(after) => after,
+            Err(e) => {
+                lost_left(shadow, &format!("the fetch failed ({e})"));
+                return;
+            }
+        };
+        // In pieces within 64 KiB blocks of title memory, as landings are.
+        let start = shadow.span().0 as usize;
+        let mut pieces = Vec::new();
+        let mut at = 0usize;
+        while at < len as usize {
+            let next = ((start + at) / crate::watch::PAGE + 1) * crate::watch::PAGE - start;
+            let hi = next.min(len as usize);
+            pieces.push((at, hi, data + at));
+            at = hi;
+        }
+        let mut notes = crate::land::Notes::default();
+        // SAFETY: the mapping of the fetched bytes, which nothing else
+        // writes while the lock is held.
+        unsafe { shadow.land_card(&pieces, after, &mut notes) };
+        notes.flush();
+    }
+
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
