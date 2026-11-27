@@ -140,6 +140,8 @@ pub(crate) fn event_set(event: usize) {
 
 /// The title signals `fence` to `value` behind its submissions.
 pub(crate) fn signal_called(fence: usize, value: u64) {
+    // SAFETY: a plain query.
+    SUBMITTER.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Relaxed);
     if on() {
         known(|k| {
             k.signals.entry((fence, value)).or_insert_with(Instant::now);
@@ -322,9 +324,14 @@ fn type_name(handle: usize) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, bytes / 2) })
 }
 
+/// The thread that signalled a fence last: the title's submitting thread.
+static SUBMITTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Since the last line: (kind, set by our GPU path) to microseconds and
-/// waits; and microseconds by thread.
-type Blocked = (HashMap<(String, bool), (u64, u64)>, HashMap<u32, u64>);
+/// waits, over all threads and on the submitting thread; and microseconds
+/// by thread.
+type Kinds = HashMap<(String, bool), (u64, u64)>;
+type Blocked = (Kinds, HashMap<u32, u64>, Kinds);
 static BLOCKED: Mutex<Option<Blocked>> = Mutex::new(None);
 
 /// Runs `call`, a wait of the title's on `kind`, timed by kind (with
@@ -343,7 +350,13 @@ fn blocked<T>(kind: Kind, ours: Option<Object>, call: impl FnOnce() -> T) -> T {
         let error = GetLastError();
         inside(|| {
             let name = if us < BRIEF_US {
-                "brief".to_string()
+                match kind {
+                    Kind::Handle(_) => "brief handle",
+                    Kind::Address => "brief address",
+                    Kind::Condition(_) => "brief condition",
+                    Kind::Sleep => "brief sleep",
+                }
+                .to_string()
             } else {
                 match kind {
                     Kind::Handle(h) => type_name(h),
@@ -355,7 +368,11 @@ fn blocked<T>(kind: Kind, ours: Option<Object>, call: impl FnOnce() -> T) -> T {
             };
             let thread = GetCurrentThreadId();
             let mut all = BLOCKED.lock().unwrap_or_else(|e| e.into_inner());
-            let (kinds, threads) = all.get_or_insert_with(Default::default);
+            let (kinds, threads, submitter) = all.get_or_insert_with(Default::default);
+            if thread == SUBMITTER.load(Relaxed) {
+                let e = submitter.entry((name.clone(), ours.is_some())).or_default();
+                *e = (e.0 + us, e.1 + 1);
+            }
             let e = kinds.entry((name, ours.is_some())).or_default();
             *e = (e.0 + us, e.1 + 1);
             *threads.entry(thread).or_default() += us;
@@ -367,28 +384,36 @@ fn blocked<T>(kind: Kind, ours: Option<Object>, call: impl FnOnce() -> T) -> T {
 
 /// The second line of a second (see [`kinds_on`]): `frames` the frames in it.
 fn kinds_line(frames: f64) {
-    let Some((kinds, threads)) = BLOCKED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+    let Some((kinds, threads, submitter)) = BLOCKED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
     let ms = |us: u64| us as f64 / 1e3 / frames;
-    let total: u64 = kinds.iter().filter(|(k, _)| k.0 != "brief").map(|(_, v)| v.0).sum();
-    let mut kinds: Vec<_> = kinds.into_iter().collect();
-    kinds.sort_unstable_by_key(|k| std::cmp::Reverse(k.1.0));
-    let kinds: Vec<String> = kinds
-        .iter()
-        .take(8)
-        .map(|((name, ours), (us, n))| {
-            format!("{name}{} {:.2} ms in {:.1}", if *ours { " (ours)" } else { "" }, ms(*us), *n as f64 / frames)
-        })
-        .collect();
+    let total: u64 = kinds.iter().filter(|(k, _)| !k.0.starts_with("brief")).map(|(_, v)| v.0).sum();
+    let listed = |kinds: Kinds| -> String {
+        let mut kinds: Vec<_> = kinds.into_iter().collect();
+        kinds.sort_unstable_by_key(|k| std::cmp::Reverse((k.1.0, k.1.1)));
+        let kinds: Vec<String> = kinds
+            .iter()
+            .take(10)
+            .map(|((name, ours), (us, n))| {
+                format!("{name}{} {:.2} ms in {:.1}", if *ours { " (ours)" } else { "" }, ms(*us), *n as f64 / frames)
+            })
+            .collect();
+        if kinds.is_empty() { "-".to_string() } else { kinds.join(", ") }
+    };
+    let on_submitter = listed(submitter);
+    let kinds = listed(kinds);
     let mut threads: Vec<_> = threads.into_iter().collect();
     threads.sort_unstable_by_key(|t| std::cmp::Reverse(t.1));
     let threads: Vec<String> = threads.iter().take(3).map(|(t, us)| format!("{t} {:.1} ms", ms(*us))).collect();
     tracing::info!(
-        "title blocked {:.1} ms a frame over its threads in waits (VICTORY_WAIT_KINDS): {}; threads blocked most: {}",
+        "title blocked {:.1} ms a frame over its threads in waits (VICTORY_WAIT_KINDS): {}; threads blocked most: {}; \
+         the submitting thread ({}): {}",
         ms(total),
-        kinds.join(", "),
+        kinds,
         threads.join(", "),
+        SUBMITTER.load(Relaxed),
+        on_submitter,
     );
 }
 
