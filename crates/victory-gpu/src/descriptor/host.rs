@@ -3674,7 +3674,15 @@ impl HostHeap {
                         self.unmake_stale(index, stale);
                         return Some(view);
                     }
-                    went_grey(index, 2, Some(kin));
+                    if is_texture_view(&view) {
+                        went_grey(index, 2, Some(kin));
+                        if kin == Kin::None {
+                            grey_dimensions(&old, &view);
+                        }
+                    } else {
+                        // (A slot used for a buffer now: not a texture that went grey.)
+                        WENT_GREY_BY[17].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -4952,12 +4960,7 @@ fn kin(old: &View, new: &View) -> Kin {
             Kin::Other
         };
     }
-    let dimension = |view: &View| match view {
-        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
-        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1],
-        _ => 0,
-    };
-    match (dimension(old), dimension(new)) {
+    match (view_dimension(old), view_dimension(new)) {
         (0, _) | (_, 0) => Kin::None,
         (a, b) if a == b => Kin::Other,
         _ => Kin::None,
@@ -4992,6 +4995,24 @@ fn keep_when_full() -> bool {
 /// neutral texture) while a new one was made: should stay 0.
 pub(crate) static WENT_GREY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The view dimension of a texture view (0: not one).
+fn view_dimension(view: &View) -> u32 {
+    match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1] as u32,
+        View::Shader(r, Some(desc)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => desc[1] as u32,
+        _ => 0,
+    }
+}
+
+/// Texture slots that went grey for a view of another kind, by the two
+/// views' dimensions (old * 16 + new).
+static GREY_DIMENSIONS: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+
+fn grey_dimensions(old: &View, new: &View) {
+    let (a, b) = (view_dimension(old).min(15), view_dimension(new).min(15));
+    GREY_DIMENSIONS[(a * 16 + b) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// [`WENT_GREY`] by where (0: a view left for later, [`Slots::show_later`];
 /// 1: a view that waits, views not kept; 2: one that waits, not kept) and
 /// by the [`Kin`] of the two views (same, moved, sized, other, none, not
@@ -5012,13 +5033,19 @@ fn went_grey(index: u32, at: usize, kin: Option<Kin>) {
     let n = WENT_GREY.fetch_add(1, Relaxed) + 1;
     if n.is_power_of_two() {
         let by: Vec<u64> = WENT_GREY_BY.iter().map(|n| n.load(Relaxed)).collect();
+        let mut dimensions: Vec<(u64, usize)> =
+            GREY_DIMENSIONS.iter().enumerate().map(|(i, n)| (n.load(Relaxed), i)).filter(|d| d.0 > 0).collect();
+        dimensions.sort_unstable_by_key(|d| std::cmp::Reverse(d.0));
+        let dimensions: Vec<String> =
+            dimensions.iter().take(6).map(|(n, i)| format!("{}->{}: {n}", i / 16, i % 16)).collect();
         tracing::info!(
             so_far = n,
             slot = index,
-            "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen); by where (left for later, waits, waits not kept) and kin (same, moved, sized, other, none, not known): {:?} {:?} {:?}",
+            "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen); by where (left for later, waits, waits not kept) and kin (same, moved, sized, other, none, not known; the last's: now a buffer, not counted): {:?} {:?} {:?}; of another dimension, by the dimensions: {}",
             &by[0..6],
             &by[6..12],
-            &by[12..18]
+            &by[12..18],
+            dimensions.join(", ")
         );
     }
 }
