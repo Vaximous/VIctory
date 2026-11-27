@@ -386,9 +386,31 @@ fn put_merged(ticket: &Ticket, before: &[u8], tiled: &mut [u8]) {
     crate::watch::writing(at, size);
     crate::ledger::note(at, size, crate::ledger::Path::Texback);
     let (mut put, mut kept) = (0u64, 0u64);
-    for i in (0..size & !3).step_by(4) {
-        let (old, new) = (&before[i..i + 4], &tiled[i..i + 4]);
+    // By whole aligned qwords (`safecopy::qwords`; `at` is a texture's
+    // start, at least 256-aligned): one the title wrote any byte of since
+    // stays the title's whole.
+    let unit = if crate::safecopy::qwords() { 8 } else { 4 };
+    let mut i = 0;
+    while i + 4 <= size {
+        let n = if unit == 8 && i + 8 <= size { 8 } else { 4 };
+        let (old, new) = (&before[i..i + n], &tiled[i..i + n]);
         if old == new {
+            i += n;
+            continue;
+        }
+        if unit == 8 {
+            // SAFETY: inside the allocation, read whole just now under the
+            // lock against mapping changes, which is still held.
+            match unsafe { crate::safecopy::put_unit(at + i, (at + i) % 8, n, old, new) } {
+                Some((true, _)) => put += 1,
+                Some((false, there)) => {
+                    kept += 1;
+                    let lo = (at + i) % 8;
+                    tiled[i..i + n].copy_from_slice(&there[lo..lo + n]);
+                }
+                None => kept += 1,
+            }
+            i += n;
             continue;
         }
         let old = u32::from_le_bytes(old.try_into().unwrap_or_default());
@@ -404,6 +426,7 @@ fn put_merged(ticket: &Ticket, before: &[u8], tiled: &mut [u8]) {
                 tiled[i..i + 4].copy_from_slice(&now.to_le_bytes());
             }
         }
+        i += n;
     }
     MERGE[0].fetch_add(1, Ordering::Relaxed);
     MERGE[1].fetch_add(put, Ordering::Relaxed);

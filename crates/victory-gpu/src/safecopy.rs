@@ -193,6 +193,29 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    ".globl victory_safe_cas8",
+    ".globl victory_safe_cas8_at",
+    ".globl victory_safe_cas8_after",
+    ".globl victory_safe_cas8_failed",
+    // rcx an aligned qword of title memory, rdx what it is to hold for the
+    // store to be made, r8 what to store, r9 where what it held goes. One
+    // locked compare-exchange: a store of the title's to any byte of it is
+    // either before (and kept) or after ours, never split by it. eax: 2
+    // stored, 1 it held something else (left as it was), 0 not there.
+    "victory_safe_cas8:",
+    "mov rax, rdx",
+    "victory_safe_cas8_at:",
+    "lock cmpxchg qword ptr [rcx], r8",
+    "victory_safe_cas8_after:",
+    "mov qword ptr [r9], rax",
+    "mov eax, 1",
+    "jne 2f",
+    "mov eax, 2",
+    "2:",
+    "ret",
+    "victory_safe_cas8_failed:",
+    "xor eax, eax",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -212,6 +235,93 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+    fn victory_safe_cas8(at: *mut u64, expected: u64, new: u64, held: *mut u64) -> u32;
+    fn victory_safe_cas8_at();
+    fn victory_safe_cas8_after();
+    fn victory_safe_cas8_failed();
+}
+
+/// What [`cas8`] found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cas {
+    /// The qword held what was expected and now holds the new value.
+    Stored,
+    /// It held this instead (the title wrote it), and was left as it is.
+    Held(u64),
+    /// Its page was not there (or not writable, and not one of ours).
+    NotThere,
+}
+
+/// One locked compare-exchange of the aligned qword of title memory at `at`.
+///
+/// # Safety
+/// `at` is 8-aligned; title memory as [`copy`]'s destination.
+pub(crate) unsafe fn cas8(at: usize, expected: u64, new: u64) -> Cas {
+    debug_assert!(at.is_multiple_of(8));
+    let mut held = 0u64;
+    // SAFETY: a fault leaves through the failing exit ([`failing_exit`]).
+    match unsafe { victory_safe_cas8(at as *mut u64, expected, new, &mut held) } {
+        2 => Cas::Stored,
+        1 => Cas::Held(held),
+        _ => Cas::NotThere,
+    }
+}
+
+/// Whether our merges into title memory work by whole aligned qwords
+/// (`VICTORY_MERGE_QWORDS`, on unless `=0`). By the dword, a pointer the
+/// title rewrote with its high dword unchanged (its heap's pointers are all
+/// 0x9_xxxx_xxxx) had that dword taken for one the title left alone, and a
+/// stale card copy's dword went over it: the title's heap-node walk read
+/// 0x10418cdf8 for 0x90418cdf8, and 0x900000000 (runs ow74d, ow79-out,
+/// image+0x4e9b578 and +0x4e9b54a). By the qword, a unit the title changed
+/// in any byte stays the title's whole, and one it did not is stored with a
+/// compare-exchange against what was held, so that a title store between
+/// our look and our store is never split either.
+pub(crate) fn qwords() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_QWORDS").is_none_or(|v| v != "0"))
+}
+
+/// Of title memory at `address` (`n` bytes in one aligned qword, from byte
+/// `lo` of it): stores `card` there if the title still holds `was` there,
+/// by one compare-exchange of the whole qword. Whether it was stored, and
+/// what the qword holds afterwards; None if it is not there.
+///
+/// # Safety
+/// Title memory, as [`cas8`]'s; `lo + n <= 8`; the qword lies in a page
+/// that holds `address`.
+pub(crate) unsafe fn put_unit(address: usize, lo: usize, n: usize, was: &[u8], card: &[u8]) -> Option<(bool, [u8; 8])> {
+    let unit = address - lo;
+    if n == 8 {
+        let (w, c) = (u64::from_le_bytes(was.try_into().ok()?), u64::from_le_bytes(card.try_into().ok()?));
+        // SAFETY: the caller's.
+        return match unsafe { cas8(unit, w, c) } {
+            Cas::Stored => Some((true, c.to_le_bytes())),
+            Cas::Held(h) => Some((false, h.to_le_bytes())),
+            Cas::NotThere => None,
+        };
+    }
+    // A qword only partly ours: the rest of it as it is now.
+    let mut t = [0u8; 8];
+    // SAFETY: the qword lies in the page.
+    if !unsafe { copy(t.as_mut_ptr(), unit as *const u8, 8) } {
+        return None;
+    }
+    for _ in 0..4 {
+        if t[lo..lo + n] != *was {
+            return Some((false, t));
+        }
+        let mut c = t;
+        c[lo..lo + n].copy_from_slice(card);
+        // SAFETY: the caller's.
+        match unsafe { cas8(unit, u64::from_le_bytes(t), u64::from_le_bytes(c)) } {
+            Cas::Stored => return Some((true, c)),
+            // Changed (beside our bytes, maybe): looked at again.
+            Cas::Held(h) => t = h.to_le_bytes(),
+            Cas::NotThere => return None,
+        }
+    }
+    Some((false, t))
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -269,7 +379,7 @@ pub(crate) struct Merged {
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
     let began = std::time::Instant::now();
     // SAFETY: the caller's promises, passed on.
-    let out = unsafe { merge_timed(title, now, held, len, take) };
+    let out = if qwords() { unsafe { merge_qwords(title, now, held, len, take) } } else { unsafe { merge_timed(title, now, held, len, take) } };
     use std::sync::atomic::Ordering::Relaxed;
     MERGES[0].fetch_add(1, Relaxed);
     MERGES[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
@@ -295,6 +405,62 @@ pub(crate) fn merge_line(frames: f64) {
         n[2] / 1e6,
         n[3],
     );
+}
+
+/// [`merge`] by whole aligned qwords of title memory ([`qwords`]): where
+/// the card's bytes of one differ from those held, it takes them by one
+/// compare-exchange against what was held; if the title changed any byte of
+/// it since, it stays the title's whole and what is held takes it.
+///
+/// # Safety
+/// As [`merge`].
+unsafe fn merge_qwords(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let mut out = Merged { there: true, ..Merged::default() };
+    let base = title.addr();
+    let mut at = 0;
+    while at < len {
+        let address = base + at;
+        let lo = address % 8;
+        let n = (8 - lo).min(len - at);
+        // Whole blocks the card left as held go by at once.
+        // SAFETY: inside both.
+        if lo == 0 && len - at >= 32 && !unsafe { differ(now.add(at), held.add(at), 32) } {
+            at += 32;
+            continue;
+        }
+        let mut card = [0u8; 8];
+        for (i, b) in card[..n].iter_mut().enumerate() {
+            // SAFETY: inside `now`, read once (the card may be writing it).
+            *b = unsafe { now.add(at + i).read_volatile() };
+        }
+        let card = &card[..n];
+        // SAFETY: inside `held`, ours.
+        let was = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
+        if *was == *card {
+            at += n;
+            continue;
+        }
+        out.new += 1;
+        // SAFETY: title memory, the caller's; the stretch lies in one page.
+        match unsafe { put_unit(address, lo, n, was, card) } {
+            Some((true, _)) => {
+                out.dwords += n.div_ceil(4) as u64;
+                was.copy_from_slice(card);
+            }
+            Some((false, there)) => {
+                out.kept += 1;
+                was.copy_from_slice(&there[lo..lo + n]);
+            }
+            None => {
+                out.there = false;
+                if take {
+                    was.copy_from_slice(card);
+                }
+            }
+        }
+        at += n;
+    }
+    out
 }
 
 /// [`merge`], untimed.
@@ -424,6 +590,23 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
 /// As [`copy`]'s.
 pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     assert_eq!(was.len(), now.len());
+    if qwords() {
+        // By whole aligned qwords, each against what was read there
+        // ([`qwords`]): one the title wrote since stays the title's.
+        let mut all = true;
+        let mut i = 0;
+        while i < now.len() {
+            let address = dst.addr() + i;
+            let lo = address % 8;
+            let n = (8 - lo).min(now.len() - i);
+            if was[i..i + n] != now[i..i + n] {
+                // SAFETY: the caller's; a qword lies in one page.
+                all &= unsafe { put_unit(address, lo, n, &was[i..i + n], &now[i..i + n]) }.is_some();
+            }
+            i += n;
+        }
+        return all;
+    }
     let n = now.len();
     let head = dst.addr().wrapping_neg() & 3;
     let head = head.min(n);
@@ -493,6 +676,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_changed_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_cas8_at as *const () as usize, victory_safe_cas8_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_cas8_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
     (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
