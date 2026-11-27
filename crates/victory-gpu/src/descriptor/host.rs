@@ -1009,6 +1009,14 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Whether due texture slots are served in turns, one looked at before and
+/// one never looked at ([`TextureQueue::in_order`]; `VICTORY_FAIR_DUE=0`:
+/// not).
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -1119,20 +1127,44 @@ impl TextureQueue {
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
+    ///
+    /// The slots looked at before and the others are served in turns, one
+    /// of each (`VICTORY_FAIR_DUE=0`: all those looked at before first).
+    /// With them first, slots never looked at waited 300 to 1,500 frames
+    /// behind a backlog streaming in a part at a time, and faces read an
+    /// empty slot or an older view. After rorodev6/victory-nvidia-megafork
+    /// 77e13a974a (GPL-3.0).
     fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        if !fair_due() {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order

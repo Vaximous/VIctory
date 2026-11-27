@@ -259,17 +259,24 @@ fn recheck_prints(
 }
 
 /// The longest wait, in milliseconds, between two looks at a texture slot
-/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`, 1000; 0:
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`; 0:
 /// about four seconds counted in passes, as before). The looks back off 1,
 /// 2, 4, ... frames up to it. After Belobug/VIctory-Belobug-AMD 9386b828
 /// (GPL-3.0): counted in passes it came to 13-18 s, long after the memory
 /// had come.
+///
+/// 20,000 unless said (`VICTORY_TEXTURE_LOOK_MS` or `VICTORY_RELOOK_MS`;
+/// 1,000 before): after rorodev6/victory-nvidia-megafork 77e13a974a
+/// (GPL-3.0). The looks at slots waiting for their memory took most of the
+/// pass while slots never looked at waited; the runtime's mappings make a
+/// slot due already (`texture_slots_remapped`).
 fn look_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_LOOK_MS")
+            .or_else(|_| std::env::var("VICTORY_RELOOK_MS"))
             .ok()
-            .map_or(Some(1000), |v| v.trim().parse::<u64>().ok())
+            .map_or(Some(20_000), |v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
     })
 }
@@ -3069,7 +3076,7 @@ impl State {
         // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
         // second; [`look_ms`] counts by the frame's time.)
         let most = match look_ms() {
-            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
+            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 1024),
             None => (4000 / took).clamp(16, 256),
         };
         // What a table entry of a texture a shader samples says.
