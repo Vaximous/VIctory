@@ -2192,6 +2192,8 @@ pub fn title_memory_attributes(at: usize, len: usize, protect: u32) {
     if len == 0 {
         return;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::memcensus::allocated(at, len, protect);
     let (from, to) = (at as u64, (at + len) as u64);
     let mut all = ATTRIBUTES.write().unwrap_or_else(|e| e.into_inner());
     // Write-back is noted only over what was noted otherwise (memory
