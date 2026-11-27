@@ -5884,12 +5884,23 @@ impl Host {
             if warm.is_empty() {
                 self.card_steps(runs)
             } else {
-                std::thread::scope(|scope| {
-                    let beside = scope.spawn(move || warm_up(warm));
+                if beside_kept() {
+                    let beside = run_beside(warm);
                     let own = self.card_steps(runs);
-                    let _ = beside.join();
+                    beside.wait();
                     own
-                })
+                } else {
+                    std::thread::scope(|scope| {
+                        let asked = std::time::Instant::now();
+                        let beside = scope.spawn(move || {
+                            note_beside_start(asked);
+                            warm_up(warm)
+                        });
+                        let own = self.card_steps(runs);
+                        let _ = beside.join();
+                        own
+                    })
+                }
             }
         } else {
             None
@@ -8645,6 +8656,83 @@ fn warm_filter(
         .collect()
 }
 
+/// Whether [`warm_up`] runs on one thread kept for it (`VICTORY_BESIDE_KEPT`,
+/// on; =0 a thread made for each submission that has such refreshes, as
+/// before). Making a thread and ending it costs the submitting thread tens
+/// of microseconds and more each time, and the work beside the steps on the
+/// card begins that much later.
+fn beside_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BESIDE_KEPT").is_none_or(|v| v != "0"))
+}
+
+/// Refreshes run beside the steps on the card, and the microseconds from
+/// asking until the thread that runs them began, summed: for the line.
+static BESIDE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn note_beside_start(asked: std::time::Instant) {
+    BESIDE[0].fetch_add(1, Ordering::Relaxed);
+    BESIDE[1].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+fn beside_line(frames: f64) {
+    let runs = BESIDE[0].swap(0, Ordering::Relaxed);
+    let us = BESIDE[1].swap(0, Ordering::Relaxed);
+    if runs > 0 {
+        tracing::info!(
+            "refreshes beside the steps on the card, per frame: {:.1}, begun {:.1} us after asking on average, {:.2} ms a frame \
+             (VICTORY_BESIDE_KEPT={})",
+            runs as f64 / frames,
+            us as f64 / runs as f64,
+            us as f64 / 1000.0 / frames,
+            u8::from(beside_kept())
+        );
+    }
+}
+
+/// The end of a [`run_beside`].
+struct BesideDone(std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl BesideDone {
+    fn wait(self) {
+        let (done, said) = &*self.0;
+        let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = said.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+type BesideJob = (std::time::Instant, Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, BesideDone);
+
+/// [`warm_up`] of `warm` on the thread kept for it ([`beside_kept`]).
+fn run_beside(warm: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> BesideDone {
+    static TO: OnceLock<Mutex<std::sync::mpsc::Sender<BesideJob>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<BesideJob>();
+        let _ = std::thread::Builder::new().name("victory-beside".into()).spawn(move || {
+            crate::cores::keep_helper_on_fast_cores("victory-beside");
+            for (asked, warm, done) in from {
+                note_beside_start(asked);
+                // The submitting thread waits for `done` whatever happens.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| warm_up(warm)));
+                let (flag, said) = &*done.0;
+                *flag.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                said.notify_all();
+            }
+        });
+        Mutex::new(to)
+    });
+    let state = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let job = (std::time::Instant::now(), warm, BesideDone(state.clone()));
+    if let Err(std::sync::mpsc::SendError((_, warm, done))) = to.lock().unwrap_or_else(|e| e.into_inner()).send(job) {
+        // No kept thread: here, before the steps.
+        warm_up(warm);
+        *done.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    BesideDone(state)
+}
+
 /// [`warm_spans`]'s refreshes, on the calling thread and the wide ones: an
 /// asking of their own, ended when they are done, as a submission's.
 fn warm_up(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
@@ -10108,6 +10196,7 @@ impl Meter {
         heap_sync_first_line(frames);
         send_parts_early_line(frames);
         crate::readprobe::line(frames);
+        beside_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
