@@ -120,6 +120,11 @@ struct Card {
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
     staging: ID3D12Resource,
+    /// Where the CPU's side begins in `staging`: 0, or its place in a
+    /// buffer it shares with others ([`cpu_slot`]).
+    staging_at: u64,
+    /// That place, given back once the card is done with it.
+    _slot: Option<CpuSlot>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -513,6 +518,96 @@ fn copy_made(at: [std::time::Duration; 4], again: bool) {
         frame = crate::frame::current(),
         "title buffers' host copies made in the card's memory since the last line"
     );
+}
+
+/// The CPU's sides of small copies in the card's memory (up to
+/// [`CPU_SLOT`]) as places in a few big buffers in the PC's memory, made,
+/// resident and mapped once each: a copy's is a pop off a list, no call of
+/// the host's. Each such side was a buffer of its own, made and waited
+/// for until mapped, about 0.5-1.5 ms: an area's 3,400 in 2 s at its first
+/// sight (run ow55c). Only the CPU's side: nothing binds it, views it or
+/// keeps it in a state; it is the source of the copies that send what
+/// changed up (from its place, [`Shadow::card_sides`]), and what `data`
+/// maps. `VICTORY_SUBALLOC_COPIES=0`: a buffer of its own, as before.
+fn suballoc_on() -> bool {
+    crate::toggled!("VICTORY_SUBALLOC_COPIES")
+}
+
+/// The bytes of a place ([`cpu_slot`]): a small copy's size, rounded.
+const CPU_SLOT: u64 = 1 << 16;
+
+/// The bytes of a buffer the places are cut from.
+const CPU_BLOCK: u64 = 64 << 20;
+
+/// The buffers ([`cpu_slot`]): each with where it is mapped; the free
+/// places, by buffer and number.
+struct CpuSlots {
+    blocks: Vec<(ID3D12Resource, usize)>,
+    free: Vec<(u32, u32)>,
+}
+// SAFETY: D3D12 buffers (free-threaded) and the addresses of their mappings.
+unsafe impl Send for CpuSlots {}
+
+static CPU_SLOTS: Mutex<CpuSlots> = Mutex::new(CpuSlots { blocks: Vec::new(), free: Vec::new() });
+
+/// Places taken and given back since the start, buffers made.
+static CPU_SLOT_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A place taken ([`cpu_slot`]): given back once every submission
+/// running when its copy goes has finished ([`crate::host::retire`]).
+pub(crate) struct CpuSlot(u32, u32);
+
+impl Drop for CpuSlot {
+    fn drop(&mut self) {
+        crate::host::retire(SlotBack(self.0, self.1));
+    }
+}
+
+/// A place whose copy has gone and whose submissions have run: zeros
+/// again (a new buffer's are), then free.
+struct SlotBack(u32, u32);
+
+impl Drop for SlotBack {
+    fn drop(&mut self) {
+        let mut slots = CPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&(_, data)) = slots.blocks.get(self.0 as usize) else { return };
+        // SAFETY: the place, inside the buffer's mapping; nothing else
+        // writes it now (its copy went, its submissions ran).
+        unsafe { std::ptr::write_bytes((data + self.1 as usize * CPU_SLOT as usize) as *mut u8, 0, CPU_SLOT as usize) };
+        slots.free.push((self.0, self.1));
+        CPU_SLOT_STATS[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A place for the CPU's side of a copy of `size` bytes in the card's
+/// memory ([`suballoc_on`]): its buffer, where it is mapped, its offset in
+/// the buffer, and the place to keep. None if too big, or no buffer.
+fn cpu_slot(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, CpuSlot)> {
+    if !suballoc_on() || size > CPU_SLOT {
+        return None;
+    }
+    let mut slots = CPU_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if slots.free.is_empty() {
+        let (buffer, data) = host()?.shared_buffer(CPU_BLOCK)?;
+        crate::host::name(&buffer, || "title buffers' CPU sides, shared".into());
+        let block = slots.blocks.len() as u32;
+        slots.blocks.push((buffer, data as usize));
+        let n = (CPU_BLOCK / CPU_SLOT) as u32;
+        slots.free.extend((0..n).rev().map(|i| (block, i)));
+        let made = CPU_SLOT_STATS[2].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(
+            buffers = made,
+            mb = made * (CPU_BLOCK >> 20),
+            taken = CPU_SLOT_STATS[0].load(Ordering::Relaxed),
+            given_back = CPU_SLOT_STATS[1].load(Ordering::Relaxed),
+            "a buffer the CPU's sides of small title-buffer copies are cut from (VICTORY_SUBALLOC_COPIES=0: each its own)"
+        );
+    }
+    let (block, i) = slots.free.pop()?;
+    let (buffer, data) = slots.blocks[block as usize].clone();
+    CPU_SLOT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let at = u64::from(i) * CPU_SLOT;
+    Some((buffer, (data + at as usize) as *mut u8, at, CpuSlot(block, i)))
 }
 
 /// [`card_for`] in the card's own memory.
@@ -1172,26 +1267,60 @@ impl Flights {
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
 /// memory): what the card's memory held when it was last looked at;
-/// `title` is title memory as just read. Every byte the card changed
-/// (`now` differs from `held`) goes into `title` and into `held`; every
-/// other byte of both stays as it is, so a byte the title wrote and the
-/// card did not keeps the title's value. Whether `title` changed.
+/// `title` is title memory as just read, from address `at` on. Three
+/// ways, by aligned dword of title memory, as a landing
+/// ([`crate::safecopy::merge`]): a dword the card changed (`now` differs
+/// from `held`) and the title did not (`title` equals `held`) goes into
+/// `title` and into `held`. One both changed keeps the title's bytes, and
+/// `held` stays: the title's are then put into the copy as any other it
+/// wrote (found against `held`), and the card's never land over them.
+/// A partial store of the card's over a pointer the title wrote since was
+/// the 0x18-byte nodes at the ends of its heap's 64 KiB blocks (run ow55).
+/// Every other byte of both stays as it is. Whether `title` changed.
 ///
 /// Nothing is stored into `now`'s source: the card may be writing it for a
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8], at: usize) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    let mut differs = false;
+    let mut kept = 0u64;
+    let mut a = 0;
+    while a < n {
+        // To the next aligned dword of title memory.
+        let b = (a + 4 - (at + a) % 4).min(n);
+        let (now, held, title) = (&now[a..b], &mut held[a..b], &mut title[a..b]);
+        if now != &*held {
+            if title == &*held {
+                differs = true;
+                title.copy_from_slice(now);
+                held.copy_from_slice(now);
+            } else {
+                kept += 1;
+            }
+        }
+        a = b;
     }
-    differs != 0
+    if kept != 0 {
+        let all = RELAY_KEPT[1].fetch_add(kept, Ordering::Relaxed) + kept;
+        let times = RELAY_KEPT[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if times <= 8 || times.is_power_of_two() {
+            tracing::info!(
+                title = format_args!("{at:#x}"),
+                dwords = kept,
+                times,
+                all,
+                "a relay merge left dwords the card changed as the title wrote them since (both wrote)"
+            );
+        }
+    }
+    differs
 }
+
+/// Merges of [`merge_piece`] that left dwords both the card and the title
+/// changed as the title wrote them, and the dwords.
+static RELAY_KEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -1247,8 +1376,9 @@ mod relay_tests {
         assert_eq!(flights.done(&[b]), vec![b]);
     }
 
-    /// The merge moves exactly the bytes the card changed, into title
-    /// memory and into the reference, and stores nothing else.
+    /// The merge moves exactly the dwords the card changed and the title
+    /// did not, into title memory and into the reference, and stores
+    /// nothing else: where both changed one the title's bytes stand.
     #[test]
     fn the_merge_stores_only_what_the_card_changed() {
         let held0: Vec<u8> = (0..200u32).map(|i| (i * 5 + 1) as u8).collect();
@@ -1257,24 +1387,53 @@ mod relay_tests {
             now[at] ^= 0x33;
         }
         // The title wrote other bytes meanwhile, and one the card wrote too.
-        let mut title = held0.clone();
+        let mut title0 = held0.clone();
         for at in [1usize, 5, 100] {
-            title[at] = 0xee;
+            title0[at] = 0xee;
         }
-        let title0 = title.clone();
-        let mut held = held0.clone();
-        assert!(merge_piece(&now, &mut held, &mut title));
-        for at in 0..200 {
-            if now[at] != held0[at] {
-                assert_eq!((title[at], held[at]), (now[at], now[at]), "the card's byte at {at}");
-            } else {
-                assert_eq!((title[at], held[at]), (title0[at], held0[at]), "untouched at {at}");
+        // Title memory from 0x1002 on: dwords [0, 2), [2, 6), [6, 10)...
+        for start in [0x1000usize, 0x1002] {
+            let mut held = held0.clone();
+            let mut title = title0.clone();
+            assert!(merge_piece(&now, &mut held, &mut title, start));
+            for at in 0..200 {
+                let g = (start + at) / 4 * 4;
+                let (a, b) = (g.saturating_sub(start), (g + 4 - start).min(200));
+                let card = (a..b).any(|i| now[i] != held0[i]);
+                let both = card && (a..b).any(|i| title0[i] != held0[i]);
+                if card && !both {
+                    assert_eq!((title[at], held[at]), (now[at], now[at]), "the card's byte at {at} ({start:#x})");
+                } else {
+                    assert_eq!((title[at], held[at]), (title0[at], held0[at]), "untouched at {at} ({start:#x})");
+                }
             }
+            // Bytes 4 and 5 (or 5 alone) the card changed, 5 the title too.
+            assert_eq!(title[5], 0xee);
+            assert_eq!(title[64], now[64]);
+            // Again with nothing new: nothing changes and nothing is reported.
+            let (title1, held1) = (title.clone(), held.clone());
+            assert!(!merge_piece(&now, &mut held, &mut title, start));
+            assert_eq!((title, held), (title1, held1));
         }
-        // Again with nothing new: nothing changes and nothing is reported.
-        let (title1, held1) = (title.clone(), held.clone());
-        assert!(!merge_piece(&now, &mut held, &mut title));
-        assert_eq!((title, held), (title1, held1));
+    }
+
+    /// A node the title wrote since (a pointer, its low dword stale on the
+    /// card side, which wrote the dword beside it): no byte of the card's
+    /// lands in that dword, the card's own dword does.
+    #[test]
+    fn a_pointer_the_title_wrote_since_is_not_cut_by_the_card() {
+        let held0 = [0u8; 16];
+        let mut now = held0;
+        now[0..4].copy_from_slice(&0x1111_2222u32.to_le_bytes());
+        now[8..12].copy_from_slice(&0xdead_0010u32.to_le_bytes());
+        let mut title = held0;
+        title[8..16].copy_from_slice(&0x0000_7ff0_1234_5678u64.to_le_bytes());
+        let mut held = held0;
+        assert!(merge_piece(&now, &mut held, &mut title, 0x2000));
+        assert_eq!(&title[0..4], &0x1111_2222u32.to_le_bytes());
+        assert_eq!(&title[8..16], &0x0000_7ff0_1234_5678u64.to_le_bytes());
+        assert_eq!(&held[0..4], &now[0..4]);
+        assert_eq!(&held[8..16], &held0[8..16], "the title's dword is found against held and put in");
     }
 
     #[test]
@@ -1323,7 +1482,7 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[a.0..a.1].to_vec();
-            assert!(merge_piece(&seen[a.0..a.1], &mut snap[a.0..a.1], &mut t));
+            assert!(merge_piece(&seen[a.0..a.1], &mut snap[a.0..a.1], &mut t, a.0));
             title[a.0..a.1].copy_from_slice(&t);
         }
         assert_eq!(copy, seen, "the merge stores nothing into the copy");
@@ -1353,7 +1512,7 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[b.0..b.1].to_vec();
-            assert!(merge_piece(&seen[b.0..b.1], &mut snap[b.0..b.1], &mut t));
+            assert!(merge_piece(&seen[b.0..b.1], &mut snap[b.0..b.1], &mut t, b.0));
             title[b.0..b.1].copy_from_slice(&t);
         }
         // B's results are there, never replaced by A's older ones.
@@ -1371,7 +1530,7 @@ mod relay_tests {
         assert_eq!(snap[a.0..b.1], title[a.0..b.1]);
         // A third merge finds nothing.
         let mut t = title.clone();
-        assert!(!merge_piece(&copy, &mut snap, &mut t));
+        assert!(!merge_piece(&copy, &mut snap, &mut t, 0));
     }
 
     /// A model of a copy in the card's memory under the relay: `card` is
@@ -1411,7 +1570,7 @@ mod relay_tests {
         let mut changed = false;
         for (a, b) in outside(0, N, skip) {
             let mut t = title[a..b].to_vec();
-            changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t);
+            changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t, a);
             title[a..b].copy_from_slice(&t);
         }
         assert!(changed);
@@ -1428,7 +1587,7 @@ mod relay_tests {
         // been taken for a shader write and put over the title's.
         let mut wrong_title = title.clone();
         let mut wrong_cpu = cpu.clone();
-        merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
+        merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title, 0);
         assert_eq!(wrong_title[30], base[30]);
     }
 }
@@ -2940,7 +3099,7 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
     title.resize(n, 0);
     assert!(crate::host::read_into((start + first) as *const u8, title));
     let was = title.clone();
-    if merge_piece(&gpu[first..=last], &mut held[first..=last], title) {
+    if merge_piece(&gpu[first..=last], &mut held[first..=last], title, start + first) {
         put_changed(start + first, &was, title);
     }
 }
@@ -4358,7 +4517,7 @@ impl Shadow {
             return 0;
         }
         let was = title.clone();
-        if !merge_piece(now, held, title) {
+        if !merge_piece(now, held, title, start + at) {
             return 0;
         }
         put_changed(start + at, &was, title)
@@ -5609,12 +5768,14 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory) and
+    /// where in it the copy begins (not 0 in a shared buffer,
+    /// [`cpu_slot`]), the card side's bytes from before if made yet, and
+    /// their size.
+    pub(crate) fn card_sides(&self) -> Option<((&ID3D12Resource, u64), Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some(((&card.staging, card.staging_at), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5840,7 +6001,7 @@ impl Shadow {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b], start + at + a);
         }
         if !mapped || !changed {
             return 0;
@@ -5861,6 +6022,8 @@ impl Shadow {
         if card {
             shadow.card = Some(Card {
                 staging: none(),
+                staging_at: 0,
+                _slot: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -6018,6 +6181,8 @@ mod land_tests {
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
             staging: buffer,
+            staging_at: 0,
+            _slot: None,
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -6522,13 +6687,24 @@ fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
     {
         return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
     }
-    // (Small ones placed in a block, `crate::pool::buffer`.)
-    let (buffer, data) = match crate::pool::buffer(&host()?.device, size, true) {
-        Some((buffer, data, _)) => (buffer, data),
-        None => host()?.shared_buffer(size)?,
+    // The CPU's side of a small copy in the card's memory: a place in a
+    // buffer shared with others ([`cpu_slot`]); else small ones placed in
+    // a block (`crate::pool::buffer`), or a buffer of its own.
+    let slot = if on_card.is_some() { cpu_slot(size) } else { None };
+    let (buffer, data, staging_at, slot) = match slot {
+        Some((buffer, data, at, slot)) => (buffer, data, at, Some(slot)),
+        None => match crate::pool::buffer(&host()?.device, size, true) {
+            Some((buffer, data, _)) => (buffer, data, 0, None),
+            None => {
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                (buffer, data, 0, None)
+            }
+        },
     };
     let made_at = began.elapsed();
-    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    if slot.is_none() {
+        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    }
     if let Some(on_card) = &on_card {
         crate::host::name(on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
     }
@@ -6539,11 +6715,13 @@ fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
         Some(on_card) => {
             let card = Card {
                 staging: buffer,
+                staging_at,
+                _slot: slot,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
-            touched: Default::default(),
-            me: std::sync::OnceLock::new(),
+                touched: Default::default(),
+                me: std::sync::OnceLock::new(),
                 size,
             };
             (on_card, Some(card))
@@ -6775,6 +6953,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
+        staging_at: 0,
+        _slot: None,
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -6873,6 +7053,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
                 staging: buffer,
+                staging_at: 0,
+                _slot: None,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),

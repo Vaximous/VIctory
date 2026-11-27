@@ -4749,10 +4749,10 @@ impl Host {
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some(((staging, base), _, _)) = side {
                                 for &(a, b) in rs {
                                     cards.push((&shadow.buffer, a as u64));
-                                    ranges.push((staging, a as u64, (b - a) as u64));
+                                    ranges.push((staging, base + a as u64, (b - a) as u64));
                                 }
                             }
                         }
@@ -4762,12 +4762,12 @@ impl Host {
                         });
                     }
                     for (shadow, ranges) in &dirty {
-                        let Some((staging, before, _)) = shadow.card_sides() else {
+                        let Some(((staging, base), before, _)) = shadow.card_sides() else {
                             continue;
                         };
                         if own.is_none() && up.is_none() {
                             for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, base + a as u64, (b - a) as u64);
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();

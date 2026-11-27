@@ -541,13 +541,13 @@ fn look(host: &Host) -> Option<u64> {
             list.SetComputeRootUnorderedAccessView(3, found.GetGPUVirtualAddress());
             let mut bound = 0;
             for (i, (shadow, at, n)) in pieces.iter().enumerate() {
-                let Some((staging, ..)) = shadow.card_sides() else {
+                let Some(((staging, base), ..)) = shadow.card_sides() else {
                     continue;
                 };
                 if bound != shadow.id() {
                     bound = shadow.id();
                     list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                    list.SetComputeRootShaderResourceView(2, staging.GetGPUVirtualAddress());
+                    list.SetComputeRootShaderResourceView(2, staging.GetGPUVirtualAddress() + base);
                 }
                 let at = *at as u32;
                 let constants = [at, (*n / 4) as u32, at, at, (i as u64 * ANSWER) as u32];
