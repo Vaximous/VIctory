@@ -16,7 +16,8 @@
 //! or the stick);
 //! `<us> R` the mouse let go (not captured);
 //! `<us> W` the first frame of the world was shown
-//! (`victory_gpu::frame::world_began`).
+//! (`victory_gpu::frame::world_began`);
+//! `<us> S` the world settled after it (`victory_gpu::frame::world_settled`).
 //!
 //! From version 2 on each time is `<us>:<poll>`, with the count of the title's
 //! keyboard polls by then. Played back, the events before the world are given
@@ -27,6 +28,12 @@
 //! line added by hand plays the part before it by time, held short of the
 //! world until the replay's own is shown. How far each phase drifted is said
 //! in the log.
+//!
+//! The first frame of the world is the title's flyover while it still loads,
+//! and the walk begins only after it, which takes longer in one build than
+//! another. With an `S` line (or `VICTORY_ROUTE_SETTLE_S`, route seconds) the
+//! events after it are given by the time since the replay's own world
+//! settled, the ones between the world and it held short of it as before.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,20 +56,33 @@ fn now_us() -> u64 {
 static POLLS: AtomicU64 = AtomicU64::new(0);
 
 /// The title polls its keyboard: counted, and when recording, the first
-/// frame of the world is noted once it was shown.
+/// frame of the world and its settling are noted once they happened.
 pub(super) fn polled() {
     POLLS.fetch_add(1, Ordering::Relaxed);
     static NOTED: AtomicBool = AtomicBool::new(false);
-    if NOTED.load(Ordering::Relaxed) {
+    static SETTLE_NOTED: AtomicBool = AtomicBool::new(false);
+    if SETTLE_NOTED.load(Ordering::Relaxed) {
         return;
     }
-    let (Some(rec), Some(world)) = (recorder(), victory_gpu::frame::world_began()) else { return };
-    if NOTED.swap(true, Ordering::Relaxed) {
+    let Some(rec) = recorder() else { return };
+    if !NOTED.load(Ordering::Relaxed) {
+        let Some(world) = victory_gpu::frame::world_began() else { return };
+        if NOTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let us = world.saturating_duration_since(zero()).as_micros() as u64;
+        let mut rec = rec.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(rec.out, "{us}:{} W", POLLS.load(Ordering::Relaxed));
+        let _ = rec.out.flush();
+    }
+    let Some(settled) = victory_gpu::frame::world_settled() else { return };
+    if SETTLE_NOTED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let us = world.saturating_duration_since(zero()).as_micros() as u64;
+    // Without a poll count: an older reader takes it as a time alone.
+    let us = settled.saturating_duration_since(zero()).as_micros() as u64;
     let mut rec = rec.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(rec.out, "{us}:{} W", POLLS.load(Ordering::Relaxed));
+    let _ = writeln!(rec.out, "{us} S");
     let _ = rec.out.flush();
 }
 
@@ -184,6 +204,9 @@ struct Route {
     end: u64,
     /// When the world's first frame was shown, if the file says.
     world: Option<u64>,
+    /// When the world settled after it, if the file (or
+    /// `VICTORY_ROUTE_SETTLE_S`) says.
+    settle: Option<u64>,
     /// Of events before the world that have a poll count: the count and the
     /// time, in order.
     polls: Vec<(u64, u64)>,
@@ -197,6 +220,7 @@ fn parse(text: &str) -> Route {
         mouse_at: Mutex::new(0),
         end: 0,
         world: None,
+        settle: None,
         polls: Vec::new(),
     };
     let mut polls = Vec::new();
@@ -212,11 +236,13 @@ fn parse(text: &str) -> Route {
         let kind = words.next();
         if let Some(poll) = poll
             && kind != Some("W")
+            && kind != Some("S")
         {
             polls.push((poll, us));
         }
         match kind {
             Some("W") => route.world = route.world.or(Some(us)),
+            Some("S") => route.settle = route.settle.or(Some(us)),
             Some("K") => {
                 let keys = match words.next() {
                     Some("-") | None => Vec::new(),
@@ -280,7 +306,21 @@ fn clock(route: &Route) -> u64 {
                 "route: the world's first frame; from here the route plays by the time since it"
             );
         });
-        return world + now.saturating_sub(here);
+        let by_world = world + now.saturating_sub(here);
+        let Some(settle) = route.settle.filter(|&s| s > world) else { return by_world };
+        let Some(settled) = victory_gpu::frame::world_settled() else { return by_world.min(settle - 1) };
+        let there = settled.saturating_duration_since(zero()).as_micros() as u64;
+        static SHIFT: std::sync::Once = std::sync::Once::new();
+        SHIFT.call_once(|| {
+            let (route_after, replay_after) = (settle - world, there.saturating_sub(here));
+            tracing::info!(
+                route_after_world_ms = route_after / 1000,
+                replay_after_world_ms = replay_after / 1000,
+                shift_ms = (replay_after as i64 - route_after as i64) / 1000,
+                "route: the world settled; from here the route plays by the time since it, its walk moved by the shift"
+            );
+        });
+        return settle + now.saturating_sub(there);
     }
     let at = if route.polls.is_empty() {
         now
@@ -311,13 +351,17 @@ fn replay() -> Option<&'static Route> {
             let path = std::env::var_os("VICTORY_INPUT_REPLAY")?;
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    let route = parse(&text);
+                    let mut route = parse(&text);
+                    if let Some(s) = std::env::var("VICTORY_ROUTE_SETTLE_S").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+                        route.settle = Some((s * 1e6) as u64);
+                    }
                     tracing::info!(
                         path = %std::path::Path::new(&path).display(),
                         keys = route.keys.len(),
                         mouse = route.mouse.len(),
                         seconds = route.end as f64 / 1e6,
                         world_s = route.world.map(|w| w as f64 / 1e6),
+                        settle_s = route.settle.map(|s| s as f64 / 1e6),
                         by_polls = route.polls.len(),
                         "a route is played back (VICTORY_INPUT_REPLAY); live input is left out"
                     );

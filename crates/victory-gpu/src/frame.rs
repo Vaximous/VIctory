@@ -94,12 +94,52 @@ pub fn world_began() -> Option<Instant> {
 
 static WORLD: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// When the world settled after its first frame: the first moment its frames
+/// had all come within `VICTORY_SETTLE_MS` (80) of each other for
+/// `VICTORY_SETTLE_S` (2) running. The first frame of the world is the
+/// title's flyover while it is still loading; how long that takes differs
+/// from build to build, and the player has the walk only after it. Input
+/// routes time their walk from here.
+pub fn world_settled() -> Option<Instant> {
+    SETTLED.get().copied()
+}
+
+static SETTLED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// After the world's first frame: the last frame shown and where the
+/// current run of quick frames began.
+fn settling(now: Instant) {
+    static RUN: Mutex<Option<(Instant, Instant)>> = Mutex::new(None);
+    static LIMITS: std::sync::OnceLock<(std::time::Duration, std::time::Duration)> = std::sync::OnceLock::new();
+    let (gap, run_for) = *LIMITS.get_or_init(|| {
+        let f = |name: &str, default: f64| std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default);
+        (std::time::Duration::from_secs_f64(f("VICTORY_SETTLE_MS", 80.0) / 1000.0), std::time::Duration::from_secs_f64(f("VICTORY_SETTLE_S", 2.0)))
+    });
+    let mut run = RUN.lock().unwrap_or_else(|e| e.into_inner());
+    let (last, began) = match *run {
+        Some((last, began)) if now.saturating_duration_since(last) <= gap => (now, began),
+        _ => (now, now),
+    };
+    *run = Some((last, began));
+    if now.saturating_duration_since(began) >= run_for && SETTLED.set(now).is_ok() {
+        let world = WORLD.get().copied().unwrap_or(now);
+        tracing::info!(
+            frame = current(),
+            after_world_ms = now.saturating_duration_since(world).as_millis() as u64,
+            "the world settled: its frames came quickly for long enough (VICTORY_SETTLE_MS, VICTORY_SETTLE_S)"
+        );
+    }
+}
+
 /// A frame was shown; `drawn` is the count of draws so far.
 pub(crate) fn shown(drawn: u64) {
     static BEFORE: AtomicU64 = AtomicU64::new(0);
     static AT_LEAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let before = BEFORE.swap(drawn, Ordering::Relaxed);
     if WORLD.get().is_some() {
+        if SETTLED.get().is_none() {
+            settling(Instant::now());
+        }
         return;
     }
     let at_least = *AT_LEAST.get_or_init(|| {
