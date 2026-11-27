@@ -600,7 +600,15 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    let put = unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) };
+    if !copy.is_null()
+        && crate::readprobe::every() != 0
+        && let (Some(from), Some(to)) = (parts.first(), parts.last())
+    {
+        // SAFETY: the caller's copy.
+        crate::readprobe::landed(unsafe { (*copy).span() }, title + from.0, title + to.1);
+    }
+    put
 }
 
 /// [`piece`], and whether a view of ours is looked for.

@@ -10107,6 +10107,7 @@ impl Meter {
         split_line(frames);
         heap_sync_first_line(frames);
         send_parts_early_line(frames);
+        crate::readprobe::line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
