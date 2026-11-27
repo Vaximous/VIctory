@@ -96,6 +96,41 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// and store). Not where a group barrier would wait for lanes that left, nor
 /// where two host waves of 32 stand for a console wave (they exchange, which
 /// takes all lanes).
+/// `VICTORY_FINITE_COLOUR` (default 1; 0 off): a pixel program's float colour outputs
+/// are made finite before the target gets them (NaN 0, an infinity the largest half).
+/// Against the black blots under water (most likely such texels, spread by the blurs
+/// after them and turned to NaN by tone mapping). A few operations a channel.
+fn finite_colour() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FINITE_COLOUR").as_deref().map(str::trim) != Ok("0"))
+}
+
+/// `VICTORY_CHEAP_FLOAT`: a set of [`super::rdna`]'s bits (decimal or `0x` hex) written
+/// on every host as on RDNA ([`host_rdna`]); by default `LEGACY | MAX_MIN | MED3`, `0`
+/// none. Of these only a zero's sign may differ from the console (`0 × -3` +0 there,
+/// -0 here; the maximum of -0 and +0 either). Spelled out exactly, a legacy product
+/// takes two comparisons, an or and a select more, a maximum or minimum six operations
+/// more, a clamp between constants nine: in the heaviest mesh program of the open
+/// world (adc5c689) some 1,250 products, a fifth of its operations. `FRACT` (the
+/// host's fraction can reach 1.0) stays exact unless asked for. None in this crate's
+/// own tests, which check the exact forms.
+fn cheap_float() -> u32 {
+    use super::rdna::{ALL, LEGACY, MAX_MIN, MED3};
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return 0;
+    }
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_CHEAP_FLOAT").ok();
+        super::parse_set(value.as_deref(), LEGACY | MAX_MIN | MED3, ALL)
+    })
+}
+
+/// The [`super::rdna`] bits written the host's own way: [`host_rdna`]'s and [`cheap_float`]'s.
+fn host_float() -> u32 {
+    host_rdna() | cheap_float()
+}
+
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -1204,7 +1239,7 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_float()]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3856,7 +3891,7 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        if host_float() & super::rdna::MAX_MIN != 0 {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -3881,6 +3916,26 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    /// `f` made finite for a colour target ([`finite_colour`]): NaN 0, an infinity the
+    /// largest half of its sign; finite values as they are.
+    fn finite(&mut self, f: V) -> V {
+        let c = self.cur;
+        let (inf, big, small, zero) = (
+            self.s.m.f32(f32::INFINITY.to_bits()),
+            self.s.m.f32(65504f32.to_bits()),
+            self.s.m.f32((-65504f32).to_bits()),
+            self.s.m.f32(0),
+        );
+        let size = self.unary(6, f);
+        // Ordered: false for NaN as for the infinities.
+        let finite = self.s.m.cmp(c, pred::OLT, size, inf);
+        let up = self.s.m.cmp(c, pred::OGT, f, zero);
+        let edge = self.s.m.select(c, up, big, small);
+        let number = self.s.m.cmp(c, pred::ORD, f, f);
+        let edge = self.s.m.select(c, number, edge, zero);
+        self.s.m.select(c, finite, f, edge)
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -3993,7 +4048,7 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
+        if host_float() & super::rdna::MED3 != 0 {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
             let ordered = match k {
                 [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
@@ -4033,7 +4088,7 @@ impl<'a> Lower<'a> {
     fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
         let c = self.cur;
         let r = self.unary(22, a);
-        if host_rdna() & super::rdna::FRACT != 0 && below_one == f32::from_bits(0x3F7F_FFFF) {
+        if host_float() & super::rdna::FRACT != 0 && below_one == f32::from_bits(0x3F7F_FFFF) {
             return r;
         }
         let limit = self.s.m.f32(threshold.to_bits());
@@ -4085,7 +4140,7 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
-        if host_rdna() & super::rdna::LEGACY != 0 {
+        if host_float() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
             // A product is not 0 only where one factor is 0 and the other an
@@ -12898,6 +12953,12 @@ impl<'a> Lower<'a> {
                     (".f32", f)
                 }
                 _ => (".i32", x),
+            };
+            let colour = elements(self, primitive)[id].kind == 16;
+            let x = if suffix == ".f32" && colour && self.s.pixel && finite_colour() {
+                self.finite(x)
+            } else {
+                x
             };
             let mut args = vec![
                 self.s.m.i32(id as u32),
