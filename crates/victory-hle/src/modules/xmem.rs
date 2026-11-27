@@ -2054,6 +2054,7 @@ fn map_own(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bo
     shown_mut().note(base, len, &slice);
     // New contents, read-write, private: the GPU side asks the kernel.
     victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_memory_watched(base, len, true);
     physical.private.insert(base, (len, slice));
     let runs = OWNED[0].fetch_add(1, Ordering::Relaxed) + 1;
     OWNED[1].fetch_add(len as u64, Ordering::Relaxed);
@@ -2085,6 +2086,7 @@ fn unown(physical: &mut Physical, base: usize) {
         slice.section.any_private.store(!runs.is_empty(), Ordering::Release);
     }
     shown_mut().forget(base, len, &slice);
+    victory_gpu::title_memory_watched(base, len, false);
     victory_gpu::title_memory_unmapping(base, len);
     let mut was = 0;
     // SAFETY: our private allocation, whole.

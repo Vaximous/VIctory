@@ -831,6 +831,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let pieces = ask_watched(pieces, &mut asked, &mut written);
     let mut groups: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
@@ -1245,11 +1246,123 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
     crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
 }
 
+/// The runs of physical pages the runtime made write-watched private
+/// memory (`victory-hle` xmem): first page to end page.
+static WATCHED: RwLock<BTreeMap<usize, usize>> = RwLock::new(BTreeMap::new());
+
+/// The frame whose first submission walked the [`WATCHED`] runs, plus 1 (0:
+/// none yet).
+static WALKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime made `[at, at + len)` write-watched private memory in place
+/// of a view of physical pages (`watched`), or is about to give it back.
+pub fn title_memory_watched(at: usize, len: usize, watched: bool) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut w = WATCHED.write().unwrap_or_else(|e| e.into_inner());
+    if watched {
+        w.insert(first, last);
+    } else {
+        w.retain(|&a, &mut b| b <= first || last <= a);
+    }
+}
+
+/// Whether the heap's runs are walked once a frame (`VICTORY_WATCH_ONCE`,
+/// on unless `=0`; with [`watch_not_guard`]).
+///
+/// Every submission asked the kernel about the ranges it refreshes, joined
+/// across gaps of up to 8 MiB: the title's heap was walked page by page some
+/// 14 times a frame, 5.7 GB asked about, 28 ms a frame of the submitting
+/// thread (run ow53-move). Now the first submission of a frame walks each
+/// run once (about 0.5 ms for the 185 MB), the journal noting what it found;
+/// the frame's later submissions ask only about the ranges they refresh in
+/// the runs, exactly (joined where they meet, no further), for what was
+/// written since. Nothing is lost: the kernel forgets only what it was asked
+/// about, and the journal keeps what each asking found, so a page written
+/// after the walk that no later submission covers is found by the next
+/// frame's walk, and its copies are older than that.
+fn watch_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| watch_not_guard() && std::env::var_os("VICTORY_WATCH_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// With [`watch_once`]: asks about the `pieces` (page ranges, in order) of a
+/// submission's asking that lie in a [`WATCHED`] run, walking the runs first
+/// if this is the frame's first such asking; adds what was asked to `asked`
+/// and what was found written to `written`. The other pieces, for the
+/// asking as before.
+fn ask_watched(
+    pieces: Vec<(usize, usize)>,
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+) -> Vec<(usize, usize)> {
+    if !watch_once() {
+        return pieces;
+    }
+    let runs: Vec<(usize, usize)> = {
+        let w = WATCHED.read().unwrap_or_else(|e| e.into_inner());
+        if w.is_empty() {
+            return pieces;
+        }
+        w.iter().map(|(&a, &b)| (a, b)).collect()
+    };
+    let run_of = |p: &(usize, usize)| {
+        let i = runs.partition_point(|r| r.0 <= p.0);
+        (i > 0 && p.1 <= runs[i - 1].1).then(|| runs[i - 1])
+    };
+    let (inside, rest): (Vec<(usize, usize)>, Vec<(usize, usize)>) = pieces.into_iter().partition(|p| run_of(p).is_some());
+    if inside.is_empty() {
+        return rest;
+    }
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let frame = crate::queue::presented() + 1;
+    let walk = WALKED.swap(frame, std::sync::atomic::Ordering::Relaxed) != frame;
+    let mut walked = Vec::new();
+    if walk {
+        for &(a, b) in &runs {
+            if let Some(pages) = kernel_written(a, b) {
+                written.extend(pages);
+                asked.push((a, b));
+                walked.push((a, b));
+            }
+        }
+        port6_count(P6_WALKS, 1);
+        port6_count(P6_WALK_PAGES, runs.iter().map(|r| (r.1 - r.0) as u64).sum());
+        #[cfg(feature = "diagnostics")]
+        port6_count(P6_WALK_NS, began.elapsed().as_nanos() as u64);
+    }
+    // The pieces the walk did not take, joined where they meet.
+    let mut exact: Vec<(usize, usize)> = Vec::new();
+    for p in inside {
+        if walked.iter().any(|w| w.0 <= p.0 && p.1 <= w.1) {
+            continue;
+        }
+        match exact.last_mut() {
+            Some(last) if p.0 <= last.1 => last.1 = last.1.max(p.1),
+            _ => exact.push(p),
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let exactly = std::time::Instant::now();
+    for (a, b) in exact {
+        port6_count(P6_EXACT_ASKS, 1);
+        port6_count(P6_EXACT_PAGES, (b - a) as u64);
+        // Refused (given back to a view meanwhile): left to `writes`.
+        if let Some(pages) = kernel_written(a, b) {
+            written.extend(pages);
+            asked.push((a, b));
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    port6_count(P6_EXACT_NS, exactly.elapsed().as_nanos() as u64);
+    rest
+}
+
 /// The pages of a piece of a submission's asking spread over threads
 /// ([`ask_wide`]): 16 MiB.
 const WIDE_PIECE: usize = (16 << 20) / PAGE;
 
-/// With [`watch_not_guard`] (`VICTORY_ASK_WIDE=0`: never): a submission's
+/// With [`watch_not_guard`] and `VICTORY_ASK_WIDE=1`: a submission's
 /// asking of the `groups` of `pieces` ([`ask_ahead`]) cut into pieces of
 /// [`WIDE_PIECE`] and asked on the kept threads and this one, when it spans
 /// more than two of them. A kernel asking costs some 1.4 microseconds a
@@ -1258,6 +1371,10 @@ const WIDE_PIECE: usize = (16 << 20) / PAGE;
 /// 8 to 10 ms (session play-1125-0203). A piece the kernel refuses is asked
 /// as [`ask_run`] would, its pieces cut to it. What was asked goes to
 /// `asked` joined where pieces meet; false if not spread (nothing done).
+///
+/// Off unless `=1`: in run ow53-move the threads' askings added up to the
+/// submitting thread's wait for them (23.8 ms a frame against 28.4): the
+/// kernel answers one at a time.
 fn ask_wide(
     pieces: &[(usize, usize)],
     groups: &[(usize, usize)],
@@ -1265,7 +1382,7 @@ fn ask_wide(
     written: &mut Vec<(usize, u16)>,
 ) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| watch_not_guard() && std::env::var_os("VICTORY_ASK_WIDE").is_none_or(|v| v != "0")) {
+    if !*ON.get_or_init(|| watch_not_guard() && std::env::var_os("VICTORY_ASK_WIDE").is_some_and(|v| v == "1")) {
         return false;
     }
     let span = |&(i, k): &(usize, usize)| pieces[i..k].iter().map(|p| p.1).max().unwrap_or(pieces[i].0) - pieces[i].0;
@@ -1756,7 +1873,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
+static PORT6: [std::sync::atomic::AtomicU64; 28] = [const { std::sync::atomic::AtomicU64::new(0) }; 28];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1790,6 +1907,15 @@ const P6_ASKED_BY_REGIONS: usize = 18;
 const P6_REGIONS: usize = 19;
 const P6_WIDE_ASKS: usize = 20;
 const P6_WIDE_PIECES: usize = 21;
+/// [`watch_once`]: walks of the watched runs, their 64 KiB pages and
+/// nanoseconds; later submissions' exact askings, their pages and
+/// nanoseconds.
+const P6_WALKS: usize = 22;
+const P6_WALK_PAGES: usize = 23;
+const P6_WALK_NS: usize = 24;
+const P6_EXACT_ASKS: usize = 25;
+const P6_EXACT_PAGES: usize = 26;
+const P6_EXACT_NS: usize = 27;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1971,7 +2097,8 @@ pub(crate) fn port_guard_line(frames: f64) {
          parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK); \
          the faults held the lock shared {:.2} ms, {:.2} of it waiting for claims, {:.2} for the open parts' map (VICTORY_PARTS_APART); \
          of the claims waited for, {:.2} ms a refresh's guarding held, {:.2} others' (VICTORY_CLAIMS_PER_RUN); \
-         askings by regions {:.1} ({:.1} regions), submissions' askings spread over threads {:.1} ({:.1} pieces) (VICTORY_WATCH_NOT_GUARD)",
+         askings by regions {:.1} ({:.1} regions), submissions' askings spread over threads {:.1} ({:.1} pieces) (VICTORY_WATCH_NOT_GUARD); \
+         walks of the watched runs {:.1}, {:.0} MB, {:.2} ms; later submissions' exact askings in them {:.1}, {:.0} MB, {:.2} ms (VICTORY_WATCH_ONCE)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1994,6 +2121,12 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_REGIONS],
         n[P6_WIDE_ASKS],
         n[P6_WIDE_PIECES],
+        n[P6_WALKS],
+        n[P6_WALK_PAGES] * PAGE as f64 / 1e6,
+        n[P6_WALK_NS] / 1e6,
+        n[P6_EXACT_ASKS],
+        n[P6_EXACT_PAGES] * PAGE as f64 / 1e6,
+        n[P6_EXACT_NS] / 1e6,
     );
     #[cfg(feature = "diagnostics")]
     asked_by_thread_line(frames);
