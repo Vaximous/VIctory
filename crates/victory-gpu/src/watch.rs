@@ -1517,7 +1517,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static PORT6: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1531,6 +1531,10 @@ const P6_HOT: usize = 7;
 const P6_PARTS: usize = 8;
 const P6_PARTS_WHOLE: usize = 9;
 const P6_PARTS_TOLD: usize = 10;
+/// [`remap_look`]: the title's mappings looked at with the lock shared, and
+/// those over noted blocks (the lock taken alone).
+const P6_REMAPS_LOOKED: usize = 11;
+const P6_REMAPS_ALONE: usize = 12;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1546,7 +1550,7 @@ pub(crate) fn port_guard_line(frames: f64) {
         "renderer port 6 (VICTORY_PORT_GUARD=1) per frame: faults opened under the shared lock {:.1} ({:.2} ms waiting for it), \
          refreshes' guards done shared {:.1}, blocks left written for want of their claim {:.1}, spins for claims {:.0}; \
          blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}; \
-         parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS)",
+         parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1558,6 +1562,8 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_PARTS],
         n[P6_PARTS_WHOLE],
         n[P6_PARTS_TOLD],
+        n[P6_REMAPS_LOOKED],
+        n[P6_REMAPS_ALONE],
     );
 }
 
@@ -4210,7 +4216,43 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    if remap_look() && nothing_noted(at, len) {
+        // What the guards' lock alone would have changed: nothing.
+        title_memory_changed_elsewhere(at, len);
+        port6_count(P6_REMAPS_LOOKED, 1);
+        return;
+    }
+    port6_count(P6_REMAPS_ALONE, 1);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
+}
+
+/// Whether a mapping the runtime made over title memory that the guards
+/// note nothing of takes the guards' lock shared only, to look
+/// (`VICTORY_REMAP_LOOK`, on unless `=0`). In run ow43-move the title's
+/// mappings took it alone some 70 times a frame, nearly always over blocks
+/// with nothing noted; each time the faults queued behind them (the faults
+/// waited 4-9 ms a frame for the lock shared).
+fn remap_look() -> bool {
+    crate::toggled!("VICTORY_REMAP_LOOK")
+}
+
+/// Whether the guards note nothing of `[at, at + len)`: no block guarded,
+/// clean, absent, held, foreign or aliased, and none being made read-only.
+/// A refresh that guarded a block there before we were told of the mapping
+/// held the lock, which this waits for, and is seen.
+fn nothing_noted(at: usize, len: usize) -> bool {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if first >= last {
+        return true;
+    }
+    let g = guards_shared();
+    !TAKING_BLOCKS.any(first, last)
+        && g.protected.range(first..last).next().is_none()
+        && g.clean.range(first..last).next().is_none()
+        && g.absent.range(first..last).next().is_none()
+        && g.held.range(first..last).next().is_none()
+        && g.aliased.range(first..last).next().is_none()
+        && g.foreign.range(first..last).next().is_none()
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
@@ -4319,13 +4361,7 @@ fn forget_views(first: usize, last: usize) {
 /// block of the range known unmapped.
 #[track_caller]
 fn title_memory_changed(at: usize, len: usize) -> GuardsW {
-    // A placed texture there arrives, goes or changes with no descriptor
-    // written.
-    crate::descriptor::host::remapped(at, len);
-    // The views the runtime told us of there are no longer what it shows.
-    crate::inplace::views_gone(at, len);
-    // And nothing stays in place over it.
-    crate::inplace::title_memory_freeing(at, len);
+    title_memory_changed_elsewhere(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
@@ -4344,6 +4380,17 @@ fn title_memory_changed(at: usize, len: usize) -> GuardsW {
         g.aliased.remove(block);
     }
     g
+}
+
+/// What [`title_memory_changed`] tells others than the guards.
+fn title_memory_changed_elsewhere(at: usize, len: usize) {
+    // A placed texture there arrives, goes or changes with no descriptor
+    // written.
+    crate::descriptor::host::remapped(at, len);
+    // The views the runtime told us of there are no longer what it shows.
+    crate::inplace::views_gone(at, len);
+    // And nothing stays in place over it.
+    crate::inplace::title_memory_freeing(at, len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
