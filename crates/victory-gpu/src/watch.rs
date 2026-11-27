@@ -1517,7 +1517,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static PORT6: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1535,6 +1535,11 @@ const P6_PARTS_TOLD: usize = 10;
 /// those over noted blocks (the lock taken alone).
 const P6_REMAPS_LOOKED: usize = 11;
 const P6_REMAPS_ALONE: usize = 12;
+/// Nanoseconds the faults held the guards' lock shared (from taking it to
+/// done), of them waiting for claims, and waiting for [`PARTS_OPEN`].
+const P6_FAULT_HOLD_NS: usize = 13;
+const P6_FAULT_CLAIM_NS: usize = 14;
+const P6_PARTS_LOCK_NS: usize = 15;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1550,7 +1555,8 @@ pub(crate) fn port_guard_line(frames: f64) {
         "renderer port 6 (VICTORY_PORT_GUARD=1) per frame: faults opened under the shared lock {:.1} ({:.2} ms waiting for it), \
          refreshes' guards done shared {:.1}, blocks left written for want of their claim {:.1}, spins for claims {:.0}; \
          blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}; \
-         parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK)",
+         parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK); \
+         the faults held the lock shared {:.2} ms, {:.2} of it waiting for claims, {:.2} for the open parts' map (VICTORY_PARTS_APART)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1564,6 +1570,9 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_PARTS_TOLD],
         n[P6_REMAPS_LOOKED],
         n[P6_REMAPS_ALONE],
+        n[P6_FAULT_HOLD_NS] / 1e6,
+        n[P6_FAULT_CLAIM_NS] / 1e6,
+        n[P6_PARTS_LOCK_NS] / 1e6,
     );
 }
 
@@ -1890,7 +1899,8 @@ fn open_faulted(at: usize, part: bool) -> (usize, std::time::Duration) {
         return (opened, waited);
     }
     let g = guards_shared();
-    let waited = began.elapsed();
+    let held = std::time::Instant::now();
+    let waited = held - began;
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
     let opened = open_claimed(&g, block, true, part.then_some(at));
     if opened != 0 {
@@ -1899,6 +1909,8 @@ fn open_faulted(at: usize, part: bool) -> (usize, std::time::Duration) {
         }
         port6_count(P6_FAULTS, 1);
     }
+    drop(g);
+    port6_count(P6_FAULT_HOLD_NS, held.elapsed().as_nanos() as u64);
     (opened.min(1), waited)
 }
 
@@ -1915,7 +1927,11 @@ fn open_claimed(g: &Guards, block: usize, fault: bool, part: Option<usize>) -> u
     let at = block * BLOCK;
     let mut views: Vec<usize> = vec![block];
     loop {
+        let claiming = std::time::Instant::now();
         let _claims = Claims::wait_for(&views);
+        if fault {
+            port6_count(P6_FAULT_CLAIM_NS, claiming.elapsed().as_nanos() as u64);
+        }
         if !g.protected.contains(block) && (fault || !g.aliased.contains(block)) {
             return 0;
         }
@@ -2015,8 +2031,7 @@ fn open_part(g: &Guards, block: usize, wrote: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let part = wrote % BLOCK / KERNEL_PAGE;
     let bit = 1u16 << part;
-    let mut open = PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner());
-    let had = open.get(&block).copied().unwrap_or(0);
+    let had = parts_open_locked(|open| open.get(&block).copied().unwrap_or(0));
     if had & bit != 0 {
         return Some(0);
     }
@@ -2028,15 +2043,45 @@ fn open_part(g: &Guards, block: usize, wrote: usize) -> Option<usize> {
     g.clean.remove(block);
     PUBLISHED.clear(block);
     let mut old = 0;
+    // The map's lock is not held over the change (`VICTORY_PARTS_APART`):
+    // the block's claim keeps its entry as read, and the faults of other
+    // blocks' parts go on meanwhile instead of queuing behind the kernel.
+    let held = (!parts_apart()).then(|| PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner()));
     // SAFETY: a block we made read-only; one 4 KiB page of it.
     let done = unsafe { VirtualProtect((block * BLOCK + part * KERNEL_PAGE) as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } != 0;
     if !done {
         return None;
     }
-    open.insert(block, had | bit);
+    match held {
+        Some(mut open) => *open.entry(block).or_default() |= bit,
+        None => parts_open_locked(|open| *open.entry(block).or_default() |= bit),
+    }
     PARTS_ANY.store(true, std::sync::atomic::Ordering::Release);
     port6_count(P6_PARTS, 1);
     Some(PART_OPENED)
+}
+
+/// `f` on [`PARTS_OPEN`], its lock's wait counted.
+fn parts_open_locked<T>(f: impl FnOnce(&mut BTreeMap<usize, u16>) -> T) -> T {
+    let mut open = match PARTS_OPEN.try_lock() {
+        Ok(open) => open,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let began = std::time::Instant::now();
+            let open = PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+            port6_count(P6_PARTS_LOCK_NS, began.elapsed().as_nanos() as u64);
+            open
+        }
+    };
+    f(&mut open)
+}
+
+/// Whether [`open_part`] lets go of [`PARTS_OPEN`] over its `VirtualProtect`
+/// (`VICTORY_PARTS_APART`, on unless `=0`). Held over it, every part a fault
+/// opened anywhere waited for the one before it, the kernel's change
+/// included: some 530 a frame in run ow44-move, on the title's threads.
+fn parts_apart() -> bool {
+    crate::toggled!("VICTORY_PARTS_APART")
 }
 
 /// With `block`'s claim held: makes it read-only whole again, if parts of
