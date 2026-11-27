@@ -40,6 +40,9 @@ pub struct Camera {
     /// each moves by the same amount as `yaw` / `pitch`.
     pub yaw_copies: Vec<Vec<u64>>,
     pub pitch_copies: Vec<Vec<u64>>,
+    /// A chain to three floats of position (the camera's or the player's),
+    /// logged with the heading once a route second; none: not logged.
+    pub position: Vec<u64>,
 }
 
 struct Cameras {
@@ -81,7 +84,52 @@ fn note_heading(found: impl FnOnce() -> Option<(f32, f32)>) {
         Some((yaw, pitch)) => tracing::info!(route_s = s, yaw, pitch, ?turned, ?dropped, "route camera"),
         None => tracing::info!(route_s = s, ?turned, ?dropped, "route camera: none found"),
     }
+    #[cfg(windows)]
+    if let Some(cameras) = CAMERAS.get() {
+        note_position(&host::Own, cameras.base, &cameras.list, s);
+    }
 }
+
+/// Once a route second (diagnostics builds): the first found camera's
+/// position, where the camera file names a chain to it; and with
+/// `VICTORY_ROUTE_CAMERA_DUMP=1` its object's first [`DUMP_BYTES`] as the
+/// floats among them that could be coordinates (finite, 1 to 100,000 in
+/// size), `offset=value`, to find which of them move as the player walks.
+#[cfg(feature = "diagnostics")]
+fn note_position(memory: &impl Memory, base: u64, list: &[Camera], s: u64) {
+    let Some(camera) = list.iter().find(|c| present(memory, base, c)) else { return };
+    if !camera.position.is_empty()
+        && let Some(at) = resolve(memory, base, &camera.position)
+    {
+        let mut b = [0u8; 12];
+        if memory.read(at, &mut b) {
+            let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            tracing::info!(route_s = s, x = f(0), y = f(4), z = f(8), "route position");
+        }
+    }
+    static DUMP: OnceLock<bool> = OnceLock::new();
+    if !*DUMP.get_or_init(|| std::env::var_os("VICTORY_ROUTE_CAMERA_DUMP").is_some_and(|v| v == "1")) || camera.object.is_empty() {
+        return;
+    }
+    let Some(at) = resolve(memory, base, &camera.object) else { return };
+    let mut b = vec![0u8; DUMP_BYTES];
+    if !memory.read(at, &mut b) {
+        return;
+    }
+    let mut out = String::new();
+    for (i, w) in b.chunks_exact(4).enumerate() {
+        let v = f32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        if v.is_finite() && (1.0..100_000.0).contains(&v.abs()) {
+            use std::fmt::Write;
+            let _ = write!(out, " {:x}={}", i * 4, v);
+        }
+    }
+    tracing::info!(route_s = s, floats = %out, "route camera dump");
+}
+
+/// The bytes of the camera object [`note_position`] dumps.
+#[cfg(feature = "diagnostics")]
+const DUMP_BYTES: usize = 0x2000;
 
 /// The first found camera's yaw and pitch now.
 fn heading(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<(f32, f32)> {
@@ -564,6 +612,7 @@ mod tests {
             kind: None,
             yaw_copies: Vec::new(),
             pitch_copies: Vec::new(),
+            position: Vec::new(),
         }
     }
 

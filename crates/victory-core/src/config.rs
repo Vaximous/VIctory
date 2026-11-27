@@ -129,6 +129,10 @@ pub struct CameraHook {
     pub yaw_copies: Vec<Vec<u64>>,
     #[serde(default)]
     pub pitch_copies: Vec<Vec<u64>>,
+    /// A chain to the camera's (or the player's) position, three floats;
+    /// logged once a route second in diagnostics builds. None: not logged.
+    #[serde(default)]
+    pub position: Vec<u64>,
 }
 
 fn pitch_limit_low() -> f32 {
