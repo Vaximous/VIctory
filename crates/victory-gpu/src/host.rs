@@ -6644,7 +6644,7 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         // A wait of the title's still held is made before the list ends: the next
         // list may write what this one read.
-        self.list.loud();
+        self.list.closing();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();

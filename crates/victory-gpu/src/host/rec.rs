@@ -64,14 +64,13 @@ pub(crate) struct Rec {
     any: AtomicBool,
     held: Mutex<Held>,
     /// Whether the list may have written memory since its last wait for every
-    /// shader write ([`Rec::title_wait`]): any use of it outside a quiet span sets
-    /// it. A list starts so (an earlier one of the submission may have written).
+    /// shader write ([`Rec::title_wait`]): [`Rec::writes`] sets it. A list starts so (an earlier one of the submission may have written).
     dirty: AtomicBool,
     /// A wait of the title's held: nothing that could write was recorded since the
     /// last wait, so none is needed yet; it is made before the next thing that may.
     waiting: AtomicBool,
-    /// A draw or dispatch whose shaders write nothing is being recorded
-    /// ([`Rec::quiet`]): its uses of the list neither write nor need the held wait.
+    /// Unused since only writers mark the list ([`Rec::writes`]); kept for
+    /// [`Rec::loud`]'s callers.
     quiet: AtomicBool,
 }
 
@@ -135,22 +134,38 @@ impl Rec {
         WAITS[0].fetch_add(1, Relaxed);
     }
 
-    /// A draw or dispatch is being recorded: quiet if `writes` is false (its uses
-    /// of the list then write nothing a shader reads and need no held wait), until
-    /// the next [`Rec::title_wait`], [`Rec::loud`] or quiet draw that writes.
+    /// A draw or dispatch is being recorded: if its shaders may write (`writes`),
+    /// as [`Rec::writes`]; one that writes nothing needs no wait held before it.
     pub(crate) fn quiet(&self, writes: bool) {
-        self.quiet.store(false, Relaxed);
         if writes {
-            // The held wait first, and the list may write from here.
-            let _ = &**self;
-        } else {
-            self.quiet.store(true, Relaxed);
+            self.writes();
         }
     }
 
-    /// The end of a quiet span (a title call begins, the list closes).
+    /// Something that may write memory a shader reads is about to be recorded (a
+    /// draw or dispatch whose shaders store, a copy, clear or resolve of the
+    /// title's): the title's held wait is made first, and the list may have
+    /// written from here. Only these count: state the title sets, and the host's
+    /// own uploads and state changes (ordered by their transitions), do not.
+    pub(crate) fn writes(&self) {
+        if self.waiting.swap(false, Relaxed) {
+            // SAFETY: an open list (it is being recorded); the barrier names nothing.
+            unsafe { self.barriers(&[wait_barrier()]) };
+            WAITS[2].fetch_add(1, Relaxed);
+        }
+        self.dirty.store(true, Relaxed);
+    }
+
+    /// The end of a quiet span (a title call begins), or with `closing` the end
+    /// of the list: a held wait is made then (the next list may write what this
+    /// one read).
     pub(crate) fn loud(&self) {
         self.quiet.store(false, Relaxed);
+    }
+
+    /// The list is about to close: a held wait is made.
+    pub(crate) fn closing(&self) {
+        self.writes();
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -256,17 +271,8 @@ fn every_write(b: &D3D12_RESOURCE_BARRIER) -> bool {
 impl std::ops::Deref for Rec {
     type Target = ID3D12GraphicsCommandList;
 
-    /// The list, with what is held recorded first: outside a quiet span the
-    /// title's held wait too, and the list may have written from here.
+    /// The list, with what is held recorded first.
     fn deref(&self) -> &ID3D12GraphicsCommandList {
-        if !self.quiet.load(Relaxed) {
-            if self.waiting.swap(false, Relaxed) {
-                // SAFETY: an open list (it is being used); the barrier names nothing.
-                unsafe { self.barriers(&[wait_barrier()]) };
-                WAITS[2].fetch_add(1, Relaxed);
-            }
-            self.dirty.store(true, Relaxed);
-        }
         self.flush();
         &self.list
     }

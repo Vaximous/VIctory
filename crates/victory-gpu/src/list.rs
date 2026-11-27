@@ -179,6 +179,17 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
+/// A title call that may write memory a shader reads (a copy, clear or resolve):
+/// a wait of the title's held before it is made first (`crate::host::rec`).
+fn writing(this: This) {
+    #[cfg(windows)]
+    if let Some(h) = host_list(this) {
+        h.list.writes();
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
@@ -878,6 +889,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    writing(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -910,6 +922,7 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    writing(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -975,6 +988,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    writing(this);
     copy_resource(this, dst, src);
 }
 
@@ -1000,6 +1014,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    writing(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1272,6 +1287,7 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    writing(this);
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1283,6 +1299,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    writing(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1359,6 +1376,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    writing(this);
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1412,6 +1430,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    writing(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1451,6 +1470,7 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    writing(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1556,6 +1576,7 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    writing(this);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
