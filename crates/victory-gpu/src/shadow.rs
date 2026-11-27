@@ -6431,100 +6431,156 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
-        // With in-place level 3: also those up to `VICTORY_INPLACE_CARD_KB`
-        // that would have a card copy (none by default: the card reads its
-        // own memory faster than the PC's over the bus).
-        let small = big && crate::inplace::level() >= 3 && size <= inplace_card_most();
-        if (!big || small) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        let began = std::time::Instant::now();
-        let on_card = card_for(size);
-        let card_used_before = on_card.is_some() && CARD_USED_BEFORE.get();
-        let carded_at = began.elapsed();
-        // Level 3: a buffer the card had no room for is in place, not a
-        // copy in the PC's memory, which the card would read over the bus
-        // all the same.
-        if on_card.is_none()
-            && big
-            && crate::inplace::level() >= 3
-            && let Some(placed) = crate::inplace::place_for(key.0, len, false)
-        {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        // (Small ones placed in a block, `crate::pool::buffer`.)
-        let (buffer, data) = match crate::pool::buffer(&host()?.device, size, true) {
-            Some((buffer, data, _)) => (buffer, data),
-            None => host()?.shared_buffer(size)?,
-        };
-        let made_at = began.elapsed();
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        if let Some(on_card) = &on_card {
-            crate::host::name(on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-        }
-        let named_at = began.elapsed();
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match on_card {
-            Some(on_card) => {
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                me: std::sync::OnceLock::new(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
-        }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            carded(&shadow);
-            // A card side in memory another buffer held: all of it goes up
-            // from the CPU's side (zeros where nothing is copied yet), as
-            // a side of its own would have begun as zeros.
-            if card_used_before {
-                shadow.card_changed_runs(std::iter::once((0, size as usize)));
-            }
-        }
-        if shadow.card.is_some() {
-            copy_made([carded_at, made_at, named_at, began.elapsed()], card_used_before);
-        }
-        entry.shadow = Some(shadow);
+    if let Some(shadow) = &entry.shadow {
+        return Some(shadow.clone());
     }
-    entry.shadow.clone()
+    // Made outside the map's lock (each copy waits for new memory, about a
+    // millisecond: 3,400 of them at an area's first sight, one after
+    // another under the lock, stood 3 s, run ow55b): the threads of the
+    // heap's views make theirs side by side. One thread makes a buffer's;
+    // the others wait for it.
+    let (copy_end, copy_len) = (entry.end, entry.end - key.0);
+    if !making(key, true) {
+        drop(map);
+        making_waited(key);
+        return lookup(address, len, any);
+    }
+    drop(map);
+    let made = make_copy(key, copy_len);
+    let mut map = buffers();
+    let shadow = match map.get_mut(&key) {
+        Some(entry) if entry.end == copy_end => {
+            if entry.shadow.is_none() {
+                entry.shadow = made;
+            }
+            entry.shadow.clone()
+        }
+        // Gone or changed meanwhile: what was made goes.
+        _ => None,
+    };
+    drop(map);
+    making(key, false);
+    shadow
+}
+
+/// Buffers whose copies a thread is making ([`lookup`]), and what waits.
+static MAKING: (Mutex<Vec<(u64, usize)>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// Claims the making of `key`'s copy (false: another thread has it), or
+/// gives the claim back and wakes those waiting.
+fn making(key: (u64, usize), claim: bool) -> bool {
+    let mut making = MAKING.0.lock().unwrap_or_else(|e| e.into_inner());
+    if claim {
+        if making.contains(&key) {
+            return false;
+        }
+        making.push(key);
+        return true;
+    }
+    making.retain(|&k| k != key);
+    drop(making);
+    MAKING.1.notify_all();
+    true
+}
+
+/// Waits until no thread is making `key`'s copy.
+fn making_waited(key: (u64, usize)) {
+    let mut making = MAKING.0.lock().unwrap_or_else(|e| e.into_inner());
+    while making.contains(&key) {
+        making = MAKING.1.wait(making).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The copy of the title buffer at `key` (`len` bytes) made ([`lookup`]).
+fn make_copy(key: (u64, usize), len: u64) -> Option<Arc<Shadow>> {
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let size = len.next_multiple_of(1 << 16);
+    // In place, if asked for and the memory can be opened
+    // (`crate::inplace::place_for`): the buffer is the title's own
+    // memory. Not the big ones `cards` puts in the card's memory: those
+    // are read too often to stay in the PC's.
+    let big = cards() && (size >= card_limits().0 || card_all());
+    // With in-place level 3: also those up to `VICTORY_INPLACE_CARD_KB`
+    // that would have a card copy (none by default: the card reads its
+    // own memory faster than the PC's over the bus).
+    let small = big && crate::inplace::level() >= 3 && size <= inplace_card_most();
+    if (!big || small) && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+    }
+    let began = std::time::Instant::now();
+    let on_card = card_for(size);
+    let card_used_before = on_card.is_some() && CARD_USED_BEFORE.get();
+    let carded_at = began.elapsed();
+    // Level 3: a buffer the card had no room for is in place, not a
+    // copy in the PC's memory, which the card would read over the bus
+    // all the same.
+    if on_card.is_none()
+        && big
+        && crate::inplace::level() >= 3
+        && let Some(placed) = crate::inplace::place_for(key.0, len, false)
+    {
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+    }
+    // (Small ones placed in a block, `crate::pool::buffer`.)
+    let (buffer, data) = match crate::pool::buffer(&host()?.device, size, true) {
+        Some((buffer, data, _)) => (buffer, data),
+        None => host()?.shared_buffer(size)?,
+    };
+    let made_at = began.elapsed();
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    if let Some(on_card) = &on_card {
+        crate::host::name(on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+    }
+    let named_at = began.elapsed();
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match on_card {
+        Some(on_card) => {
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+            touched: Default::default(),
+            me: std::sync::OnceLock::new(),
+                size,
+            };
+            (on_card, Some(card))
+        }
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
+    }
+    let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if shadow.card.is_some() {
+        carded(&shadow);
+        // A card side in memory another buffer held: all of it goes up
+        // from the CPU's side (zeros where nothing is copied yet), as
+        // a side of its own would have begun as zeros.
+        if card_used_before {
+            shadow.card_changed_runs(std::iter::once((0, size as usize)));
+        }
+    }
+    if shadow.card.is_some() {
+        copy_made([carded_at, made_at, named_at, began.elapsed()], card_used_before);
+    }
+    Some(shadow)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
