@@ -2151,39 +2151,98 @@ fn land_echo() -> bool {
 /// bytes back up, 21 MB a frame. It rests on what every send up rests on:
 /// outside ranges shaders may be writing, a copy's CPU side holds what its
 /// card side holds (`VICTORY_UPCOPY_CHECK=1` looks at that at rest).
-/// Title memory the title asked for write-combined (the console's 0x400
-/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+/// What the title asked its memory to be, by how the CPU reaches it (the
+/// console's protection bits): cached (write-back), the default.
+pub(crate) const WRITE_BACK: u8 = 0;
+/// Write-combined (0x400): the CPU writes it and does not read it.
+pub(crate) const WRITE_COMBINED_KIND: u8 = 1;
+/// Uncached (0x200): the CPU reaches it uncached, as the GPU's memory.
+pub(crate) const UNCACHED: u8 = 2;
+/// The GPU's alone: no access for the CPU, GPU access bits (0x800 and up).
+pub(crate) const GPU_ONLY: u8 = 3;
+/// The kinds' names, for the log.
+pub(crate) const KINDS: [&str; 4] = ["write-back", "write-combined", "uncached", "GPU-only"];
+
+/// Title memory the title asked for other than write-back, as `[start, end)`
+/// and the kind ([`title_memory_attributes`]).
 ///
 /// Ported from pepezin-ai/VIctory-NVIDIA, commits 50c15a145 and 2f81d0c85
 /// (GPL-3.0, as this): the registry and [`wc_no_back`], not the first's
-/// mapped copies in card memory (`VICTORY_WC_BAR`).
-static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+/// mapped copies in card memory (`VICTORY_WC_BAR`). Uncached and GPU-only
+/// added here.
+static ATTRIBUTES: RwLock<Vec<(u64, u64, u8)>> = RwLock::new(Vec::new());
 
-/// The title asked for `[at, at + len)` write-combined: its CPU writes the
-/// memory and does not read it (reads of such memory are uncached on the
-/// console; memory the title reads back is cacheable).
-pub fn title_memory_write_combined(at: usize, len: usize) {
-    if len == 0 {
+/// The title asked for `[at, at + len)` with the console's protection
+/// `protect`: the kind of memory it is noted, if not write-back.
+/// Write-combined and uncached memory is what the title's CPU writes and
+/// does not read (reads of it are uncached on the console; memory the title
+/// reads back is cacheable).
+pub fn title_memory_attributes(at: usize, len: usize, protect: u32) {
+    const PAGE_NOACCESS: u32 = 0x01;
+    const GPU_ACCESS: u32 = 0x7_f800;
+    let kind = if protect & GPU_ACCESS != 0 && protect & 0xff == PAGE_NOACCESS {
+        GPU_ONLY
+    } else if protect & 0x200 != 0 {
+        UNCACHED
+    } else if protect & 0x400 != 0 {
+        WRITE_COMBINED_KIND
+    } else {
+        WRITE_BACK
+    };
+    if len == 0 || kind == WRITE_BACK {
         return;
     }
-    WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner()).push((at as u64, (at + len) as u64));
+    ATTRIBUTES.write().unwrap_or_else(|e| e.into_inner()).push((at as u64, (at + len) as u64, kind));
+}
+
+/// The title asked for `[at, at + len)` write-combined.
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    title_memory_attributes(at, len, 0x404);
 }
 
 /// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
-/// write-combined regions in it are forgotten.
+/// the kinds noted in it are forgotten.
 pub(crate) fn write_combined_freed(at: usize, len: usize) {
     let (at, end) = (at as u64, at.saturating_add(len) as u64);
-    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    let mut all = ATTRIBUTES.write().unwrap_or_else(|e| e.into_inner());
     if all.is_empty() {
         return;
     }
-    all.retain(|&(from, to)| if len == 0 { from != at } else { to <= at || from >= end });
+    all.retain(|&(from, to, _)| if len == 0 { from != at } else { to <= at || from >= end });
+}
+
+/// The kind of `[start, start + len)`: that of the one region all of it lies
+/// in, else write-back.
+pub(crate) fn kind_of(start: u64, len: u64) -> u8 {
+    ATTRIBUTES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|&&(from, to, _)| from <= start && start + len <= to)
+        .map_or(WRITE_BACK, |r| r.2)
 }
 
 /// Whether all of `[start, start + len)` lies in one write-combined region.
+#[cfg(test)]
 fn is_write_combined(start: u64, len: u64) -> bool {
-    WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(from, to)| from <= start && start + len <= to)
+    kind_of(start, len) == WRITE_COMBINED_KIND
 }
+
+/// Whether what shaders write into big copies in the card's memory of
+/// uncached title memory stays on the card, as [`wc_no_back`] does for
+/// write-combined memory (`VICTORY_UC_NO_BACK`, on unless `=0`; the same
+/// smallest copy, [`wc_no_back_min`]). The console's CPU reaches uncached
+/// memory as it does the GPU's: what the title reads back it asks for
+/// cacheable. The risks are [`wc_no_back`]'s.
+fn uc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UC_NO_BACK").is_none_or(|v| v != "0"))
+}
+
+/// Bytes of copies in the card's memory sent up and fetched, by the kind of
+/// title memory they are of ([`KINDS`]), since the last line (the
+/// diagnostics' traffic).
+pub(crate) static BY_KIND: [[AtomicU64; 2]; 4] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 4];
 
 /// Whether what shaders write into big copies in the card's memory of
 /// write-combined title memory stays on the card, without hashes, compare,
@@ -3049,6 +3108,27 @@ mod write_combined_tests {
         write_combined_freed(other, 0);
         assert!(!is_write_combined(other as u64, 0x1000), "the allocation released");
     }
+
+    /// The console's protection bits say the kind: uncached, write-combined,
+    /// the GPU's alone (no access, GPU bits), else write-back, noted not.
+    #[test]
+    fn kinds_of_title_memory() {
+        use super::{GPU_ONLY, UNCACHED, WRITE_BACK, WRITE_COMBINED_KIND, kind_of, title_memory_attributes};
+        let base = 0x7e00_0000_0000usize;
+        title_memory_attributes(base, 0x10_0000, 0x204);
+        title_memory_attributes(base + 0x100_0000, 0x10_0000, 0x404);
+        title_memory_attributes(base + 0x200_0000, 0x10_0000, 0x2001);
+        title_memory_attributes(base + 0x300_0000, 0x10_0000, 0x2004);
+        assert_eq!(kind_of(base as u64, 0x1000), UNCACHED);
+        assert_eq!(kind_of(base as u64 + 0x100_0000, 0x1000), WRITE_COMBINED_KIND);
+        assert_eq!(kind_of(base as u64 + 0x200_0000, 0x1000), GPU_ONLY);
+        assert_eq!(kind_of(base as u64 + 0x300_0000, 0x1000), WRITE_BACK, "read-write with GPU bits is the CPU's too");
+        assert_eq!(kind_of(base as u64 + 0xf_f000, 0x2000), WRITE_BACK, "past an end");
+        for i in 0..4 {
+            write_combined_freed(base + i * 0x100_0000, 0);
+        }
+        assert_eq!(kind_of(base as u64, 0x1000), WRITE_BACK, "released");
+    }
 }
 
 #[cfg(test)]
@@ -3497,7 +3577,7 @@ impl Shadow {
         // Big copies of write-combined title memory, which the title's CPU
         // does not read: what shaders write stays on the card
         // ([`wc_no_back`]).
-        if self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() && self.write_combined() {
+        if self.card.is_some() && self.len >= wc_no_back_min() && self.no_back() {
             self.written.store(true, Ordering::Relaxed);
             WC_LEFT[0].fetch_add(1, Ordering::Relaxed);
             let frame = crate::frame::current() + 1;
@@ -3512,25 +3592,39 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// Whether all of the copy's title memory was asked for write-combined
-    /// ([`title_memory_write_combined`]); found once.
-    fn write_combined(&self) -> bool {
+    /// The kind of the copy's title memory ([`title_memory_attributes`]);
+    /// found once.
+    pub(crate) fn kind(&self) -> u8 {
         match self.wc.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let wc = is_write_combined(self.start, self.len);
-                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
-                if wc {
-                    tracing::info!(
-                        start = format_args!("{:#x}", self.start),
-                        len = format_args!("{:#x}", self.len),
-                        "write-combined title memory: what shaders write in its copy stays on the card (VICTORY_WC_NO_BACK)"
-                    );
-                }
-                wc
+            0 => {
+                let kind = kind_of(self.start, self.len);
+                self.wc.store(kind + 1, Ordering::Relaxed);
+                kind
             }
+            known => known - 1,
         }
+    }
+
+    /// Whether what shaders write in the copy stays on the card for the kind
+    /// of its title memory ([`wc_no_back`], [`uc_no_back`]); said the first
+    /// time.
+    fn no_back(&self) -> bool {
+        let first = self.wc.load(Ordering::Relaxed) == 0;
+        let kind = self.kind();
+        let (no_back, switch) = match kind {
+            WRITE_COMBINED_KIND => (wc_no_back(), "VICTORY_WC_NO_BACK"),
+            UNCACHED => (uc_no_back(), "VICTORY_UC_NO_BACK"),
+            _ => (false, ""),
+        };
+        if first && no_back {
+            tracing::info!(
+                start = format_args!("{:#x}", self.start),
+                len = format_args!("{:#x}", self.len),
+                "{} title memory: what shaders write in its copy stays on the card ({switch})",
+                KINDS[kind as usize]
+            );
+        }
+        no_back
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
