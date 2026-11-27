@@ -2515,6 +2515,20 @@ fn send_parts() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PARTS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a refresh of a copy that landings were noted in ([`land_echo`])
+/// takes the pages no landing was noted in as [`send_parts`] does, the 4 KiB
+/// parts that differ from the CPU's side (`VICTORY_LANDED_PARTS`, on unless
+/// `=0`: those pages whole, as before). Once a copy had a landing every
+/// refresh of it went to [`Shadow::take_landed`], which compared only the
+/// noted pages and sent all others up whole, past [`send_parts`]: in run
+/// ow26-move the 174 MB copy sent 107 MB a frame in 656 pieces while
+/// [`send_parts`] saw 7.5 MB. The pages are ones the copy held before
+/// (`known`), the case [`send_parts`] covers, on what it rests on.
+fn landed_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LANDED_PARTS").is_none_or(|v| v != "0"))
+}
+
 /// Since the last frame-rate line, of [`send_parts`] refreshes: bytes found
 /// as the CPU's side held them (left), and bytes taken and sent up.
 pub(crate) static PARTS_SENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -4933,10 +4947,19 @@ impl Shadow {
                 at = next;
             }
         }
+        let parts = !self.window && send_parts() && landed_parts();
         TITLE.with_borrow_mut(|title| {
             for (from, to, noted) in runs {
                 if !noted {
-                    self.copy(from, to);
+                    if parts {
+                        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                        let (a, b) = (from.max(start), to.min(end));
+                        if a < b {
+                            self.copy_changed_part(a, b, &PARTS_SENT);
+                        }
+                    } else {
+                        self.copy(from, to);
+                    }
                     continue;
                 }
                 title.resize(to - from, 0);
