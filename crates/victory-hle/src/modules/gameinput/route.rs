@@ -42,6 +42,9 @@
 //! the same seconds in some 370 frames against 320 at 51 ms, and went past
 //! the door the route goes out by (half of the runs of one route ended in
 //! the house, at 43 to 45 ms a frame; those at 50 to 56 ms went out).
+//! A world that settles more than `VICTORY_ROUTE_SETTLE_MOST_S` (3) later
+//! after its first frame than the route's did is not waited for: the walk
+//! begins from there.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -316,8 +319,28 @@ fn clock(route: &Route) -> u64 {
         });
         let by_world = world + now.saturating_sub(here);
         let Some(settle) = route.settle.filter(|&s| s > world) else { return by_world };
-        let Some(settled) = victory_gpu::frame::world_settled() else { return by_world.min(settle - 1) };
-        let there = settled.saturating_duration_since(zero()).as_micros() as u64;
+        // The settling, or at the latest the route's own distance from the
+        // world to it and `settle_most` more: the replay's anchor, its time
+        // and frame, taken once.
+        static ANCHOR: OnceLock<(u64, u64, bool)> = OnceLock::new();
+        let latest = settle_most().map(|most| here + (settle - world) + most);
+        let anchor = match ANCHOR.get() {
+            Some(&anchor) => anchor,
+            None => {
+                let settled = victory_gpu::frame::world_settled()
+                    .map(|s| s.saturating_duration_since(zero()).as_micros() as u64)
+                    .zip(victory_gpu::frame::world_settled_frame());
+                let found = match (settled, latest) {
+                    (Some((there, _)), Some(latest)) if there > latest => Some((latest, victory_gpu::frame::frames(), false)),
+                    (Some((there, frame)), _) => Some((there, frame, true)),
+                    (None, Some(latest)) if now >= latest => Some((latest, victory_gpu::frame::frames(), false)),
+                    (None, _) => None,
+                };
+                let Some(found) = found else { return by_world.min(settle - 1) };
+                *ANCHOR.get_or_init(|| found)
+            }
+        };
+        let (there, first, settled) = anchor;
         static SHIFT: std::sync::Once = std::sync::Once::new();
         SHIFT.call_once(|| {
             let (route_after, replay_after) = (settle - world, there.saturating_sub(here));
@@ -325,12 +348,11 @@ fn clock(route: &Route) -> u64 {
                 route_after_world_ms = route_after / 1000,
                 replay_after_world_ms = replay_after / 1000,
                 shift_ms = (replay_after as i64 - route_after as i64) / 1000,
-                "route: the world settled; from here the route plays by the time since it, its walk moved by the shift"
+                settled,
+                "route: the world settled (or settled late: anchored at the latest, VICTORY_ROUTE_SETTLE_MOST_S); from here the route plays on from it, its walk moved by the shift"
             );
         });
-        if let Some(per_frame) = frame_us()
-            && let Some(first) = victory_gpu::frame::world_settled_frame()
-        {
+        if let Some(per_frame) = frame_us() {
             let frames = victory_gpu::frame::frames().saturating_sub(first);
             return settle + frames * per_frame;
         }
@@ -408,6 +430,20 @@ fn until() -> u64 {
     static UNTIL: OnceLock<u64> = OnceLock::new();
     *UNTIL.get_or_init(|| {
         std::env::var("VICTORY_ROUTE_UNTIL_S").ok().and_then(|v| v.trim().parse::<f64>().ok()).map_or(u64::MAX, |s| (s * 1e6) as u64)
+    })
+}
+
+/// How much later after the world than the route's own the replay's world
+/// may settle before the route goes on without it, in microseconds
+/// (`VICTORY_ROUTE_SETTLE_MOST_S`, 3 if unset; `0`: it waits for the
+/// settling however late). A world that settled 13 and 25 s later than the
+/// route's kept the walk waiting in the bedroom long after the player had
+/// it, and it never went out.
+fn settle_most() -> Option<u64> {
+    static US: OnceLock<Option<u64>> = OnceLock::new();
+    *US.get_or_init(|| {
+        let s = std::env::var("VICTORY_ROUTE_SETTLE_MOST_S").ok().map_or(Some(3.0), |v| v.trim().parse::<f64>().ok());
+        s.filter(|&s| s > 0.0).map(|s| (s * 1e6) as u64)
     })
 }
 
