@@ -473,8 +473,15 @@ fn card_all() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
 }
 
+thread_local! {
+    /// The card side [`card_room_for`] just gave was placed in a block
+    /// where another buffer was before ([`crate::pool::buffer`]): not zeros.
+    static CARD_USED_BEFORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<ID3D12Resource> {
+    CARD_USED_BEFORE.set(false);
     if !cards() {
         return None;
     }
@@ -530,7 +537,13 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         late = true;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = match crate::pool::buffer(&host.device, size, false) {
+        Some((buffer, _, again)) => {
+            CARD_USED_BEFORE.set(again);
+            Some(buffer)
+        }
+        None => host.uav_buffer(size),
+    };
     match (&buffer, late) {
         (None, true) => {
             LATE_USED.fetch_sub(size, Ordering::Relaxed);
@@ -6392,6 +6405,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             return entry.shadow.clone();
         }
         let on_card = card_for(size);
+        let card_used_before = on_card.is_some() && CARD_USED_BEFORE.get();
         // Level 3: a buffer the card had no room for is in place, not a
         // copy in the PC's memory, which the card would read over the bus
         // all the same.
@@ -6403,7 +6417,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        // (Small ones placed in a block, `crate::pool::buffer`.)
+        let (buffer, data) = match crate::pool::buffer(&host()?.device, size, true) {
+            Some((buffer, data, _)) => (buffer, data),
+            None => host()?.shared_buffer(size)?,
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -6448,6 +6466,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             carded(&shadow);
+            // A card side in memory another buffer held: all of it goes up
+            // from the CPU's side (zeros where nothing is copied yet), as
+            // a side of its own would have begun as zeros.
+            if card_used_before {
+                shadow.card_changed_runs(std::iter::once((0, size as usize)));
+            }
         }
         entry.shadow = Some(shadow);
     }
