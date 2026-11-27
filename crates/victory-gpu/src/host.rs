@@ -5709,7 +5709,7 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
-    fn execute_own(&self, list: &HostList) -> u64 {
+    pub(crate) fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
             return 0;

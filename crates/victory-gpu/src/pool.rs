@@ -721,7 +721,7 @@ pub(crate) unsafe fn texture(
 
 /// Whether the host copies of small title buffers (up to [`BUFFER_MOST`]),
 /// both sides, are buffers placed in blocks made once
-/// (`VICTORY_POOLED_CARD_COPIES`, on unless 0), not allocations of their
+/// (`VICTORY_POOLED_CARD_COPIES=1`; off by default), not allocations of their
 /// own. Each of those was made, made resident and waited for on the card
 /// alone, about 0.6 ms, two a copy: when the world first shows a part of
 /// it the pass over the heap's views made some 3,500 of them in a row (1,040
@@ -729,8 +729,17 @@ pub(crate) unsafe fn texture(
 /// 1.1 to 3.6 s without a frame (runs ow46b, ow48, ow50b). A placed buffer
 /// is a resource of its own still: its barriers, views (at offset 0) and
 /// copies are as they were; only its memory comes from a block.
+///
+/// Off by default since run ow52: the card's time per frame went from 29.5
+/// to 37.1 ms over world frames 1000-3000 (against ow50b) and no cause in
+/// the blocks themselves was found: no aliasing barriers are issued for
+/// buffers, each block is made resident once (64 MiB, not per frame), and
+/// a copy placed where another was sends its 64 KiB up once. The card
+/// sides' ranges sent up per frame rose from 20,000-34,000 to 25,000-67,000
+/// in the same run, which the blocks do not explain either.
 pub(crate) fn pooled_copies() -> bool {
-    crate::toggled!("VICTORY_POOLED_CARD_COPIES")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOLED_CARD_COPIES").is_some_and(|v| v != "0"))
 }
 
 /// The most bytes of a buffer [`buffer`] places in a block.
@@ -830,11 +839,10 @@ pub(crate) fn buffer(device: &ID3D12Device, size: u64, shared: bool) -> Option<(
             in_the_pc = BUFFERS_MADE[1].load(Ordering::Relaxed),
             card_blocks = lock(&CARD_BUFFERS).blocks(),
             pc_blocks = lock(&SHARED_BUFFERS).blocks(),
-            "title buffers' host copies placed in blocks so far (VICTORY_POOLED_CARD_COPIES=0: each made on its own)"
+            "title buffers' host copies placed in blocks so far (VICTORY_POOLED_CARD_COPIES=1)"
         );
     }
-    #[cfg(feature = "diagnostics")]
-    crate::book::made(&made, || if shared { "a shared buffer in a block".into() } else { "a card buffer in a block".into() });
+    // (Booked where it is named, `crate::host::name`: once, not twice.)
     Some((made, data.cast(), again))
 }
 

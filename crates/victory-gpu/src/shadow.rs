@@ -479,6 +479,42 @@ thread_local! {
     static CARD_USED_BEFORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Copies in the card's memory made since the last line, those placed
+/// where another was, and the microseconds spent finding the card's side,
+/// making the CPU's side, naming them (the book, `SetName`) and the rest
+/// (the copy's record, the card side's first refresh marked).
+static COPIES_MADE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A copy in the card's memory was made ([`lookup`]) with its times since
+/// it began: at most a line a second of them all (one a copy cost 0.27 ms
+/// of the frame's time when an area's thousands came, run ow52).
+fn copy_made(at: [std::time::Duration; 4], again: bool) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let us = at.map(|d| d.as_micros() as u64);
+    COPIES_MADE[0].fetch_add(1, Ordering::Relaxed);
+    COPIES_MADE[1].fetch_add(u64::from(again), Ordering::Relaxed);
+    COPIES_MADE[2].fetch_add(us[0], Ordering::Relaxed);
+    COPIES_MADE[3].fetch_add(us[1] - us[0], Ordering::Relaxed);
+    COPIES_MADE[4].fetch_add(us[2] - us[1], Ordering::Relaxed);
+    COPIES_MADE[5].fetch_add(us[3] - us[2], Ordering::Relaxed);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 1000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let [n, again, card_us, made_us, named_us, rest_us] = COPIES_MADE.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    tracing::info!(
+        copies = n,
+        placed_where_another_was = again,
+        card_side_us = card_us,
+        cpu_side_us = made_us,
+        named_us,
+        rest_us,
+        frame = crate::frame::current(),
+        "title buffers' host copies made in the card's memory since the last line"
+    );
+}
+
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     CARD_USED_BEFORE.set(false);
@@ -6404,8 +6440,10 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        let began = std::time::Instant::now();
         let on_card = card_for(size);
         let card_used_before = on_card.is_some() && CARD_USED_BEFORE.get();
+        let carded_at = began.elapsed();
         // Level 3: a buffer the card had no room for is in place, not a
         // copy in the PC's memory, which the card would read over the bus
         // all the same.
@@ -6422,17 +6460,16 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((buffer, data, _)) => (buffer, data),
             None => host()?.shared_buffer(size)?,
         };
+        let made_at = began.elapsed();
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        if let Some(on_card) = &on_card {
+            crate::host::name(on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+        }
+        let named_at = began.elapsed();
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match on_card {
             Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
@@ -6472,6 +6509,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             if card_used_before {
                 shadow.card_changed_runs(std::iter::once((0, size as usize)));
             }
+        }
+        if shadow.card.is_some() {
+            copy_made([carded_at, made_at, named_at, began.elapsed()], card_used_before);
         }
         entry.shadow = Some(shadow);
     }
