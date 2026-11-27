@@ -667,19 +667,6 @@ pub(super) fn stood_at(object: u64) -> bool {
     place(object).load(Ordering::SeqCst) != 0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse;
-
-    #[test]
-    fn a_timeline_is_asked_for_by_seconds_frames_and_a_file() {
-        assert_eq!(parse("120,20,D:/a.json"), (Some((vec![120.0], 20)), "D:/a.json"));
-        assert_eq!(parse("120+130.5,20,D:/a,b.json"), (Some((vec![120.0, 130.5], 20)), "D:/a,b.json"));
-        assert_eq!(parse("D:/a,1,2.json"), (None, "D:/a,1,2.json"));
-        assert_eq!(parse("D:/a.json"), (None, "D:/a.json"));
-    }
-}
-
 /// The stall watch (`VICTORY_STALL_WATCH=0`: off): each thread's span begun
 /// last is known to a thread of ours, which tells when no frame was
 /// presented for a second what the threads were in, and since when. (A
@@ -799,7 +786,7 @@ fn watch_stalls() {
                 open.push((ms, format!("{thread}: {name} for {ms} ms")));
             }
         }
-        open.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        open.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
         let open: Vec<String> = open.into_iter().map(|(_, s)| s).collect();
         tracing::warn!(
             frame,
@@ -807,5 +794,18 @@ fn watch_stalls() {
             "no frame presented for a second; spans open for 250 ms or more: {}",
             if open.is_empty() { "none (the stall is outside our spans: the title, or the system)".to_owned() } else { open.join("; ") }
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn a_timeline_is_asked_for_by_seconds_frames_and_a_file() {
+        assert_eq!(parse("120,20,D:/a.json"), (Some((vec![120.0], 20)), "D:/a.json"));
+        assert_eq!(parse("120+130.5,20,D:/a,b.json"), (Some((vec![120.0, 130.5], 20)), "D:/a,b.json"));
+        assert_eq!(parse("D:/a,1,2.json"), (None, "D:/a,1,2.json"));
+        assert_eq!(parse("D:/a.json"), (None, "D:/a.json"));
     }
 }

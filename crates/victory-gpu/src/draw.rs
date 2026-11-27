@@ -301,7 +301,7 @@ fn world_ms() -> Option<u64> {
     *MS.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_WORLD_MS")
             .ok()
-            .map_or(None, |v| v.trim().parse::<u64>().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
     })
 }
