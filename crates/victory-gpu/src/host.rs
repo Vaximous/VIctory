@@ -8387,6 +8387,24 @@ fn steps_add(i: usize, since: std::time::Instant) {
 #[cfg(feature = "diagnostics")]
 static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame-rate line, of [`Batch::refresh_spans`] on the
+/// submitting thread: ns telling which copy nothing, ns asking ahead, ns
+/// refreshing on the threads; and the pieces of long spans
+/// ([`piece_looks`]) looked at, those found to copy nothing, their bytes.
+#[cfg(feature = "diagnostics")]
+static FRONT_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether each piece of a long span a front refresh cuts
+/// ([`refresh_pieces`]) is first looked at as a span would be, and left if
+/// it copies nothing (`VICTORY_PIECE_LOOKS`, on unless `=0`). The look at the
+/// whole span says "ask" when any page of it was written: the heap's 174 MB
+/// copy was refreshed whole some 9 times a frame, in 1 MiB pieces that
+/// nearly all took nothing, 18.9 GB a frame gone over (run ow60-move).
+fn piece_looks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_LOOKS").is_none_or(|v| v != "0"))
+}
+
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
 struct Split(std::cell::Cell<std::time::Instant>);
@@ -8422,6 +8440,17 @@ fn split_line(frames: f64) {
         st[2],
         st[3],
         st[4]
+    );
+    let fs: Vec<f64> = FRONT_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "refreshes in front per frame, the submitting thread: {:.2} ms telling which copy nothing, {:.2} asking ahead, {:.2} refreshing on the threads; \
+         pieces of long spans looked at {:.0}, {:.0} of them copy nothing, {:.0} MB left (VICTORY_PIECE_LOOKS)",
+        fs[0] / 1e6,
+        fs[1] / 1e6,
+        fs[2] / 1e6,
+        fs[3],
+        fs[4],
+        fs[5] / 1e6,
     );
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
@@ -9594,6 +9623,8 @@ impl Batch {
         // the others (over), they held the submission back.
         // `VICTORY_WIDE_NOTHING_NEW=0`: as before.
         const WIDE_LOOKS: usize = 24;
+        #[cfg(feature = "diagnostics")]
+        let mut phase = std::time::Instant::now();
         if spans.len() >= WIDE_LOOKS && wide_nothing_new() {
             let all = spans.len();
             let shared = std::sync::Arc::new(spans);
@@ -9624,33 +9655,71 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            FRONT_SPLIT[0].fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            phase = std::time::Instant::now();
+        }
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
+        {
+            FRONT_SPLIT[1].fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            phase = std::time::Instant::now();
+        }
+        #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         // Long ones in pieces any thread takes ([`refresh_pieces`]): asked
-        // ahead and noted above whole, as before.
-        let spans = if refresh_pieces() && spans.len() + due.len() > 1 { in_pieces(spans) } else { spans };
+        // ahead and noted above whole, as before. Each piece is looked at
+        // first ([`piece_looks`]): the look at the whole said only that some
+        // page of it was written.
+        let cut = refresh_pieces() && spans.len() + due.len() > 1;
+        let looks = cut && !many && piece_looks();
+        let spans: Vec<_> = if cut {
+            spans
+                .into_iter()
+                .flat_map(|span| {
+                    let long = span.2 - span.1 > REFRESH_PIECE;
+                    in_pieces(vec![span]).into_iter().map(move |p| (p, long))
+                })
+                .collect()
+        } else {
+            spans.into_iter().map(|p| (p, false)).collect()
+        };
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
+            let ((shadow, from, to), long) = &spans[i];
             if many && shadow.nothing_new(*from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
+            }
+            if looks && *long {
+                #[cfg(feature = "diagnostics")]
+                FRONT_SPLIT[3].fetch_add(1, Ordering::Relaxed);
+                if shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        FRONT_SPLIT[4].fetch_add(1, Ordering::Relaxed);
+                        FRONT_SPLIT[5].fetch_add((*to - *from) as u64, Ordering::Relaxed);
+                    }
+                    return;
+                }
             }
             Self::update(shadow, *from, *to);
         });
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        #[cfg(feature = "diagnostics")]
+        FRONT_SPLIT[2].fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
         let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
