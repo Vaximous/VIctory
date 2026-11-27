@@ -629,14 +629,79 @@ thread_local! {
 }
 
 /// The pages of `[first, last)` the kernel says were written since it was
-/// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
-/// memory of one reservation. The caller holds the range ([`Asking`]).
+/// last asked, in order, each once, with their written parts; `None` if the
+/// range is not write-watched memory (of one reservation, or with
+/// [`watch_not_guard`] of committed private regions one after another).
+/// The caller holds the range ([`Asking`]).
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    let mut pages = Vec::new();
+    if kernel_ask(first * PAGE, last * PAGE, &mut pages) {
+        return Some(pages);
+    }
+    if !watch_not_guard() {
+        return None;
+    }
+    by_regions(first * PAGE, last * PAGE)
+}
+
+/// Whether physical pages the runtime gives write-watched private memory
+/// (`victory-hle` xmem, `VICTORY_WATCHED_PAGES`) are asked about by the
+/// kernel's write watch and not guarded (`VICTORY_WATCH_NOT_GUARD`, on
+/// unless `=0`, which also keeps them views).
+///
+/// Views of sections cannot be write-watched, so their writes were learned
+/// by guards: the title's 185 MB 32-bit graphics heap took some 690 of the
+/// 740 write faults a frame (run ow51-move), each in the title's thread.
+/// The heap is private memory now, mapped in a few runs of 64 KiB pages: a
+/// range of it across two runs is two reservations, which one asking
+/// refuses; such a range is asked a region at a time ([`by_regions`]). The
+/// submission's askings of it are spread over the kept threads
+/// ([`ask_wide`]).
+pub(crate) fn watch_not_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_NOT_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// [`kernel_written`] for `[start, end)` (bytes), asked a region at a time,
+/// if every region there is committed private memory; `None` at the first
+/// that is not (a view, a hole). A region is a run of pages alike, inside
+/// one reservation.
+fn by_regions(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut pages = Vec::new();
+    let mut at = start;
+    let mut regions = 0u64;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.Type != MEM_PRIVATE || info.State != MEM_COMMIT {
+            return None;
+        }
+        let to = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if to <= at || !kernel_ask(at, to, &mut pages) {
+            return None;
+        }
+        regions += 1;
+        at = to;
+    }
+    port6_count(P6_ASKED_BY_REGIONS, 1);
+    port6_count(P6_REGIONS, regions);
+    Some(pages)
+}
+
+/// Asks the kernel about `[start, end)` (bytes, 4 KiB-aligned) and adds the
+/// pages it names to `pages` (in order after those there); false if it
+/// refuses.
+fn kernel_ask(start: usize, end: usize, pages: &mut Vec<(usize, u16)>) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    #[cfg(feature = "diagnostics")]
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
-        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        let mut count = (end - start) / KERNEL_PAGE;
         if found.len() < count {
             found.resize(count, 0);
         }
@@ -647,8 +712,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         let failed = unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
+                start as *const _,
+                end - start,
                 found.as_mut_ptr().cast(),
                 &mut count,
                 &mut granularity,
@@ -658,9 +723,10 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         {
             tally(10, u64::from(failed));
             tally(11, started.elapsed().as_nanos() as u64);
+            asked_by_thread(started.elapsed().as_nanos() as u64, end - start, failed);
         }
         if failed {
-            return None;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -674,7 +740,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
             match pages.last_mut() {
@@ -682,8 +747,56 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 _ => pages.push((page, part)),
             }
         }
-        Some(pages)
+        true
     })
+}
+
+/// Diagnostics: kernel askings by thread since the last line: the thread's
+/// name, askings, nanoseconds, bytes asked about; and those refused.
+#[cfg(feature = "diagnostics")]
+type ByThread = std::collections::HashMap<u32, (String, u64, u64, u64, u64)>;
+#[cfg(feature = "diagnostics")]
+static BY_THREAD: Mutex<Option<ByThread>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn asked_by_thread(ns: u64, bytes: usize, refused: bool) {
+    // SAFETY: no arguments.
+    let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut all = BY_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all.get_or_insert_with(Default::default).entry(id).or_insert_with(|| {
+        (std::thread::current().name().unwrap_or("unnamed").to_string(), 0, 0, 0, 0)
+    });
+    e.1 += 1;
+    e.2 += ns;
+    e.3 += bytes as u64;
+    e.4 += u64::from(refused);
+}
+
+/// Diagnostics, for the frame lines: kernel askings per frame, all threads
+/// and the busiest threads.
+#[cfg(feature = "diagnostics")]
+fn asked_by_thread_line(frames: f64) {
+    let all = BY_THREAD.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if all.is_empty() {
+        return;
+    }
+    let (n, ns, bytes, refused) = all.values().fold((0, 0, 0, 0), |s, v| (s.0 + v.1, s.1 + v.2, s.2 + v.3, s.3 + v.4));
+    let mut all: Vec<_> = all.into_values().collect();
+    all.sort_unstable_by_key(|v| std::cmp::Reverse(v.2));
+    let top: Vec<String> = all
+        .iter()
+        .take(6)
+        .map(|(name, k, ns, _, _)| format!("{name} {:.1}x {:.2} ms", *k as f64 / frames, *ns as f64 / 1e6 / frames))
+        .collect();
+    tracing::info!(
+        "the kernel's write watch asked per frame (VICTORY_WATCH_NOT_GUARD): {:.1} askings, {:.2} ms, {:.0} MB asked about, \
+         {:.1} refused; by thread: {}",
+        n as f64 / frames,
+        ns as f64 / 1e6 / frames,
+        bytes as f64 / 1e6 / frames,
+        refused as f64 / frames,
+        top.join("; ")
+    );
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -718,6 +831,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let mut groups: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -730,8 +844,13 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        groups.push((i, k));
         i = k;
+    }
+    if !ask_wide(&pieces, &groups, &mut asked, &mut written) {
+        for &(i, k) in &groups {
+            ask_run(&pieces[i..k], &mut asked, &mut written);
+        }
     }
     note_hot(&written);
     if port_journal() {
@@ -1124,6 +1243,90 @@ fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
         return Vec::new();
     }
     crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+}
+
+/// The pages of a piece of a submission's asking spread over threads
+/// ([`ask_wide`]): 16 MiB.
+const WIDE_PIECE: usize = (16 << 20) / PAGE;
+
+/// With [`watch_not_guard`] (`VICTORY_ASK_WIDE=0`: never): a submission's
+/// asking of the `groups` of `pieces` ([`ask_ahead`]) cut into pieces of
+/// [`WIDE_PIECE`] and asked on the kept threads and this one, when it spans
+/// more than two of them. A kernel asking costs some 1.4 microseconds a
+/// page it finds written, and the title writes thousands of its heap's
+/// pages a frame, which the guards saw as faults before: one asking stood
+/// 8 to 10 ms (session play-1125-0203). A piece the kernel refuses is asked
+/// as [`ask_run`] would, its pieces cut to it. What was asked goes to
+/// `asked` joined where pieces meet; false if not spread (nothing done).
+fn ask_wide(
+    pieces: &[(usize, usize)],
+    groups: &[(usize, usize)],
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| watch_not_guard() && std::env::var_os("VICTORY_ASK_WIDE").is_none_or(|v| v != "0")) {
+        return false;
+    }
+    let span = |&(i, k): &(usize, usize)| pieces[i..k].iter().map(|p| p.1).max().unwrap_or(pieces[i].0) - pieces[i].0;
+    if groups.iter().map(span).sum::<usize>() <= 2 * WIDE_PIECE {
+        return false;
+    }
+    // Each piece with the pieces of its group cut to it.
+    let mut cuts: Vec<((usize, usize), Vec<(usize, usize)>)> = Vec::new();
+    for &(i, k) in groups {
+        let group = &pieces[i..k];
+        let first = group[0].0;
+        let last = group.iter().map(|p| p.1).max().unwrap_or(first);
+        let mut at = first;
+        while at < last {
+            let to = (at + WIDE_PIECE).min(last);
+            let inside: Vec<(usize, usize)> =
+                group.iter().filter(|p| p.0 < to && at < p.1).map(|p| (p.0.max(at), p.1.min(to))).collect();
+            if !inside.is_empty() {
+                cuts.push(((at, to), inside));
+            }
+            at = to;
+        }
+    }
+    port6_count(P6_WIDE_ASKS, 1);
+    port6_count(P6_WIDE_PIECES, cuts.len() as u64);
+    type Found = (Vec<(usize, usize)>, Vec<(usize, u16)>);
+    let found: std::sync::Arc<Mutex<Vec<Found>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = cuts
+        .into_iter()
+        .map(|((at, to), inside)| {
+            let found = found.clone();
+            Box::new(move || {
+                let (mut asked, mut written) = (Vec::new(), Vec::new());
+                match kernel_written(at, to) {
+                    Some(pages) => {
+                        written = pages;
+                        asked.push((at, to));
+                    }
+                    None => ask_run(&inside, &mut asked, &mut written),
+                }
+                found.lock().unwrap_or_else(|e| e.into_inner()).push((asked, written));
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    let mut all: Vec<(usize, usize)> = Vec::new();
+    for (a, w) in std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner())) {
+        all.extend(a);
+        written.extend(w);
+    }
+    // Pieces that meet are one range asked: a refresh across their seam is
+    // held by it.
+    all.sort_unstable();
+    for (a, b) in all {
+        match asked.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => asked.push((a, b)),
+        }
+    }
+    written.sort_unstable_by_key(|w| w.0);
+    true
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
@@ -1553,7 +1756,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
+static PORT6: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1580,6 +1783,13 @@ const P6_PARTS_LOCK_NS: usize = 15;
 /// others' (another fault's, mostly).
 const P6_CLAIM_REFRESH_NS: usize = 16;
 const P6_CLAIM_OTHER_NS: usize = 17;
+/// [`watch_not_guard`]: askings refused whole and asked a region at a time
+/// ([`by_regions`]), and their regions; a submission's askings spread over
+/// threads ([`ask_wide`]), and their pieces.
+const P6_ASKED_BY_REGIONS: usize = 18;
+const P6_REGIONS: usize = 19;
+const P6_WIDE_ASKS: usize = 20;
+const P6_WIDE_PIECES: usize = 21;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1760,7 +1970,8 @@ pub(crate) fn port_guard_line(frames: f64) {
          blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}; \
          parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK); \
          the faults held the lock shared {:.2} ms, {:.2} of it waiting for claims, {:.2} for the open parts' map (VICTORY_PARTS_APART); \
-         of the claims waited for, {:.2} ms a refresh's guarding held, {:.2} others' (VICTORY_CLAIMS_PER_RUN)",
+         of the claims waited for, {:.2} ms a refresh's guarding held, {:.2} others' (VICTORY_CLAIMS_PER_RUN); \
+         askings by regions {:.1} ({:.1} regions), submissions' askings spread over threads {:.1} ({:.1} pieces) (VICTORY_WATCH_NOT_GUARD)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1779,7 +1990,13 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_PARTS_LOCK_NS] / 1e6,
         n[P6_CLAIM_REFRESH_NS] / 1e6,
         n[P6_CLAIM_OTHER_NS] / 1e6,
+        n[P6_ASKED_BY_REGIONS],
+        n[P6_REGIONS],
+        n[P6_WIDE_ASKS],
+        n[P6_WIDE_PIECES],
     );
+    #[cfg(feature = "diagnostics")]
+    asked_by_thread_line(frames);
 }
 
 /// The blocks known to be view memory (renderer port #6): guarded by us
