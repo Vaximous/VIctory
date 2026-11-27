@@ -42,11 +42,13 @@ route in every run (about 5,000-6,500 draws a frame).
 | bench16 | 44.7 | 22.4 | 68 ms | blocks the title rewrites whole are opened whole |
 | bench17 | ~44 | ~22.7 | | changed-part compare done in place (AVX2), alignment-correct |
 | bench18 | 42.5 | 23.5 | 66 ms | scalar buffer loads read four dwords a call, fitted to the view's end |
-| **bench19** | **41.4** | **24.1** | **70 ms** | the graphics heap is write-watched by the kernel instead of guarded; landing merge fixed |
+| bench19 | 41.4 | 24.1 | 70 ms | the graphics heap is write-watched by the kernel instead of guarded; landing merge fixed |
+| **bench20** | **42.3** | **23.6** | **74 ms** | kernel writes into title memory noted (banding fixed); decal bake asynchronous; small copies cut from shared buffers |
 
-Averaged over every frame after the first minute, bench19 runs 42.7 ms
-(23.4 fps), and its worst frame is 124 ms (bench18: 44.0 ms, worst 228 ms).
-Per 1000 draws it costs 7.27 ms a frame against bench18's 7.38.
+bench20 drew about 6,900 draws a frame on the route against bench19's 6,000, so
+its raw time is slightly higher; per 1000 draws both cost 7.27 ms a frame, with
+bench20's preparing 0.4 ms lower (6.11 against 6.53) and its worst frame 113 ms
+(bench19: 124 ms). It is the base because it fixes the last cause of banding.
 
 ### Where a frame goes (bench19, moving)
 
@@ -92,6 +94,11 @@ What was learned along the way:
   written since. That reverted the title's own pointers (a crash at world load)
   and its lighting curves (posterized banding), seemingly at random. The merge now
   stores a byte only where the title still holds what we last knew.
+- **The kernel's write watch only sees user-mode writes.** Bytes the kernel puts
+  into watched memory itself (file reads, DirectStorage, page writes) leave no
+  trace, so our copies of them stayed stale and the picture banded now and then.
+  Noting those ranges ourselves when each read completes cleared it: a sampled
+  check of 17,000 copies found none changed without a write being noted.
 - **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
   between the title's first list call and its first submission are not waits on
   us: its submitting thread waits on no fence, event or label at all.
@@ -156,6 +163,9 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_WATCHED_PAGES` | Long runs of fresh physical pages mapped below 4 GiB become write-watched private memory at the title's addresses; remaps copy them back first. |
 | `VICTORY_WATCH_NOT_GUARD`, `VICTORY_WATCH_ONCE` | Watched memory is never guarded; it is walked once a frame and later submissions ask only what they cover. |
 | `VICTORY_REGION_CACHE`, `VICTORY_WATCH_PIECES` | Region splits of private memory are remembered; watched copies are asked about piece by piece. |
+| `VICTORY_COPY_CHECK` | One refresh in 16 checks a copied part against title memory later and logs any change no write explains. |
+| `VICTORY_SUBALLOC_COPIES` | CPU sides of small title-buffer copies are cut from shared buffers instead of made one by one. |
+| `VICTORY_BAKE_SLICE_MS` | The decal bake's texture pass runs in time slices with a catch-up of the slots written lately. |
 
 The grey placeholder is kept on purpose: it shows what hasn't streamed in yet.
 
@@ -278,9 +288,10 @@ A real controller works alongside.
   progress.
 - **Hitches:** a slow-compiling pipeline or a face bake gives a single hitch of
   about 100 ms. The first sight of a new area creates a few thousand small card
-  copies one by one and can stall for one to three seconds; a fix is in testing. A synchronous decal-bake texture pass can stall one frame for
-  about a second, every couple of minutes in the open world; an asynchronous
-  version is in testing.
+  copies one by one and can stall for one to three seconds;
+  `VICTORY_SUBALLOC_CARD=1` cuts that to about one second but slows steady play
+  for now. The decal-bake texture pass now runs in time slices instead of
+  stalling a frame.
 - **Under memory pressure** (low RAM, or another heavy process on the card),
   texture streaming falls behind and shows blocks.
 
