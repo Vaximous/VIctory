@@ -601,7 +601,11 @@ pub(crate) unsafe fn piece(
 ) -> u64 {
     // SAFETY: the caller's.
     // (What it writes is no touch of a copy left on the card.)
-    let put = crate::readprobe::as_landing(|| unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) });
+    let (put, kept) = crate::readprobe::as_landing(|| unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) });
+    if kept > 0 && !copy.is_null() {
+        // SAFETY: the caller's copy, and its bytes.
+        unsafe { resend_kept(title, now, held, parts, &*copy) };
+    }
     if !copy.is_null()
         && let (Some(from), Some(to)) = (parts.first(), parts.last())
     {
@@ -624,9 +628,9 @@ unsafe fn piece_at(
     notes: &mut Notes,
     beside: bool,
     copy: *const crate::shadow::Shadow,
-) -> u64 {
+) -> (u64, u64) {
     let Some(end) = parts.last().map(|p| p.1) else {
-        return 0;
+        return (0, 0);
     };
     // From here until the piece is put the runtime changes no mapping: our
     // view's address stays where the title sees `title`. Not waited for: if
@@ -651,7 +655,7 @@ unsafe fn piece_at(
         });
         let Some(first) = differing.iter().position(|&d| d) else {
             for_pages(title, parts, |_, _| count(stat::PAGES, 1));
-            return 0;
+            return (0, 0);
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
@@ -725,8 +729,49 @@ unsafe fn piece_at(
     count(stat::MISSING, missing);
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
-    dwords * 4
+    (dwords * 4, kept)
 }
+
+/// After a piece kept title writes ([`crate::safecopy::merge`]: the title
+/// wrote a dword the card changed too, and its bytes stayed): the CPU's side
+/// took the title's bytes there, the card's side still has its own. Nothing
+/// else sends them: a refresh finds title memory and the CPU's side alike.
+/// So a later landing of the piece found the card's old bytes against the
+/// title's in the CPU's side and put them back over the title's write. The
+/// dwords where the two sides differ now go up again (`VICTORY_RESEND_KEPT=0`:
+/// not, as before).
+///
+/// # Safety
+/// [`piece`]'s.
+unsafe fn resend_kept(title: usize, now: *const u8, held: *mut u8, parts: &[(usize, usize)], copy: &crate::shadow::Shadow) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RESEND_KEPT").is_none_or(|v| v != "0")) || !copy.carded() {
+        return;
+    }
+    let Some(base) = title.checked_sub(copy.span().0 as usize) else {
+        return;
+    };
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &(from, to) in parts {
+        for at in from..to {
+            // SAFETY: the caller's: both are ours over the piece.
+            if unsafe { now.add(at).read() != held.add(at).read() } {
+                match runs.last_mut() {
+                    Some(last) if last.1 == at => last.1 = at + 1,
+                    _ => runs.push((at, at + 1)),
+                }
+            }
+        }
+    }
+    RESENT[0].fetch_add(1, Ordering::Relaxed);
+    for (from, to) in runs {
+        RESENT[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+        copy.resend(base + from, base + to);
+    }
+}
+
+/// Pieces whose kept title writes went up again ([`resend_kept`]), and bytes.
+pub(crate) static RESENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Landings that left bytes the card changed as the title wrote them since
 /// ([`crate::safecopy::merge`]: the card's side was behind the CPU's), by
@@ -757,6 +802,8 @@ fn title_kept(title: usize, end: usize, blocks: u64, copy: *const crate::shadow:
             blocks,
             pieces_so_far = n,
             blocks_so_far = all,
+            resent_pieces = RESENT[0].load(Ordering::Relaxed),
+            resent_bytes = RESENT[1].load(Ordering::Relaxed),
             frame = crate::frame::current(),
             "a landing left bytes the card changed as the title wrote them since its side was last looked at (the card's side was behind the CPU's)"
         );

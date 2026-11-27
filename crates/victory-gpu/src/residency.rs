@@ -12,7 +12,25 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     // SAFETY: the API initializes the fields of a correctly sized structure.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(faked(status))
+}
+
+/// Debugging (`VICTORY_FAKE_COMMIT_MB=<mb>`, off by default): the host's
+/// available commit and physical memory are taken to be at most `mb`, so
+/// that the paths of a host short of memory are taken without making it
+/// short of memory.
+pub(crate) fn faked(mut status: MEMORYSTATUSEX) -> MEMORYSTATUSEX {
+    static MOST: OnceLock<Option<u64>> = OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_FAKE_COMMIT_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())?;
+        tracing::info!(mb, "available commit and physical memory taken to be at most this (VICTORY_FAKE_COMMIT_MB)");
+        Some(mb * MIB)
+    });
+    if let Some(most) = most {
+        status.ullAvailPageFile = status.ullAvailPageFile.min(most);
+        status.ullAvailPhys = status.ullAvailPhys.min(most);
+    }
+    status
 }
 
 // The texture sweep may run for seconds inside a single submitted frame.

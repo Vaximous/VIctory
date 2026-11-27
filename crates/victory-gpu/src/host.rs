@@ -151,7 +151,7 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then(|| crate::residency::faked(m).ullAvailPhys)
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -568,6 +568,7 @@ pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return None;
     }
+    let m = crate::residency::faked(m);
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ..Default::default()

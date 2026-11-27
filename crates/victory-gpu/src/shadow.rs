@@ -819,6 +819,29 @@ struct CardSide {
     slot: Option<Arc<CardSlot>>,
 }
 
+/// Debugging (`VICTORY_FAKE_REFUSE=<n>`, off by default): one title buffer's
+/// card copy in `n` is turned down as a full card turns it down, to have the
+/// copies of a session whose card is full without filling it.
+fn fake_refused(size: u64) -> bool {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    let every = *EVERY.get_or_init(|| std::env::var("VICTORY_FAKE_REFUSE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if every == 0 || !(ASKED.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(every) {
+        return false;
+    }
+    let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+    CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed);
+    if n <= 64 || n.is_multiple_of(32) {
+        tracing::info!(
+            size_kib = size >> 10,
+            refused = n,
+            frame = crate::frame::current(),
+            "no card copy for a title buffer: turned down as a full card would (VICTORY_FAKE_REFUSE)"
+        );
+    }
+    true
+}
+
 /// [`card_for`] in the card's own memory.
 fn card_room_for(size: u64) -> Option<CardSide> {
     CARD_USED_BEFORE.set(false);
@@ -831,6 +854,9 @@ fn card_room_for(size: u64) -> Option<CardSide> {
     }
     let host = host()?;
     if !host.card_ready() {
+        return None;
+    }
+    if fake_refused(size) {
         return None;
     }
     // Only while the card has room: with this copy on it, a fifth of the
