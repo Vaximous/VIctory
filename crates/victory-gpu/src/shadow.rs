@@ -97,6 +97,9 @@ pub(crate) struct Shadow {
     /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
     /// 0 not known yet, 1 no, 2 yes.
     wc: AtomicU8,
+    /// The frame (+1) whose writes left on the card were counted for this
+    /// copy ([`WC_LEFT`]).
+    wc_frame: AtomicU64,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2298,9 +2301,13 @@ fn wc_no_back_min() -> u64 {
     })
 }
 
-/// Bytes shaders were declared to write in write-combined copies and that
-/// were left on the card ([`wc_no_back`]), since the last frame-rate line.
-pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+/// Of writes left on the card in write-combined copies ([`wc_no_back`]),
+/// since the last frame-rate line: the declarations, the copies (each once a
+/// frame), and those copies' bytes (each once a frame). A copy's ranges are
+/// declared written many times a frame (the world's heap dozens of times,
+/// overlapping), so a sum of declared bytes said thousands of MB a frame:
+/// the copies' bytes are what can come back at most.
+pub(crate) static WC_LEFT: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Whether a refresh of a copy in the card's memory sends up, of the pages
 /// counted as written, only the 4 KiB parts in which title memory differs
@@ -3538,6 +3545,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             wc: AtomicU8::new(0),
+            wc_frame: AtomicU64::new(0),
             mapped: false,
             place: None,
         }
@@ -3574,7 +3582,12 @@ impl Shadow {
         // ([`wc_no_back`]).
         if self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() && self.write_combined() {
             self.written.store(true, Ordering::Relaxed);
-            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            WC_LEFT[0].fetch_add(1, Ordering::Relaxed);
+            let frame = crate::frame::current() + 1;
+            if self.wc_frame.swap(frame, Ordering::Relaxed) != frame {
+                WC_LEFT[1].fetch_add(1, Ordering::Relaxed);
+                WC_LEFT[2].fetch_add(self.len, Ordering::Relaxed);
+            }
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4954,6 +4967,15 @@ impl Shadow {
     pub(crate) fn card_run(&self, from: usize, to: usize) -> CardSpan {
         let to = to.min(self.len as usize);
         card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
+    }
+
+    /// `[from, to)` (offsets in the copy) widened to the edges of the hashed
+    /// pieces it touches, within the copy.
+    pub(crate) fn card_pieces_around(&self, from: usize, to: usize) -> (usize, usize) {
+        let start = self.start as usize;
+        let lo = ((start + from) & !(PIECE - 1)).saturating_sub(start);
+        let hi = ((start + to).next_multiple_of(PIECE) - start).min(self.len as usize);
+        (lo, hi)
     }
 
     /// The offsets of piece `i` of `span` that lie in the span.

@@ -3029,6 +3029,43 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 }
 
 /// `ranges` with `more`, in order, joined where they overlap or touch.
+/// `more` added to `into`, copy by copy (the ranges of one copy joined).
+fn merge_declared(into: &mut Vec<Declared>, more: impl IntoIterator<Item = Declared>) {
+    for (shadow, ranges) in more {
+        match into.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow)) {
+            Some((_, all)) => join_ranges(all, ranges),
+            None => {
+                let mut all = Vec::new();
+                join_ranges(&mut all, ranges);
+                into.push((shadow, all));
+            }
+        }
+    }
+}
+
+/// Of `ranges`, what lies outside every range of `cut`, in order.
+fn ranges_outside(ranges: &[(usize, usize)], cut: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut cut = cut.to_vec();
+    cut.sort_unstable();
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(a, b) in ranges {
+        let mut at = a;
+        for &(c, d) in cut.iter().filter(|&&(c, d)| c < b && d > a) {
+            if c > at {
+                out.push((at, c));
+            }
+            at = at.max(d);
+            if at >= b {
+                break;
+            }
+        }
+        if at < b {
+            out.push((at, b));
+        }
+    }
+    out
+}
+
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
@@ -4585,7 +4622,23 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    ///
+    /// `compare`: whether the compare is made here. Parts of a submission
+    /// sent early ([`send_parts_early`]) leave theirs to the last part, which
+    /// compares what all of them declared, once. `pending`: ranges of copies
+    /// that parts already on the card declared and whose compare is still to
+    /// come: the pieces they touch are not hashed again when sent up here
+    /// (their hashes stay those from before those parts' shaders ran, so the
+    /// compare finds what they wrote; what is sent up there differs from
+    /// those hashes too and is fetched with it, and merged as unchanged).
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+        compare: bool,
+        pending: &[Declared],
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4732,13 +4785,26 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
+                        // Not the pieces of ranges still to be compared.
+                        let kept: Vec<(usize, usize)>;
+                        let ranges = match pending.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                            Some((_, held)) => {
+                                let around: Vec<(usize, usize)> =
+                                    held.iter().map(|&(a, b)| shadow.card_pieces_around(a, b)).collect();
+                                kept = ranges_outside(ranges, &around);
+                                let bytes = |r: &[(usize, usize)]| r.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+                                EARLY[3].fetch_add(bytes(ranges) - bytes(&kept), Ordering::Relaxed);
+                                &kept
+                            }
+                            None => ranges,
+                        };
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            for run in ranges.iter().filter(|&&(a, b)| a < b).map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -4775,6 +4841,9 @@ impl Host {
             sends: own.map(send::Own::memory),
             up,
         };
+        if !compare {
+            return Some(plan);
+        }
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
@@ -6084,6 +6153,11 @@ impl Host {
         let mut this_submission = this_submission;
         // Lists `[0, done)` have had their steps; `[held, done)` are not sent.
         let (mut done, mut held) = (0, 0);
+        // Of the parts sent early, what shaders may write in copies in the
+        // card's memory, and the picked ranges to look at: compared once, by
+        // the last part.
+        let mut pending: Vec<Declared> = Vec::new();
+        let mut pending_looked: Vec<crate::picked::Range> = Vec::new();
         let cuts = if late && relay() && send_parts_early() { early_cuts(&parts, all_runs.len()) } else { Vec::new() };
         for &cut in &cuts {
             // Result slots for the compares running low: the rest as one,
@@ -6122,7 +6196,7 @@ impl Host {
                 shadow.writing(*at, *len);
             }
             let declared = declared_writes(group);
-            let card = self.card_before(&declared, &picked, true);
+            let card = self.card_before(&declared, &picked, true, false, &pending);
             for (shadow, at, bytes) in batch.placed.drain(..) {
                 shadow.placed_copy(at, &bytes);
             }
@@ -6154,10 +6228,11 @@ impl Host {
             // read-backs and bottom-of-pipe writes go with the last part,
             // which lands after it.
             let back = crate::picked::with(declared, &picked.written);
+            let (carded, back): (Vec<Declared>, Vec<Declared>) = back.into_iter().partition(|(shadow, _)| shadow.carded());
             {
                 let mut line = line();
                 let Line { line: items, written, target, .. } = &mut *line;
-                join_ranges(written, back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+                join_ranges(written, back.iter().chain(&carded).flat_map(|(_, ranges)| ranges.iter().copied()));
                 *target = *submitted;
                 items.push(Late::Run(Flight {
                     number: this_submission,
@@ -6169,6 +6244,11 @@ impl Host {
                     own: None,
                     texture_back_ranges: Vec::new(),
                 }));
+            }
+            merge_declared(&mut pending, carded);
+            for range in picked.looked {
+                merge_declared(&mut pending, [(range.0.clone(), vec![(range.1, range.1 + range.2)])]);
+                pending_looked.push(range);
             }
             RELAY_MOVED.notify_one();
             EARLY[0].fetch_add(1, Ordering::Relaxed);
@@ -6220,12 +6300,18 @@ impl Host {
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
-        let picked = crate::picked::declare(runs);
+        let mut picked = crate::picked::declare(runs);
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
-        let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut declared = declared_writes(runs);
+        // With what the parts sent early left to compare here.
+        let pending = {
+            merge_declared(&mut declared, pending.iter().cloned());
+            picked.looked.extend(pending_looked);
+            pending
+        };
+        let card = self.card_before(&declared, &picked, flown, true, &pending);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -8470,7 +8556,8 @@ fn send_parts_early() -> bool {
 /// Of [`send_parts_early`], since the last frame line: parts sent early,
 /// parts kept with the next for picked views, submissions whose rest went as
 /// one for the compares' result slots.
-static EARLY: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// And bytes sent up whose pieces were left unhashed for a compare to come.
+static EARLY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The places in a submission of `len` lists where a part sent early ends
 /// ([`send_parts_early`]): the beginnings of `parts` but the first, in order.
@@ -8483,11 +8570,13 @@ fn early_cuts(parts: &[usize], len: usize) -> Vec<usize> {
 
 /// The counts of [`EARLY`], for the frame line.
 fn send_parts_early_line(frames: f64) {
-    let [sent, kept, rest] = [0, 1, 2].map(|i| EARLY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [sent, kept, rest, unhashed] = [0, 1, 2, 3].map(|i| EARLY[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if sent + kept + rest > 0.0 {
         tracing::info!(
             "parts of submissions sent early, per frame (VICTORY_SEND_PARTS_EARLY=1): {sent:.1}; {kept:.1} kept with the next \
-             for views shaders pick; {rest:.1} submissions whose rest went as one for the compares' result slots"
+             for views shaders pick; {rest:.1} submissions whose rest went as one for the compares' result slots; {:.2} MB \
+             sent up in pieces left unhashed for the last part's compare",
+            unhashed / 1e6
         );
     }
 }
@@ -10199,12 +10288,15 @@ impl Meter {
         beside_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
-            if passes + compares + wc_left > 0.0 {
+            let [wc_declared, wc_copies, wc_bytes] =
+                [0, 1, 2].map(|i| crate::shadow::WC_LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let wc_mb = wc_bytes / 1e6;
+            if passes + compares + wc_declared > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
-                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK=0: copied back)",
+                     writes left on the card in write-combined memory: {wc_declared:.0} ranges declared, in {wc_copies:.1} copies \
+                     of {wc_mb:.1} MB together (VICTORY_WC_NO_BACK=0: copied back)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
@@ -11518,6 +11610,16 @@ mod refresh_tests {
     /// title memory holds.
     /// A joined submission's parts end where the next begins: not at its
     /// first list, nor past its last, each once, in order.
+    #[test]
+    fn what_is_hashed_leaves_out_the_pieces_to_be_compared() {
+        let outside = super::ranges_outside;
+        assert_eq!(outside(&[(0, 100)], &[(10, 20), (30, 40)]), vec![(0, 10), (20, 30), (40, 100)]);
+        assert_eq!(outside(&[(0, 10), (50, 60)], &[(5, 55)]), vec![(0, 5), (55, 60)]);
+        assert!(outside(&[(10, 20)], &[(0, 30)]).is_empty());
+        assert_eq!(outside(&[(10, 20)], &[]), vec![(10, 20)]);
+        assert_eq!(outside(&[(10, 20)], &[(25, 30), (0, 12)]), vec![(12, 20)]);
+    }
+
     #[test]
     fn parts_sent_early_end_where_the_next_begins() {
         assert_eq!(super::early_cuts(&[0, 3, 5], 8), vec![3, 5]);
