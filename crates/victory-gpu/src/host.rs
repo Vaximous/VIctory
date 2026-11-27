@@ -5741,7 +5741,25 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        //
+        // Beside them ([`steps_beside_refresh`]): the refreshes in front of
+        // the lists that nothing in the air or in the steps can touch, on a
+        // thread of their own, joined before anything below.
+        let own = if late {
+            let warm = warm_spans(runs, parts);
+            if warm.is_empty() {
+                self.card_steps(runs)
+            } else {
+                std::thread::scope(|scope| {
+                    let beside = scope.spawn(move || warm_up(warm));
+                    let own = self.card_steps(runs);
+                    let _ = beside.join();
+                    own
+                })
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -8046,6 +8064,121 @@ fn ahead_of_writes() -> bool {
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+}
+
+/// Whether the refreshes in front of a submission's lists start while the
+/// steps on the card are being chosen, on a thread beside
+/// (`VICTORY_STEPS_BESIDE_REFRESH`, on unless `=0`: one after the other).
+///
+/// Run fm14: the card idle 11.4 ms a frame between 11.3 submissions, the
+/// chain to each next one the submitting thread's work one piece after the
+/// other: the steps on the card (`card_steps`) some 3 ms, then the
+/// refreshes in front. Only what neither can change is done beside
+/// ([`warm_spans`]); the refreshes in front are made afterwards as before,
+/// and find those up to date.
+fn steps_beside_refresh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEPS_BESIDE_REFRESH").is_none_or(|v| v != "0"))
+}
+
+/// The pages [`warm_filter`] keeps apart: a copy's refresh takes whole ones.
+const WARM_PAGE: usize = 1 << 16;
+
+/// The refreshes in front of `runs` ([`front_spans`], parts beginning at
+/// `parts`, without the list of steps on the card that may come before
+/// them) that can be made while those steps are chosen ([`warm_filter`]):
+/// none unless [`steps_beside_refresh`], [`refresh_front`], and the steps on
+/// the card have something to take.
+fn warm_spans(runs: &[&HostList], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    if !steps_beside_refresh() || !refresh_front() || card_steps::stage() == 0 || !relay_exact() {
+        return Vec::new();
+    }
+    let written = {
+        let line = line();
+        if line.written.is_empty() {
+            return Vec::new();
+        }
+        line.written.clone()
+    };
+    if blocked_by(&written, runs, false).is_none() {
+        return Vec::new();
+    }
+    let _planning = crate::timeline::span("refreshes beside the steps on the card: planned");
+    let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+    let mut touches = Vec::new();
+    // What the lists' own steps write of title memory: the steps on the
+    // card may take them, and write their host copies.
+    let mut written = written;
+    for (n, list) in runs.iter().enumerate() {
+        if parts.contains(&n) {
+            touches.push(Touch::Part);
+        }
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(shadow, at, len) => {
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    copies.entry(key).or_insert_with(|| shadow.clone());
+                    touches.push(Touch::Refresh(key, *at, *at + *len));
+                }
+                Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+                &Step::Copy(dst, _, len) => written.push((dst, dst + len)),
+                Step::Placed(placed) => written.push((placed.dst, placed.dst + placed.len)),
+                _ => {}
+            }
+        }
+    }
+    let spans = front_spans(touches.into_iter()).into_iter().filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)));
+    warm_filter(spans, &written)
+}
+
+/// Of `spans`, those whose refresh nothing that may change while the steps
+/// on the card are chosen touches: no flight's shaders write the copy, and
+/// none of its pages holds title memory in `written` (what flights write,
+/// and with it what a settle's copy-back writes; what the lists' own steps
+/// write, which the steps on the card may take, and so write in their copies).
+fn warm_filter(
+    spans: impl Iterator<Item = (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    written: &[(usize, usize)],
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let mut pages: Vec<(usize, usize)> =
+        written.iter().filter(|r| r.0 < r.1).map(|&(from, to)| (from / WARM_PAGE, to.div_ceil(WARM_PAGE))).collect();
+    pages.sort_unstable();
+    let touched = |from: usize, to: usize| {
+        let (first, last) = (from / WARM_PAGE, to.div_ceil(WARM_PAGE));
+        // Those that begin before `last`; any of them ending after `first`.
+        let upto = pages.partition_point(|p| p.0 < last);
+        pages[..upto].iter().any(|p| p.1 > first)
+    };
+    spans
+        .filter(|(shadow, from, to)| {
+            from < to && !shadow.writes_pending() && !touched(*from, *to)
+        })
+        .collect()
+}
+
+/// [`warm_spans`]'s refreshes, on the calling thread and the wide ones: an
+/// asking of their own, ended when they are done, as a submission's.
+fn warm_up(spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+    let _beside = crate::timeline::span("refreshes beside the steps on the card");
+    let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+    let once = crate::watch::once();
+    if once {
+        crate::watch::ask_once(&ranges);
+    } else if ranges.len() > 1 {
+        crate::watch::ask_ahead(&ranges);
+    }
+    let n = spans.len();
+    crate::shadow::wide_each(n, move |i| {
+        let (shadow, from, to) = &spans[i];
+        if !shadow.nothing_new(*from, *to - *from) {
+            Batch::update(shadow, *from, *to);
+        }
+    });
+    if once {
+        crate::watch::ask_once_end();
+    } else if ranges.len() > 1 {
+        crate::watch::ask_ahead_done();
+    }
 }
 
 /// Per copy what is refreshed in front of a submission's steps, as
@@ -10683,9 +10816,19 @@ mod refresh_tests {
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
+        submission_warmed(ranges, flushes, false);
+    }
+
+    /// [`submission`], with `warmed` its refreshes made beside first, as
+    /// `VICTORY_STEPS_BESIDE_REFRESH` does while the steps on the card are
+    /// chosen (`super::warm_up`).
+    fn submission_warmed(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize, warmed: bool) {
         // One at a time, as submissions are.
         static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        if warmed {
+            super::warm_up(ranges.iter().map(|(shadow, at, len)| (shadow.clone(), *at, *at + *len)).collect());
+        }
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
         let mut batch = Batch::default();
@@ -10702,6 +10845,88 @@ mod refresh_tests {
     /// copies (of both kinds of memory, over one another, none on a page
     /// line) are refreshed in which ranges: a refreshed range holds what
     /// title memory holds.
+    /// The refreshes made beside the steps on the card, then the
+    /// submission's own: the same bytes in the same ranges as the
+    /// submission's alone, and title memory's.
+    #[test]
+    fn refreshes_beside_leave_what_alone_leaves() {
+        let mut random = Random(0x0BE5_1DE5_7E95_0001);
+        const LEN: usize = 16 * PAGE;
+        let region = title(LEN, false);
+        // (Copy warmed, its data; copy alone, its data), over the same title bytes.
+        let mut pairs = Vec::new();
+        for (from, to) in [(0, LEN), (300, LEN - 4000), (2 * PAGE + 5, 7 * PAGE + 9), (5 * PAGE, 5 * PAGE + 200)] {
+            let make = || {
+                let data = memory(to - from);
+                (Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data)
+            };
+            pairs.push((make(), make()));
+        }
+        let byte = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        for round in 0..300 {
+            for _ in 0..random.below(5) {
+                let at = region + random.below(LEN - 64);
+                for i in 0..1 + random.below(60) {
+                    // SAFETY: the test's title memory.
+                    unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                }
+            }
+            let (mut warmed, mut alone) = (Vec::new(), Vec::new());
+            for ((one, _), (other, _)) in &pairs {
+                if random.below(3) == 0 {
+                    continue;
+                }
+                let (start, len) = one.span();
+                let (start, len) = (start as usize, len as usize);
+                let from = random.below(len);
+                let n = 1 + random.below(len - from);
+                warmed.push((one.clone(), start + from, n));
+                alone.push((other.clone(), start + from, n));
+            }
+            if warmed.is_empty() {
+                continue;
+            }
+            let flushes = 1 + random.below(3);
+            submission_warmed(&warmed, flushes, true);
+            submission(&alone, flushes);
+            for ((one, at, n), (other, ..)) in warmed.iter().zip(&alone) {
+                let data = |shadow: &Arc<Shadow>| {
+                    let pair = pairs.iter().find(|p| Arc::ptr_eq(&p.0.0, shadow) || Arc::ptr_eq(&p.1.0, shadow)).unwrap();
+                    if Arc::ptr_eq(&pair.0.0, shadow) { pair.0.1 } else { pair.1.1 }
+                };
+                let start = one.span().0 as usize;
+                // SAFETY: the copies' own memory, `[at, at + n)` within them.
+                let (a, b, t) = unsafe {
+                    (
+                        std::slice::from_raw_parts(data(one).add(at - start), *n),
+                        std::slice::from_raw_parts(data(other).add(at - start), *n),
+                        std::slice::from_raw_parts(*at as *const u8, *n),
+                    )
+                };
+                assert!(a == b && a == t, "round {round}: {at:#x}+{n:#x}; first byte {}", byte(*at));
+            }
+        }
+    }
+
+    /// What may change while the steps on the card are chosen keeps a
+    /// refresh from being made beside them: a page of it in what is written.
+    #[test]
+    fn refreshes_beside_keep_off_written_pages() {
+        const LEN: usize = 8 * PAGE;
+        let region = title(LEN, false);
+        let shadow = Shadow::unbacked(region as u64, memory(LEN), LEN as u64, false);
+        let page = super::WARM_PAGE;
+        let spans = || [(0, 100), (2 * page + 10, 3 * page), (5 * page, 6 * page)].map(|(f, t)| (shadow.clone(), region + f, region + t));
+        let kept = |written: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            super::warm_filter(spans().into_iter(), written).iter().map(|s| (s.1 - region, s.2 - region)).collect()
+        };
+        assert_eq!(kept(&[]).len(), 3);
+        // A byte on the span's last page, and a range on the page past it.
+        assert_eq!(kept(&[(region + 3 * page - 1, region + 3 * page)]), vec![(0, 100), (5 * page, 6 * page)]);
+        assert_eq!(kept(&[(region + 6 * page, region + 6 * page + 8)]).len(), 3);
+        assert_eq!(kept(&[(region + 200, region + 300), (region + 4 * page, region + 7 * page)]), vec![(2 * page + 10, 3 * page)]);
+    }
+
     #[test]
     fn refreshed_ranges_hold_title_memory() {
         // SAFETY (all blocks): title memory and copies of the test's own,
