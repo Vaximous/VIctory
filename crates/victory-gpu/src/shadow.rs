@@ -4860,6 +4860,15 @@ impl Shadow {
         card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
     }
 
+    /// `[from, to)` (offsets in the copy) widened to the edges of the hashed
+    /// pieces it touches, within the copy.
+    pub(crate) fn card_pieces_around(&self, from: usize, to: usize) -> (usize, usize) {
+        let start = self.start as usize;
+        let lo = ((start + from) & !(PIECE - 1)).saturating_sub(start);
+        let hi = ((start + to).next_multiple_of(PIECE) - start).min(self.len as usize);
+        (lo, hi)
+    }
+
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
