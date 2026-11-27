@@ -2120,11 +2120,15 @@ fn parts_open_locked<T>(f: impl FnOnce(&mut BTreeMap<usize, u16>) -> T) -> T {
 }
 
 /// Whether [`open_part`] lets go of [`PARTS_OPEN`] over its `VirtualProtect`
-/// (`VICTORY_PARTS_APART`, on unless `=0`). Held over it, every part a fault
+/// (`VICTORY_PARTS_APART=1`). Held over it, every part a fault
 /// opened anywhere waited for the one before it, the kernel's change
 /// included: some 530 a frame in run ow44-move, on the title's threads.
+///
+/// Off unless `=1`: the builds with it (runs ow45 to ow47) did not beat the
+/// one before.
 fn parts_apart() -> bool {
-    crate::toggled!("VICTORY_PARTS_APART")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTS_APART").is_some_and(|v| v == "1"))
 }
 
 /// With `block`'s claim held: makes it read-only whole again, if parts of
@@ -3361,13 +3365,18 @@ const RUN_MOST: usize = 8;
 
 /// Whether [`protect_claimed`] lets go of each run's claims once that run
 /// is guarded, a run being at most [`RUN_MOST`] blocks
-/// (`VICTORY_CLAIMS_PER_RUN`, on unless `=0`). Held to the end of the range,
+/// (`VICTORY_CLAIMS_PER_RUN=1`). Held to the end of the range,
 /// a write fault of the title's in its first block waited for the kernel's
 /// changes of every block after it: the faults spent 6.4 ms a frame
 /// of their 19.8 ms holding the guards' lock waiting for claims in run
 /// ow45-move.
+///
+/// Off unless `=1`: the faults' waits were for other faults' claims (4.8 of
+/// 5.3 ms a frame in run ow46b-move), and the build with it did not beat the
+/// one before.
 fn claims_per_run() -> bool {
-    crate::toggled!("VICTORY_CLAIMS_PER_RUN")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAIMS_PER_RUN").is_some_and(|v| v == "1"))
 }
 
 fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
