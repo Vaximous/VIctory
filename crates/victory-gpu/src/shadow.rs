@@ -2189,10 +2189,18 @@ pub fn title_memory_attributes(at: usize, len: usize, protect: u32) {
     } else {
         WRITE_BACK
     };
-    if len == 0 || kind == WRITE_BACK {
+    if len == 0 {
         return;
     }
-    ATTRIBUTES.write().unwrap_or_else(|e| e.into_inner()).push((at as u64, (at + len) as u64, kind));
+    let (from, to) = (at as u64, (at + len) as u64);
+    let mut all = ATTRIBUTES.write().unwrap_or_else(|e| e.into_inner());
+    // Write-back is noted only over what was noted otherwise (memory
+    // reserved without access for the CPU, then committed): the latest
+    // says.
+    if kind == WRITE_BACK && !all.iter().any(|&(a, b, _)| a < to && b > from) {
+        return;
+    }
+    all.push((from, to, kind));
 }
 
 /// The title asked for `[at, at + len)` write-combined.
@@ -2211,13 +2219,14 @@ pub(crate) fn write_combined_freed(at: usize, len: usize) {
     all.retain(|&(from, to, _)| if len == 0 { from != at } else { to <= at || from >= end });
 }
 
-/// The kind of `[start, start + len)`: that of the one region all of it lies
-/// in, else write-back.
+/// The kind of `[start, start + len)`: that of the latest region noted that
+/// all of it lies in, else write-back.
 pub(crate) fn kind_of(start: u64, len: u64) -> u8 {
     ATTRIBUTES
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .rev()
         .find(|&&(from, to, _)| from <= start && start + len <= to)
         .map_or(WRITE_BACK, |r| r.2)
 }
@@ -3124,6 +3133,15 @@ mod write_combined_tests {
         assert_eq!(kind_of(base as u64 + 0x200_0000, 0x1000), GPU_ONLY);
         assert_eq!(kind_of(base as u64 + 0x300_0000, 0x1000), WRITE_BACK, "read-write with GPU bits is the CPU's too");
         assert_eq!(kind_of(base as u64 + 0xf_f000, 0x2000), WRITE_BACK, "past an end");
+        // Reserved the GPU's alone, then committed: what was asked last.
+        let reserved = base + 0x400_0000;
+        title_memory_attributes(reserved, 0x40_0000, 0x801);
+        title_memory_attributes(reserved, 0x10_0000, 0x4);
+        title_memory_attributes(reserved + 0x10_0000, 0x10_0000, 0x2404);
+        assert_eq!(kind_of(reserved as u64, 0x1000), WRITE_BACK);
+        assert_eq!(kind_of(reserved as u64 + 0x10_0000, 0x1000), WRITE_COMBINED_KIND);
+        assert_eq!(kind_of(reserved as u64 + 0x30_0000, 0x1000), GPU_ONLY);
+        write_combined_freed(reserved, 0x40_0000);
         for i in 0..4 {
             write_combined_freed(base + i * 0x100_0000, 0);
         }
