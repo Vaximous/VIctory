@@ -3000,10 +3000,13 @@ impl State {
                 continue;
             }
             let oldest = shots.iter().map(|s| s.frame).min().unwrap_or(frame);
+            // (Up to the newest of them: up to now, the slots written while
+            // they waited joined in, 12,000-24,000 of them, run ow50.)
+            let newest = shots.iter().map(|s| s.frame).max().unwrap_or(frame);
             let mut probe = State::default();
             probe.heaps = shots[0].heaps;
             let (left, target, missing) = if mode == Kept::Targeted {
-                (bake_left(frame, bake_most()), Target::Only(oldest.saturating_sub(bake_recent()), frame), UNSERVED_LATELY)
+                (bake_left(frame, bake_most()), Target::Only(oldest.saturating_sub(bake_recent()), newest), UNSERVED_LATELY)
             } else {
                 (bake_left(frame, bake_whole_slice()), Target::All, UNSERVED_ALL)
             };
@@ -3817,10 +3820,18 @@ impl State {
         // looks of 48 KiB a pass (200 MB; 65,536 in a bake), passes of
         // 125-220 ms that uploaded nothing, bakes of a second and more
         // (run ow14-warm).
-        // (A bake's pass in a slice of a frame, [`bake_slice`]: as many as
-        // the world's, or the looks alone were 8-15 ms.)
+        // (A bake's pass in a slice of a frame, [`bake_slice`]: a few, or the
+        // looks alone were 8-15 ms, and up to 143 ms at 256, run ow50.)
         let short = PASS_BUDGET.get().is_some_and(|(ms, _, bake)| bake && ms < 100);
-        let reach = if (baking || sync.is_some()) && !short { 4096 } else if loading() { 1024 } else { 256 };
+        let reach = if short {
+            64
+        } else if baking || sync.is_some() {
+            4096
+        } else if loading() {
+            1024
+        } else {
+            256
+        };
         let prints = recheck_prints(host, &due[..due.len().min(reach)]);
         PASS_PHASES[2].store(prints_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         let premake_began = std::time::Instant::now();
