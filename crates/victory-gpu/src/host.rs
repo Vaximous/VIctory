@@ -4675,7 +4675,9 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         let joins = rehash_runs() || own.is_some();
-                        // Not the pieces of ranges still to be compared.
+                        // Not the pieces of ranges still to be compared
+                        // (declared as title addresses; `ranges` are
+                        // offsets in the copy).
                         let kept: Vec<(usize, usize)>;
                         let ranges = match pending.iter().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
                             Some((_, held)) => {
