@@ -20,8 +20,8 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -1250,14 +1250,18 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
+    let slices: Vec<Option<Slice>> = match &pages {
+        Some(pages) => {
+            let table = page_table();
+            pages.iter().map(|page| table.pages.get(page).cloned()).collect()
+        }
+        None => Vec::new(),
+    };
+    give_back_first(&mut physical, &[(base, n * PAGE)], &slices.iter().flatten().collect::<Vec<_>>());
     let _changing = victory_gpu::title_memory_remapping_in(&[views_touched(&physical, base, n * PAGE)]);
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
-    };
-    let slices: Vec<Option<Slice>> = {
-        let table = page_table();
-        pages.iter().map(|page| table.pages.get(page).cloned()).collect()
     };
     let mut i = 0;
     while i < n {
@@ -1338,6 +1342,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
+    give_back_first(&mut physical, &[(to, len), (from, if from == 0 { 0 } else { len })], &[]);
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping_in(&[views_touched(&physical, to, len)]);
     unmap(&mut physical, to, len);
@@ -1546,6 +1551,17 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     while at < pages.len() {
         let _busy = Busy::begin();
         let mut physical = physical();
+        {
+            // The group's addresses and sources, at most: what it gives back
+            // goes first, under a change of its own.
+            let near: Vec<(usize, usize)> = pages[at..]
+                .iter()
+                .take(GROUP)
+                .flat_map(|&(to, from)| [Some((to, PAGE)), from.map(|from| (from, PAGE))])
+                .flatten()
+                .collect();
+            give_back_first(&mut physical, &near, &[]);
+        }
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
         for &(to, from) in &pages[at..] {
@@ -1602,6 +1618,8 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
+        let near: Vec<(usize, usize)> = ops.iter().map(|op| (op.at, PAGE)).collect();
+        give_back_first(&mut physical, &near, &ops.iter().filter_map(|op| op.slice.as_ref()).collect::<Vec<_>>());
         let touches: Vec<(usize, usize)> = ops.iter().map(|op| views_touched(&physical, op.at, PAGE)).collect();
         let _changing = victory_gpu::title_memory_remapping_in(&touches);
         ok &= change(&mut physical, ops);
@@ -1963,9 +1981,14 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 /// `VICTORY_WATCHED_PAGES`: 1 (default) runs of fresh physical pages the
 /// title maps below 4 GiB are write-watched private memory ([`own_pages`]);
 /// 2 runs anywhere; 0 every mapping a view, as before.
+/// `VICTORY_WATCH_NOT_GUARD=0` is 0 too, whatever this says.
 fn watched_pages() -> u8 {
-    static MODE: LazyLock<u8> =
-        LazyLock::new(|| std::env::var("VICTORY_WATCHED_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1));
+    static MODE: LazyLock<u8> = LazyLock::new(|| {
+        if std::env::var_os("VICTORY_WATCH_NOT_GUARD").is_some_and(|v| v == "0") {
+            return 0;
+        }
+        std::env::var("VICTORY_WATCHED_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+    });
     *MODE
 }
 
@@ -2046,9 +2069,11 @@ fn map_own(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bo
 /// Gives the private run at `base` back to its section: its bytes copied
 /// into the section's pages and a view of them mapped at `base`.
 ///
-/// shortcut: a title thread writing the run while this runs loses its write
-/// or faults; the heap is never remapped in the title's runs, and the log
-/// says so if it is.
+/// Under a change of mapping that covers the run ([`give_back_first`]):
+/// reads in place there wait for it. The run is made read-only before its
+/// bytes are copied, so a title thread that writes it meanwhile faults and
+/// waits for the change (`victory_gpu`'s handler), then writes the view;
+/// one that reads it between the free and the view does the same.
 fn unown(physical: &mut Physical, base: usize) {
     let Some((len, slice)) = physical.private.remove(&base) else {
         return;
@@ -2061,6 +2086,17 @@ fn unown(physical: &mut Physical, base: usize) {
     }
     shown_mut().forget(base, len, &slice);
     victory_gpu::title_memory_unmapping(base, len);
+    let mut was = 0;
+    // SAFETY: our private allocation, whole.
+    let still = unsafe { VirtualProtect(base as *const c_void, len, PAGE_READONLY, &mut was) } != 0;
+    if !still {
+        tracing::warn!(
+            address = format_args!("{base:#x}"),
+            len,
+            error = %std::io::Error::last_os_error(),
+            "write-watched physical pages not made read-only to be given back: a write meanwhile may be lost"
+        );
+    }
     // SAFETY: the run's committed private bytes.
     let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, len) };
     let copied = match slice.section.window(slice.index, n) {
@@ -2084,6 +2120,46 @@ fn unown(physical: &mut Physical, base: usize) {
         mapped,
         "write-watched physical pages given back to a view (the title shows or unmaps them elsewhere)"
     );
+}
+
+/// Before a change of mapping takes its own lock: gives back
+/// ([`unown`]) the private runs that the change would give back inside it,
+/// those `ranges` (address, bytes) touch and those holding a page of
+/// `slices` (to be shown elsewhere), under a change of mapping that covers
+/// the runs themselves. The change's own covers only its addresses (and the
+/// views it cuts): a run given back from inside it, at another address or
+/// reaching past its own, would be copied, freed and mapped again with
+/// reads in place there not waiting.
+fn give_back_first(physical: &mut Physical, ranges: &[(usize, usize)], slices: &[&Slice]) {
+    if physical.private.is_empty() {
+        return;
+    }
+    let mut hit: Vec<usize> = Vec::new();
+    for &(base, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        let end = base.saturating_add(len);
+        hit.extend(physical.private.range(..end).filter(|(at, (size, _))| **at + *size > base).map(|(at, _)| *at));
+    }
+    for slice in slices {
+        if !slice.section.any_private.load(Ordering::Acquire) {
+            continue;
+        }
+        let runs = slice.section.private.read().unwrap_or_else(|e| e.into_inner());
+        hit.extend(runs.iter().filter(|r| r.0 <= slice.index && slice.index < r.0 + r.1).map(|r| r.2));
+    }
+    if hit.is_empty() {
+        return;
+    }
+    hit.sort_unstable();
+    hit.dedup();
+    let spans: Vec<(usize, usize)> =
+        hit.iter().filter_map(|at| physical.private.get(at).map(|(len, _)| (*at, *len))).collect();
+    let _changing = victory_gpu::title_memory_remapping_in(&spans);
+    for at in hit {
+        unown(physical, at);
+    }
 }
 
 /// Gives back every private run that `[base, base + len)` touches.
