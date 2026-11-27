@@ -34,6 +34,14 @@
 //! another. With an `S` line (or `VICTORY_ROUTE_SETTLE_S`, route seconds) the
 //! events after it are given by the time since the replay's own world
 //! settled, the ones between the world and it held short of it as before.
+//!
+//! After the settling the route is played by the title's frames, not by the
+//! time: each frame the title begins moves it on by `VICTORY_ROUTE_FRAME_MS`
+//! (52 ms; `0`: by the time, as before). The walk is the same number of the
+//! title's frames in every build: one that runs it at 43 ms a frame walked
+//! the same seconds in some 370 frames against 320 at 51 ms, and went past
+//! the door the route goes out by (half of the runs of one route ended in
+//! the house, at 43 to 45 ms a frame; those at 50 to 56 ms went out).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -320,6 +328,12 @@ fn clock(route: &Route) -> u64 {
                 "route: the world settled; from here the route plays by the time since it, its walk moved by the shift"
             );
         });
+        if let Some(per_frame) = frame_us()
+            && let Some(first) = victory_gpu::frame::world_settled_frame()
+        {
+            let frames = victory_gpu::frame::frames().saturating_sub(first);
+            return settle + frames * per_frame;
+        }
         return settle + now.saturating_sub(there);
     }
     let at = if route.polls.is_empty() {
@@ -397,6 +411,19 @@ fn until() -> u64 {
     })
 }
 
+/// After the world settled, how far a frame of the title moves the route on,
+/// in microseconds (`VICTORY_ROUTE_FRAME_MS`, 52 if unset; `0`: none, the
+/// route plays by the time).
+fn frame_us() -> Option<u64> {
+    static US: OnceLock<Option<u64>> = OnceLock::new();
+    *US.get_or_init(|| {
+        let ms = std::env::var("VICTORY_ROUTE_FRAME_MS").ok().map_or(Some(52.0), |v| v.trim().parse::<f64>().ok());
+        let us = ms.filter(|&ms| ms > 0.0).map(|ms| (ms * 1000.0) as u64);
+        tracing::info!(frame_ms = us.map(|us| us as f64 / 1000.0), "route: after the world settled it plays by the title's frames (VICTORY_ROUTE_FRAME_MS)");
+        us
+    })
+}
+
 /// The route's clock ([`clock`]), if it is still played.
 fn playing(route: &Route) -> Option<u64> {
     let at = clock(route);
@@ -404,7 +431,11 @@ fn playing(route: &Route) -> Option<u64> {
         return Some(at);
     }
     static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| tracing::info!(route_s = at as f64 / 1e6, "route: played up to VICTORY_ROUTE_UNTIL_S; the scripted keys go on"));
+    SAID.call_once(|| {
+        let after_settle_s = victory_gpu::frame::world_settled().map(|s| s.elapsed().as_secs_f64());
+        let frames = victory_gpu::frame::world_settled_frame().map(|f| victory_gpu::frame::frames().saturating_sub(f));
+        tracing::info!(route_s = at as f64 / 1e6, after_settle_s, frames, "route: played up to VICTORY_ROUTE_UNTIL_S; the scripted keys go on")
+    });
     None
 }
 

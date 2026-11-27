@@ -106,6 +106,19 @@ pub fn world_settled() -> Option<Instant> {
 
 static SETTLED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// The title's frames begun so far (its frame waits that ended): for input
+/// routes played by frames rather than by time.
+pub fn frames() -> u64 {
+    current()
+}
+
+/// The frame ([`frames`]) at which the world settled ([`world_settled`]).
+pub fn world_settled_frame() -> Option<u64> {
+    SETTLED_FRAME.get().copied()
+}
+
+static SETTLED_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 /// After the world's first frame: the last frame shown and where the
 /// current run of quick frames began.
 fn settling(now: Instant) {
@@ -122,6 +135,7 @@ fn settling(now: Instant) {
     };
     *run = Some((last, began));
     if now.saturating_duration_since(began) >= run_for && SETTLED.set(now).is_ok() {
+        let _ = SETTLED_FRAME.set(current());
         let world = WORLD.get().copied().unwrap_or(now);
         tracing::info!(
             frame = current(),
