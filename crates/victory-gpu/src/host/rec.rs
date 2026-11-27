@@ -72,6 +72,8 @@ pub(crate) struct Rec {
     /// Unused since only writers mark the list ([`Rec::writes`]); kept for
     /// [`Rec::loud`]'s callers.
     quiet: AtomicBool,
+    /// Uses of the list so far ([`Rec::uses`]).
+    uses: AtomicU64,
 }
 
 /// `VICTORY_HOLD_WAITS` (on by default; `0` off): the title's waits for every shader
@@ -131,7 +133,14 @@ impl Rec {
             dirty: AtomicBool::new(true),
             waiting: AtomicBool::new(false),
             quiet: AtomicBool::new(false),
+            uses: AtomicU64::new(0),
         }
+    }
+
+    /// How many times the list was used to record (any call through it):
+    /// what changes it, something went into the list.
+    pub(crate) fn uses(&self) -> u64 {
+        self.uses.load(Relaxed)
     }
 
     /// The title waits for every earlier shader write: the wait is made, or held
@@ -307,6 +316,7 @@ impl std::ops::Deref for Rec {
 
     /// The list, with what is held recorded first.
     fn deref(&self) -> &ID3D12GraphicsCommandList {
+        self.uses.fetch_add(1, Relaxed);
         self.flush();
         &self.list
     }
