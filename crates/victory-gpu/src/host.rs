@@ -10412,7 +10412,7 @@ impl Meter {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
-                     writes left on the card in write-combined memory: {wc_declared:.0} ranges declared, in {wc_copies:.1} copies \
+                     writes left on the card in write-combined or uncached memory: {wc_declared:.0} ranges declared, in {wc_copies:.1} copies \
                      of {wc_mb:.1} MB together (VICTORY_WC_NO_BACK=0: copied back)",
                     if rehash_runs() { "on" } else { "off" }
                 );

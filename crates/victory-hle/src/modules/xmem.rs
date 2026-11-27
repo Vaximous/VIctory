@@ -180,9 +180,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
-    // Write-combined: memory the title's CPU writes and does not read.
-    if !at.is_null() && asked & 0x400 != 0 {
-        victory_gpu::title_memory_write_combined(at as usize, size);
+    // Write-combined, uncached, the GPU's alone: kinds of memory the title's
+    // CPU does not read.
+    if !at.is_null() {
+        victory_gpu::title_memory_attributes(at as usize, size, asked);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at

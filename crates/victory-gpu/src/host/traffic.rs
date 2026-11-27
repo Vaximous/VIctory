@@ -13,6 +13,8 @@ use std::sync::Mutex;
 struct Moved {
     bytes: [u64; 2],
     pieces: [HashSet<u32>; 2],
+    /// The kind of its title memory (`crate::shadow::KINDS`).
+    kind: u8,
 }
 
 pub(super) const UP: usize = 0;
@@ -23,7 +25,12 @@ static MOVED: Mutex<Option<HashMap<(u64, u64), Moved>>> = Mutex::new(None);
 /// Offsets `ranges` of the copy of `span` (title address, bytes) went `way`.
 pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (usize, usize)>) {
     let mut all = MOVED.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = !all.as_ref().is_some_and(|all| all.contains_key(&span));
     let m = all.get_or_insert_with(Default::default).entry(span).or_default();
+    if fresh {
+        m.kind = crate::shadow::kind_of(span.0, span.1);
+    }
+    let before = m.bytes[way];
     // (Thousands of runs lie in one piece, one after the other.)
     let mut last = u32::MAX;
     for (from, to) in ranges.filter(|r| r.0 < r.1) {
@@ -34,6 +41,7 @@ pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (
         }
         last = end;
     }
+    crate::shadow::BY_KIND[m.kind as usize][way].fetch_add(m.bytes[way] - before, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// For the log, over `frames` frames.
@@ -45,6 +53,21 @@ pub(super) fn line(frames: f64) {
     let sum = |way: usize| all.iter().map(|(_, m)| m.bytes[way]).sum::<u64>();
     // Copies that only move one way.
     let only = |way: usize| all.iter().filter(|(_, m)| m.bytes[1 - way] == 0).map(|(_, m)| m.bytes[way]).sum::<u64>();
+    {
+        let kinds: Vec<String> = crate::shadow::KINDS
+            .iter()
+            .zip(&crate::shadow::BY_KIND)
+            .map(|(name, ways)| {
+                let [up, back] = [0, 1].map(|w| mb(ways[w].swap(0, std::sync::atomic::Ordering::Relaxed)));
+                format!("{name} {up:.1} up, {back:.1} fetched")
+            })
+            .collect();
+        tracing::info!(
+            "bytes of copies in the card's memory over the bus per frame, by the kind of title memory the title asked for \
+             (VICTORY_WC_NO_BACK, VICTORY_UC_NO_BACK leave what shaders write in the 2nd and 3rd on the card): {}",
+            kinds.join("; ")
+        );
+    }
     tracing::info!(
         "landings in title memory looked at by refreshes per frame (VICTORY_LAND_ECHO=0: sent up): {:.1} MB held already and left, \
          {:.1} MB the title's too",
