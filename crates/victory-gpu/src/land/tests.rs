@@ -163,9 +163,15 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
                 *b = random.next() as u8;
             }
         }
+        // The title's own writes since: in dwords the card left alone (in
+        // the others the title's write stays, `safecopy::merge`).
+        let card_dwords: std::collections::HashSet<usize> = (0..len).filter(|&i| now[i] != base[i]).map(|i| (from + i) / 4).collect();
         let mut there = base.clone();
         for _ in 0..random.next() % 60 {
-            there[random.next() % len] ^= 0x11;
+            let i = random.next() % len;
+            if !card_dwords.contains(&((from + i) / 4)) {
+                there[i] ^= 0x11;
+            }
         }
         // Left out: some ranges, anywhere.
         let mut parts = vec![(0, len)];

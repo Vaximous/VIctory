@@ -661,7 +661,7 @@ unsafe fn piece_at(
     }
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
-    let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
+    let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing, mut kept) = (0, 0u64, 0, 0, 0, 0u64);
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
@@ -692,6 +692,7 @@ unsafe fn piece_at(
         }
         blocks += done.new;
         dwords += done.dwords;
+        kept += done.kept;
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
@@ -713,6 +714,9 @@ unsafe fn piece_at(
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
     }
+    if kept > 0 {
+        title_kept(title, end, kept, copy);
+    }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
     count(stat::NEW_PAGES, new_pages);
@@ -722,6 +726,41 @@ unsafe fn piece_at(
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4
+}
+
+/// Landings that left bytes the card changed as the title wrote them since
+/// ([`crate::safecopy::merge`]: the card's side was behind the CPU's), by
+/// path (a copy in the card's memory, one in the PC's memory, none): pieces
+/// and blocks of 32 bytes.
+static KEPT: [[AtomicU64; 2]; 3] = [const { [const { AtomicU64::new(0) }; 2] }; 3];
+
+/// A piece from `title` to `title + end` kept `blocks` of the title's writes
+/// ([`KEPT`]): the first eight of each path said, with the copy, to learn
+/// which path lets the card's side fall behind.
+fn title_kept(title: usize, end: usize, blocks: u64, copy: *const crate::shadow::Shadow) {
+    // SAFETY: the caller's copy, alive during the landing.
+    let copy = (!copy.is_null()).then(|| unsafe { &*copy });
+    let path = match copy {
+        Some(c) if c.carded() => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    let n = KEPT[path][0].fetch_add(1, Ordering::Relaxed) + 1;
+    let all = KEPT[path][1].fetch_add(blocks, Ordering::Relaxed) + blocks;
+    if n <= 8 || n.is_power_of_two() {
+        let (start, len) = copy.map_or((0, 0), crate::shadow::Shadow::span);
+        tracing::info!(
+            path = ["a copy in the card's memory", "a copy in the PC's memory", "no copy"][path],
+            from = format_args!("{title:#x}"),
+            to = format_args!("{:#x}", title + end),
+            copy = format_args!("{start:#x}+{len:#x}"),
+            blocks,
+            pieces_so_far = n,
+            blocks_so_far = all,
+            frame = crate::frame::current(),
+            "a landing left bytes the card changed as the title wrote them since its side was last looked at (the card's side was behind the CPU's)"
+        );
+    }
 }
 
 /// `parts` of a piece that begins at `title`, cut where 4 KiB pages of title

@@ -80,13 +80,16 @@ std::arch::global_asm!(
     ".globl victory_safe_merge_after",
     ".globl victory_safe_merge_failed",
     // rcx title memory, rdx what the card holds, r8 what it held when last
-    // looked at, r9 blocks of 32 bytes, fifth where the two counts go. Where
-    // a byte of the second differs from the third, it goes into title memory
-    // (as whole dwords, and only dwords that then differ from what is there)
-    // and into the third; each block of title memory is read just before it
-    // is written. rax: the blocks left when a page of title memory could not
-    // be read or written (0: all done). The counts: blocks in which the
-    // second and third differed, dwords stored in title memory.
+    // looked at, r9 blocks of 32 bytes, fifth where the three counts go.
+    // Where a byte of the second differs from the third, it goes into title
+    // memory (as whole dwords, and only dwords that then differ from what is
+    // there) and into the third, but only in a dword of title memory that
+    // still holds what the third does: in one the title wrote since, the
+    // title's bytes stay and the third takes them. Each block of title
+    // memory is read just before it is written. rax: the blocks left when a
+    // page of title memory could not be read or written (0: all done). The
+    // counts: blocks in which the second and third differed, dwords stored
+    // in title memory, blocks with a byte the title's write kept.
     "victory_safe_merge:",
     "xor r10d, r10d",
     "xor r11d, r11d",
@@ -101,6 +104,21 @@ std::arch::global_asm!(
     "je 5f",
     "victory_safe_merge_at:",
     "vmovdqu ymm2, ymmword ptr [rcx]",
+    // ymm3: the dwords that may take the card's bytes: those it left as
+    // held, and those title memory still holds as held.
+    "vpcmpeqd ymm4, ymm2, ymmword ptr [r8]",
+    "vpcmpeqd ymm3, ymm0, ymmword ptr [r8]",
+    "vpor ymm3, ymm3, ymm4",
+    // Any other (the card changed it, and so did the title): counted (the
+    // fifth argument, above the home space: the stack is as it came), and
+    // the title's bytes stay there.
+    "vptest ymm3, ymm5",
+    "jc 8f",
+    "mov rax, qword ptr [rsp + 40]",
+    "inc qword ptr [rax + 16]",
+    "8:",
+    "vpxor ymm4, ymm3, ymm5",
+    "vpor ymm1, ymm1, ymm4",
     "vpblendvb ymm3, ymm0, ymm2, ymm1",
     "vpcmpeqd ymm4, ymm3, ymm2",
     "vmovmskps eax, ymm4",
@@ -119,7 +137,11 @@ std::arch::global_asm!(
     "add r11, rax",
     "4:",
     "inc r10",
-    "vmovdqu ymmword ptr [r8], ymm0",
+    // What is held takes what was put, but in the dwords the card left as
+    // held: there it stays (title memory may hold the title's newer bytes).
+    "vpcmpeqd ymm1, ymm0, ymmword ptr [r8]",
+    "vpblendvb ymm1, ymm3, ymm0, ymm1",
+    "vmovdqu ymmword ptr [r8], ymm1",
     "5:",
     "add rcx, 32",
     "add rdx, 32",
@@ -182,7 +204,7 @@ unsafe extern "system" {
     fn victory_safe_put_at();
     fn victory_safe_put_after();
     fn victory_safe_put_failed();
-    fn victory_safe_merge(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 3]) -> usize;
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
@@ -218,11 +240,19 @@ pub(crate) struct Merged {
     pub(crate) dwords: u64,
     /// Whether title memory could be read and written wherever it had to be.
     pub(crate) there: bool,
+    /// Blocks of 32 bytes (bytes, at ends that are no dword's) in which a
+    /// byte the card changed was left as the title wrote it since.
+    pub(crate) kept: u64,
 }
 
 /// What shaders wrote goes into title memory: every byte of `now` that
 /// differs from the one in `held` goes to `title` and into `held`, every
-/// other byte of both stays as it is. Title memory is read 32 bytes at a
+/// other byte of both stays as it is; but not into a dword of title memory
+/// (a byte, at ends that are no dword's) that no longer holds what `held`
+/// does: the title wrote it since, and its write stays and goes into
+/// `held` (run ow55: a copy in the card's memory that had fallen behind the
+/// CPU's side put zeros into the low dwords of pointers the title's
+/// allocator keeps at the ends of its 64 KiB blocks). Title memory is read 32 bytes at a
 /// time, each just before what changes of them is stored, and only the
 /// dwords that change are stored (at ends that are no dword's, bytes): the
 /// title's own threads may be writing those beside them.
@@ -248,16 +278,23 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             unsafe {
                 let byte = now.add(at).read_volatile();
                 let mut there = 0u8;
-                if byte != held.add(at).read() {
+                let was = held.add(at).read();
+                if byte != was {
                     out.new += 1;
                     let mut ok = copy(&mut there, title.add(at), 1);
-                    if ok && there != byte {
-                        ok = copy(title.add(at), &byte, 1);
-                        out.dwords += u64::from(ok);
-                    }
-                    out.there &= ok;
-                    if ok || take {
-                        held.add(at).write(byte);
+                    if ok && there != was {
+                        // The title wrote it since.
+                        out.kept += 1;
+                        held.add(at).write(there);
+                    } else {
+                        if ok && there != byte {
+                            ok = copy(title.add(at), &byte, 1);
+                            out.dwords += u64::from(ok);
+                        }
+                        out.there &= ok;
+                        if ok || take {
+                            held.add(at).write(byte);
+                        }
                     }
                 }
             }
@@ -265,15 +302,20 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             continue;
         }
         let into = address % 32;
-        let mut counts = [0u64; 2];
+        let mut counts = [0u64; 3];
         if into != 0 || left < 32 {
-            // Part of a block: in a block of its own, equal beside the part.
+            // Part of a block: in a block of its own, equal beside the part,
+            // where both are as title memory was.
             let n = (32 - into).min(left) & !3;
             let (mut new, mut old) = ([0u8; 32], [0u8; 32]);
             // SAFETY: inside the stretch; the block of title memory around
             // it lies in the same page, and nothing of it outside the part
             // is stored (the two arrays are equal there).
             unsafe {
+                let block = title.wrapping_add(at).wrapping_sub(into);
+                if copy(old.as_mut_ptr(), block, 32) {
+                    new = old;
+                }
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
                 let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
@@ -298,6 +340,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         }
         out.new += counts[0];
         out.dwords += counts[1];
+        out.kept += counts[2];
     }
     out
 }
@@ -588,15 +631,18 @@ mod tests {
             let mut held = was.clone();
             let mut now = was.clone();
             let mut title = base.clone();
-            // The card's writes: dwords and single bytes; the title's: some
-            // in the same dwords, some the same values.
+            // The card's writes: dwords and single bytes; the title's: beside
+            // the stretch, outside its dwords (inside them the title's write
+            // stays: [`a_title_write_since_stays`]).
             for _ in 0..random() % 12 {
                 if n > 0 {
                     let i = random() as usize % n;
                     now[i] = random() as u8;
                 }
                 let i = random() as usize % 512;
-                title[i] = if (from..to).contains(&i) && round % 3 == 0 { now[i - from] } else { random() as u8 };
+                if !(from.saturating_sub(8)..to + 8).contains(&i) {
+                    title[i] = random() as u8;
+                }
             }
             if round % 7 == 0 {
                 now.iter_mut().for_each(|b| *b = b.wrapping_add(1));
@@ -619,7 +665,55 @@ mod tests {
             // Found merged already.
             // SAFETY: as above.
             let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false) };
-            assert_eq!(again, Merged { new: 0, dwords: 0, there: true });
+            assert_eq!(again, Merged { new: 0, dwords: 0, there: true, kept: 0 });
+        }
+    }
+
+    /// The three-way rule: a dword of title memory the title wrote since
+    /// what is held keeps the title's bytes, whatever the card holds (a card
+    /// side behind the CPU's), and what is held takes them; the card's
+    /// changes in other qwords arrive. At ends that are no dword's, bytes.
+    #[test]
+    fn a_title_write_since_stays() {
+        assert!(on());
+        let pages = Pages::new(1 << 12);
+        for (from, len) in [(0usize, 64usize), (8, 48), (4, 40), (1, 7), (24, 16), (0, 4096)] {
+            let held_was: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut held = held_was.clone();
+            let mut title = vec![0u8; 4096];
+            title[from..from + len].copy_from_slice(&held_was);
+            // The title wrote a pointer's low dword in the first whole qword
+            // of the stretch; the card's side never had it: zeros there. Its
+            // high dword is the card's write, in a dword of its own.
+            let q = (from.next_multiple_of(8)..from + len).step_by(8).find(|&q| q + 8 <= from + len);
+            let mut now = held_was.clone();
+            if let Some(q) = q {
+                title[q..q + 4].copy_from_slice(&[0x80, 0x6c, 0xf6, 0xfb]);
+                now[q - from..q - from + 4].fill(0);
+                now[q - from + 4] ^= 0x33;
+            }
+            // And the card changed the last byte, in a qword of its own.
+            let last = from + len - 1;
+            let last_alone = q.is_none_or(|q| last >= q + 8);
+            now[len - 1] ^= 0x55;
+            // SAFETY: inside the allocation and the vectors.
+            let done = unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), pages.0, 4096);
+                merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), len, false)
+            };
+            assert!(done.there);
+            // SAFETY: inside the allocation.
+            let there = unsafe { std::slice::from_raw_parts(pages.0, 4096) };
+            if let Some(q) = q {
+                assert_eq!(&there[q..q + 4], &[0x80, 0x6c, 0xf6, 0xfb], "{from}+{len}: the title's write undone");
+                assert_eq!(&held[q - from..q - from + 4], &[0x80, 0x6c, 0xf6, 0xfb], "{from}+{len}: held");
+                assert!(done.kept > 0, "{from}+{len}");
+                assert_eq!(there[q + 4], held_was[q - from + 4] ^ 0x33, "{from}+{len}: the card's write beside it");
+            }
+            if last_alone {
+                assert_eq!(there[last], held_was[len - 1] ^ 0x55, "{from}+{len}: the card's write");
+                assert_eq!(held[len - 1], held_was[len - 1] ^ 0x55);
+            }
         }
     }
 
@@ -639,6 +733,9 @@ mod tests {
                 let mut held = was.clone();
                 // SAFETY: our allocation.
                 let done = unsafe {
+                    // Title memory as held (else the title's bytes stay and
+                    // nothing is to be written).
+                    std::ptr::write_bytes(pages.0.add(at), 1, len);
                     if missing {
                         VirtualFree(pages.0.cast(), 4096, MEM_DECOMMIT);
                     } else {
