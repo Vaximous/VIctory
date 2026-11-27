@@ -4913,6 +4913,56 @@ impl Shadow {
         same
     }
 
+    /// Diagnostics: one 4 KiB part of `[address, address + len)`, chosen by
+    /// `salt`, compared between title memory and the CPU's side, after a
+    /// look ([`Shadow::nothing_new`]) said the range is as it was. `None` if
+    /// alike, or if the part cannot be compared (shaders may be writing it,
+    /// it is in place or left on the card, or title memory cannot be read);
+    /// else what the copy and the journal say of it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn audit(&self, address: usize, len: usize, salt: usize) -> Option<String> {
+        const PART: usize = 4 << 10;
+        if self.place.is_some() || crate::readprobe::left_now(self) || len == 0 {
+            return None;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        let parts = (to - from).div_ceil(PART);
+        if parts == 0 {
+            return None;
+        }
+        let at = from + (salt % parts) * PART;
+        let n = PART.min(to - at);
+        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < at + n && e > at);
+        if busy || self.landing.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut title = [0u8; PART];
+        if !crate::host::read_into(at as *const u8, &mut title[..n]) {
+            return None;
+        }
+        // SAFETY: inside the copy's CPU side; a race with a refresh of it
+        // only makes the answer wrong, and it is diagnostics.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+        if held == &title[..n] {
+            return None;
+        }
+        let differ = held.iter().zip(&title[..n]).filter(|(a, b)| a != b).count();
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(at / PAGE - start / PAGE).copied().unwrap_or(0);
+        let ranged = *self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+        let (published, holds, asked, note, watched) = crate::watch::audit_page(at);
+        Some(format!(
+            "copy {} {start:#x}+{:#x} card {} window {} watched-state {}: part {at:#x} {differ} bytes differ; page copied after asking {copied}, ranged {:?}; \
+             journal: bit published {published}, ahead holds {holds}, asking standing {asked}, page last found written {note}; in a watched run {watched}",
+            self.id,
+            self.len,
+            self.card.is_some(),
+            self.window,
+            self.watched.load(Ordering::Relaxed),
+            ranged,
+        ))
+    }
+
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {

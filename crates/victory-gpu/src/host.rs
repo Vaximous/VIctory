@@ -8400,10 +8400,31 @@ static FRONT_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atom
 /// whole span says "ask" when any page of it was written: the heap's 174 MB
 /// copy was refreshed whole some 9 times a frame, in 1 MiB pieces that
 /// nearly all took nothing, 18.9 GB a frame gone over (run ow60-move).
+///
+/// Off unless `=1`: run ow61-move with it on was banded (stale tone curves)
+/// where run ow60-move without it was not; [`piece_audit`] looks for why.
 fn piece_looks() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_LOOKS").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_LOOKS").is_some_and(|v| v == "1"))
 }
+
+/// Diagnostics: each piece of a long front span is looked at as with
+/// [`piece_looks`], and where the look says it copies nothing one 4 KiB
+/// part of it is compared with title memory (`crate::shadow::Shadow::audit`);
+/// with the switch off the piece is refreshed all the same
+/// (`VICTORY_PIECE_AUDIT`, on unless `=0`). What a look called unchanged and
+/// was not is counted, and the first ones said.
+#[cfg(feature = "diagnostics")]
+fn piece_audit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_AUDIT").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: pieces audited, of them called unchanged, of those
+/// found to differ in their part, and bytes the refresh of such a piece took
+/// all the same; and since the start, the differing said.
+#[cfg(feature = "diagnostics")]
+static AUDIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
@@ -8451,6 +8472,15 @@ fn split_line(frames: f64) {
         fs[3],
         fs[4],
         fs[5] / 1e6,
+    );
+    let au: Vec<f64> = AUDIT[..4].iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "pieces of long front spans audited per frame (VICTORY_PIECE_AUDIT): {:.0}, {:.0} of them called unchanged by their look, {:.2} of those differing in the part compared, \
+         {:.3} MB taken by the refresh of pieces called unchanged",
+        au[0],
+        au[1],
+        au[2],
+        au[3] / 1e6,
     );
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
@@ -9678,6 +9708,10 @@ impl Batch {
         // page of it was written.
         let cut = refresh_pieces() && spans.len() + due.len() > 1;
         let looks = cut && !many && piece_looks();
+        #[cfg(feature = "diagnostics")]
+        let audit = cut && !many && piece_audit();
+        #[cfg(feature = "diagnostics")]
+        let salt = crate::queue::presented() as usize;
         let spans: Vec<_> = if cut {
             spans
                 .into_iter()
@@ -9700,6 +9734,30 @@ impl Batch {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                 return;
+            }
+            #[cfg(feature = "diagnostics")]
+            if audit && *long {
+                AUDIT[0].fetch_add(1, Ordering::Relaxed);
+                if shadow.nothing_new(*from, *to - *from) {
+                    AUDIT[1].fetch_add(1, Ordering::Relaxed);
+                    if let Some(said) = shadow.audit(*from, *to - *from, salt.wrapping_mul(7919).wrapping_add(i)) {
+                        AUDIT[2].fetch_add(1, Ordering::Relaxed);
+                        let n = AUDIT[4].fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 48 || n.is_power_of_two() {
+                            tracing::warn!(n, "a piece its look called unchanged differs from title memory (VICTORY_PIECE_AUDIT): {said}");
+                        }
+                    }
+                    if !looks {
+                        let started = std::time::Instant::now();
+                        let copied = shadow.update(*from, *to - *from);
+                        let us = started.elapsed().as_micros() as u64;
+                        crate::copystat::range(*from, *to - *from, us, copied);
+                        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                        AUDIT[3].fetch_add(copied as u64, Ordering::Relaxed);
+                        return;
+                    }
+                }
             }
             if looks && *long {
                 #[cfg(feature = "diagnostics")]

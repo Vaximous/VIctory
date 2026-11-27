@@ -1810,6 +1810,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
+/// Diagnostics for an audit of a look ([`nothing_new`]) that a page proved
+/// wrong: of the 64 KiB page at `at`, whether its block's bit says it is
+/// clean ([`PUBLISHED`]), whether the journal's asked-ahead ranges hold it,
+/// the asking that stands, and the asking the journal last found it written
+/// (0: never); and whether it lies in a [`WATCHED`] run.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn audit_page(at: usize) -> (bool, bool, u64, u64, bool) {
+    let page = at / PAGE;
+    let published = published(page * PAGE, (page + 1) * PAGE);
+    let j = journal();
+    let holds = j.ahead.holds(page, page + 1);
+    let note = j.notes.range(page, page + 1).first().map_or(0, |n| n.1);
+    let asked = j.ahead_asked;
+    drop(j);
+    let watched = WATCHED.read().unwrap_or_else(|e| e.into_inner()).range(..=page).next_back().is_some_and(|(_, &b)| page < b);
+    (published, holds, asked, note, watched)
+}
+
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// and `ranged` (the asking after which a range that holds this one was
