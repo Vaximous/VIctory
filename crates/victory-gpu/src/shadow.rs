@@ -2534,6 +2534,17 @@ fn send_parts() -> bool {
 /// ow26-move the 174 MB copy sent 107 MB a frame in 656 pieces while
 /// [`send_parts`] saw 7.5 MB. The pages are ones the copy held before
 /// (`known`), the case [`send_parts`] covers, on what it rests on.
+/// Whether the light look ([`Shadow::nothing_new`]) at a range that shaders
+/// of flights in the air are writing in part looks at its gaps, as the
+/// refresh itself does (`VICTORY_LIGHT_GAPS`, on unless `=0`: it says it
+/// must ask, and the refresh asks gap by gap). Such ranges were refreshed
+/// for nothing about 11 times a frame, some 110 us each (run ow31-move:
+/// 0x15300000+0x100000, 1.3 ms a frame and nothing taken). The refresh
+/// takes nothing of a range whose gaps the look finds as they were.
+fn light_gaps() -> bool {
+    crate::toggled!("VICTORY_LIGHT_GAPS")
+}
+
 fn compare_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_IN_PLACE").is_some_and(|v| v == "1"))
@@ -4771,19 +4782,50 @@ impl Shadow {
             return true;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::why(address, len, 0);
             return false;
         }
-        // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        // Around ranges shaders are writing the refresh asks gap by gap: so
+        // does this ([`light_gaps`]), else it says it must ask.
+        let mut busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|&(a, e)| a < to && e > from)
+            .collect();
+        let gaps: Vec<(usize, usize)> = if busy.is_empty() {
+            vec![(from, to)]
+        } else if light_gaps() {
+            busy.sort_unstable();
+            let (mut at, mut gaps) = (from, Vec::new());
+            for (a, e) in busy {
+                if a > at {
+                    gaps.push((at, a));
+                }
+                at = at.max(e);
+            }
+            if at < to {
+                gaps.push((at, to));
+            }
+            gaps
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::why(address, len, 1);
             return false;
-        }
+        };
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = gaps.iter().all(|&(a, e)| crate::watch::nothing_new(a, e, start / PAGE, &copied, self.ranged(a, e)));
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
-            add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from) as u64);
+            let bytes = gaps.iter().map(|g| (g.1 - g.0) as u64).sum();
+            add(C::Checked, bytes);
+            add(C::Unchanged, bytes);
+        } else {
+            crate::copystat::why(address, len, if gaps.len() == 1 && gaps[0] == (from, to) { 2 } else { 3 });
         }
         same
     }
