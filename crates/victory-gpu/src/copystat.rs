@@ -183,8 +183,9 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+/// Per source range (start, length): refreshes, bytes, microseconds, bytes
+/// taken, refreshes that took nothing.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64, u64, u64)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
 /// Per range copied whole because its memory is not watched (start,
@@ -293,16 +294,15 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     e.1 += written as u64;
 }
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `len` bytes from `src` took `us` and copied `taken` of them.
+pub(crate) fn range(src: usize, len: usize, us: u64, taken: usize) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map
-        .get_or_insert_with(HashMap::new)
-        .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0, 0, 0, 0));
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
+    e.3 += taken as u64;
+    e.4 += u64::from(taken == 0);
 }
 
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
@@ -1470,14 +1470,15 @@ pub(crate) fn log(frames: f64) {
     crate::watch::alone_line(frames);
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
+    // The costliest first.
+    ranges.sort_by_key(|&(_, (_, _, us, _, _))| std::cmp::Reverse(us));
     // The kind of memory of each range, asked once per address: a question
     // walks the page tables to the end of the pages alike, up to 10 ms in
     // the title's heaps, and holds the memory map meanwhile (run lane2-0:
     // 10 ms on the submitting thread, when this ran there). A line may name
     // the kind an address had when first seen.
     static KINDS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    for ((src, len), (n, bytes, us, taken, empty)) in ranges.into_iter().take(16) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         let known = KINDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&src).copied();
         let kind = known.unwrap_or_else(|| {
@@ -1489,10 +1490,12 @@ pub(crate) fn log(frames: f64) {
             info.Type
         });
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame; {:.2} MB/frame taken, {:.1}x/frame took nothing",
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
-            us as f64 / 1e3 / frames
+            us as f64 / 1e3 / frames,
+            taken as f64 / 1e6 / frames,
+            empty as f64 / frames
         );
     }
 }
