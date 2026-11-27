@@ -741,11 +741,16 @@ unsafe fn piece_at(
 /// dwords where the two sides differ now go up again (`VICTORY_RESEND_KEPT=0`:
 /// not, as before).
 ///
+/// A copy in the PC's memory has the same hole: the snapshot took the title's
+/// bytes, the copy the card reads kept the shaders', and while the range is
+/// declared again and again no refresh takes it, so the next landing put the
+/// shaders' old bytes back. There the copy takes the title's bytes at once.
+///
 /// # Safety
 /// [`piece`]'s.
 unsafe fn resend_kept(title: usize, now: *const u8, held: *mut u8, parts: &[(usize, usize)], copy: &crate::shadow::Shadow) {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RESEND_KEPT").is_none_or(|v| v != "0")) || !copy.carded() {
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RESEND_KEPT").is_none_or(|v| v != "0")) {
         return;
     }
     let Some(base) = title.checked_sub(copy.span().0 as usize) else {
@@ -766,7 +771,14 @@ unsafe fn resend_kept(title: usize, now: *const u8, held: *mut u8, parts: &[(usi
     RESENT[0].fetch_add(1, Ordering::Relaxed);
     for (from, to) in runs {
         RESENT[1].fetch_add((to - from) as u64, Ordering::Relaxed);
-        copy.resend(base + from, base + to);
+        if copy.carded() {
+            copy.resend(base + from, base + to);
+        } else {
+            // SAFETY: `now` is the copy itself here (`Shadow::land_back`),
+            // ours over the piece; the card writes it only where a flight
+            // declared it, as a refresh would find it.
+            unsafe { std::ptr::copy_nonoverlapping(held.add(from).cast_const(), now.cast_mut().add(from), to - from) };
+        }
     }
 }
 
