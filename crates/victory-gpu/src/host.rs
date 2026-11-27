@@ -6040,9 +6040,12 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
-            lists.push(Some(check));
-        }
+        // A title list can leave a buffer promoted to COPY_DEST; buffers
+        // decay to COMMON only between ExecuteCommandLists calls, so the
+        // compare goes in a call of its own, before the fence (D3D12 error
+        // 538, 23,000 times in run ow16-check). After
+        // rorodev6/victory-nvidia-megafork d1fe0bd015 (GPL-3.0).
+        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6082,6 +6085,9 @@ impl Host {
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
+                }
+                if let Some(check) = &check {
+                    self.queue.ExecuteCommandLists(check);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -6138,6 +6144,11 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if i + 1 == groups.len()
+                    && let Some(check) = &check
+                {
+                    self.queue.ExecuteCommandLists(check);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
