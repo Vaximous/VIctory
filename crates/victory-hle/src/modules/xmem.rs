@@ -1285,10 +1285,100 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Whether pages of the GPU's page-mapping copies that already show what
+/// they are asked to show are left alone (`VICTORY_MAP_SKIP_SAME`, on unless
+/// `=0`).
+///
+/// The title hands the same mappings again and again (one constant page over
+/// a range, unmapped pages unmapped again): each was an unmapping and a
+/// mapping of a view, and a telling of the GPU side that the contents
+/// changed, on the title's thread, under the mapping lock that every
+/// protection change of a view takes too (run fm14: one call 15.5 ms on the
+/// thread the frame's chain ran through, 5.7 ms a frame on that chain).
+fn skip_same() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_MAP_SKIP_SAME").is_none_or(|v| v != "0"));
+    *ON
+}
+
+/// Of the GPU's page-mapping copies: pages asked for, pages that already
+/// showed what was asked and were left alone ([`skip_same`]).
+static ALIASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `ranges` (address, source or 0, bytes) without the pages that already
+/// show what they are asked to (the source's page, or nothing), joined again
+/// into runs, in order. A page an earlier range of these changes, or maps
+/// from, is never left out.
+fn changed_only(ranges: &[(u64, u64, u64)]) -> Vec<(u64, u64, u64)> {
+    let page = PAGE as u64;
+    let physical = physical();
+    let mut out: Vec<(u64, u64, u64)> = Vec::new();
+    let mut changed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let (mut asked, mut same) = (0u64, 0u64);
+    let push = |out: &mut Vec<(u64, u64, u64)>, to: u64, from: u64| match out.last_mut() {
+        Some(last)
+            if last.0 + last.2 == to
+                && ((last.1 == 0 && from == 0) || (last.1 != 0 && from != 0 && last.1 + last.2 == from)) =>
+        {
+            last.2 += page;
+        }
+        _ => out.push((to, from, page)),
+    };
+    for &(to, from, len) in ranges {
+        if to % page != 0 || from % page != 0 || len % page != 0 {
+            changed.extend((0..len.div_ceil(page)).map(|k| (to + k * page) & !(page - 1)));
+            out.push((to, from, len));
+            continue;
+        }
+        for k in (0..len).step_by(PAGE) {
+            asked += 1;
+            let (at, source) = (to + k, if from == 0 { 0 } else { from + k });
+            let fresh = !changed.contains(&at) && (source == 0 || !changed.contains(&source));
+            let there = physical.slice_at(at as usize);
+            let unchanged = fresh
+                && match (&there, source) {
+                    (None, 0) => true,
+                    (Some(there), source) if source != 0 => physical
+                        .slice_at(source as usize)
+                        .is_some_and(|wanted| Arc::ptr_eq(&wanted.section, &there.section) && wanted.index == there.index),
+                    _ => false,
+                };
+            if unchanged {
+                same += 1;
+                continue;
+            }
+            changed.insert(at);
+            push(&mut out, at, source);
+        }
+    }
+    drop(physical);
+    ALIASED[0].fetch_add(asked, Ordering::Relaxed);
+    ALIASED[1].fetch_add(same, Ordering::Relaxed);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() && n >= 64 {
+        tracing::info!(
+            "the GPU's page-mapping copies: {n} calls, {} pages asked for, {} of them already showing what was asked and left alone (VICTORY_MAP_SKIP_SAME=0: done anyway)",
+            ALIASED[0].load(Ordering::Relaxed),
+            ALIASED[1].load(Ordering::Relaxed)
+        );
+    }
+    out
+}
+
 /// [`map_alias`] of many ranges, in order.
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
+    let left;
+    let ranges = if skip_same() {
+        left = changed_only(ranges);
+        if left.is_empty() {
+            return true;
+        }
+        &left[..]
+    } else {
+        ranges
+    };
     if side_by_side() <= 1 {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
@@ -2347,6 +2437,47 @@ mod tests {
         assert!(map_aliases(&[(a as u64, 0, (2 * N * PAGE) as u64)]));
         assert!((0..2 * N).all(|k| query(at(k)).host.State == MEM_RESERVE));
         assert!(physical().views.range(a..a + 2 * N * PAGE).next().is_none());
+        assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
+    }
+
+    /// The GPU's page-mapping copies asked again for what pages already show
+    /// leave them alone (no view goes or comes), and a page an earlier range
+    /// of the same call changes is never left out.
+    #[test]
+    fn mappings_asked_again_are_left_alone() {
+        const N: usize = 8;
+        let pages = allocate(N);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        let at = |k: usize| (a + k * PAGE) as *mut c_void;
+        let first = |k: usize| at(k).cast::<u64>();
+        assert_eq!(XMemMapPhysicalPages(at(0), N, pages.as_ptr()), at(0));
+        for k in 0..N {
+            // SAFETY: mapped read-write.
+            unsafe { first(k).write(100 + k as u64) };
+        }
+        let (from, to, len) = (a as u64, at(N) as u64, (N * PAGE) as u64);
+        assert!(map_aliases(&[(to, from, len)]));
+        let views: Vec<usize> = physical().views.range(a + N * PAGE..a + 2 * N * PAGE).map(|(at, _)| *at).collect();
+        let same = ALIASED[1].load(Ordering::Relaxed);
+        // Again: all of it the same, and unmapped pages unmapped again.
+        assert!(map_aliases(&[(to, from, len), (at(2 * N) as u64, 0, len)]));
+        if skip_same() {
+            assert!(ALIASED[1].load(Ordering::Relaxed) >= same + 2 * N as u64, "left alone");
+        }
+        let again: Vec<usize> = physical().views.range(a + N * PAGE..a + 2 * N * PAGE).map(|(at, _)| *at).collect();
+        assert_eq!(views, again);
+        // The first half moved, then mapped from where it moved to: the
+        // second range sees the first one's change.
+        let half = len / 2;
+        assert!(map_aliases(&[(to, from + half, half), (to + half, to, half)]));
+        for k in 0..N / 2 {
+            // SAFETY: mapped read-write.
+            unsafe {
+                assert_eq!(first(N + k).read(), 100 + (N / 2 + k) as u64);
+                assert_eq!(first(N + N / 2 + k).read(), 100 + (N / 2 + k) as u64);
+            }
+        }
+        assert!(map_aliases(&[(a as u64, 0, (3 * N * PAGE) as u64)]));
         assert_eq!(XMemFreePhysicalPages(N, pages.as_ptr()), 1);
     }
 
