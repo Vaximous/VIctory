@@ -127,7 +127,9 @@ fn most() -> f32 {
     static SET: OnceLock<(f32, u64, f32)> = OnceLock::new();
     let (most, from, then) = *SET.get_or_init(|| {
         let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
-        let most = number(&std::env::var("VICTORY_AMBIENT_TITLE").unwrap_or_default()).unwrap_or(0.0);
+        // (`VICTORY_AMBIENT_MOST`, VIctory-NVIDIA 77e13a974's name for it, too.)
+        let set = std::env::var("VICTORY_AMBIENT_TITLE").or_else(|_| std::env::var("VICTORY_AMBIENT_MOST"));
+        let most = number(&set.unwrap_or_default()).unwrap_or(0.0);
         let later = std::env::var("VICTORY_AMBIENT_TITLE_FROM").unwrap_or_default();
         let (from, then) = later
             .split_once(':')

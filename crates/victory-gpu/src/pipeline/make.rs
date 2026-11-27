@@ -46,6 +46,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// How long draws have waited for it so far, in microseconds
+    /// ([`wait_once`]).
+    waited_us: AtomicU64,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
     /// opening-scene / bake producer that must never sit behind cold RT shaders.
     screen: bool,
@@ -212,6 +215,7 @@ impl Pending {
             stalled: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -463,6 +467,20 @@ fn block() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BLOCK").is_some_and(|v| v == "1"))
 }
 
+/// Whether one pipeline is waited for at most one budget over the whole
+/// run, not one budget every frame (`VICTORY_PIPELINE_WAIT_ONCE`, on; =0 as
+/// before). A pipeline whose make takes longer than the budget (a driver
+/// compile of tens of seconds, or one that never ends) cost the whole budget
+/// in every frame in which a draw asked for it: the picture stood still
+/// while the thing drawn with it was in view, and moved again when the
+/// camera turned away. After its budget its draws are dropped until it is
+/// made, as with any pipeline past the frame's budget.
+/// Ported from VIctory-NVIDIA 77e13a974 (GPL-3.0).
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+}
+
 fn wait(p: &Pending, frame: u64) {
     if !block() {
         return;
@@ -472,6 +490,16 @@ fn wait(p: &Pending, frame: u64) {
     if budget.is_zero() {
         return;
     }
+    // What is left of this pipeline's own budget ([`wait_once`]).
+    let own = if wait_once() {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -482,7 +510,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -503,6 +531,16 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if wait_once() && p.made.get().is_none() {
+        let before = p.waited_us.fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+        if Duration::from_micros(before) + waited >= budget {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE=0: waited for every frame)"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
