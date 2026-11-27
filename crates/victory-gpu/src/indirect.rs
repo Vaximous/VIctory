@@ -439,7 +439,8 @@ fn clamp_into(
     ahead: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let waits = Waits::of(list);
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead, waits);
     if recorded {
         list.indirect_readable(dst);
     }
@@ -461,6 +462,7 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+    waits: Waits,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -512,14 +514,10 @@ fn record_clamp_as(
     // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`. Moving
     // it out of `INDIRECT_ARGUMENT` orders this clamp's writes after every
     // earlier execution's reads of the scratch buffer; nothing else writes it.
-    // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the two
-    // waits for every earlier shader write out (the state changes stay).
+    // Diagnostics: counted. Which of the two waits for every shader write are
+    // made: [`Waits`].
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
@@ -532,10 +530,9 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[usize::from(!waits.before)..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -546,9 +543,36 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[usize::from(!waits.after)..]);
     }
     true
+}
+
+/// Which waits for every shader write a clamp makes: `before` its pass (for
+/// the title's writes of the records it reads), `after` it (none is needed:
+/// the scratch buffer's move to indirect arguments orders the records it
+/// writes, and the budget is only touched by atomics; made with
+/// `VICTORY_CLAMP_WAITS=0`, as before).
+#[derive(Clone, Copy)]
+pub(crate) struct Waits {
+    pub(crate) before: bool,
+    pub(crate) after: bool,
+}
+
+impl Waits {
+    /// Both, as the clamps made them before `VICTORY_CLAMP_WAITS`.
+    pub(crate) const BOTH: Self = Self { before: true, after: true };
+
+    /// The waits a clamp recorded into `list` now makes
+    /// ([`crate::host::rec::clamp_waits`]); with diagnostics,
+    /// `VICTORY_BARRIER_TEST=indirect` leaves both out (the state changes stay).
+    fn of(list: &HostList) -> Self {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::barrier_test() & 2 != 0 {
+            return Self { before: false, after: false };
+        }
+        Self { before: list.list.clamp_wait(), after: !crate::host::rec::clamp_waits() }
+    }
 }
 
 /// The batched clamp's pipeline ([`batch`]).
@@ -602,7 +626,7 @@ pub(crate) fn open_batch(
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs, Waits::of(list).before);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -2066,6 +2090,28 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         assert!(super::clamp().is_some());
     }
 
+    /// A clamp waits for earlier shader writes only where the list may have
+    /// written since its last wait (`VICTORY_CLAMP_WAITS`, on): a new list
+    /// may have (an earlier one of its submission), the clamp's own wait
+    /// stands for the next clamp's, and a write since needs one again.
+    #[test]
+    fn clamps_wait_only_after_what_may_have_written() {
+        if !crate::host::rec::clamp_waits() {
+            return;
+        }
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        let rec = crate::host::rec::Rec::new(warp.list.clone());
+        assert!(rec.clamp_wait(), "a new list may follow one that wrote");
+        assert!(!rec.clamp_wait(), "nothing wrote since the last clamp's wait");
+        rec.writes();
+        assert!(rec.clamp_wait(), "a draw that stores, a copy or a clear wrote since");
+        // SAFETY: an open list.
+        unsafe { rec.title_wait() };
+        assert!(!rec.clamp_wait(), "the title's own wait was made since");
+    }
+
     #[test]
     fn rejects_unaligned_or_undersized_layouts() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
@@ -2178,7 +2224,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            false, Waits::BOTH,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -2225,7 +2271,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-            false,
+            false, Waits::BOTH,
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -2342,7 +2388,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
-                ahead,
+                ahead, Waits::BOTH,
             ));
             // SAFETY: an open list; the scratch buffer, which the clamp left
             // readable as arguments, is copied for the check.
@@ -2426,7 +2472,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
-            false,
+            false, Waits::BOTH,
         ));
 
         // SAFETY: open command list; copy clamped scratch buffer (left
@@ -2637,7 +2683,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             (&src_buf, 0),
             None,
             (KIND_DRAW, STRIDE, counts.len() as u32),
-            false,
+            false, Waits::BOTH,
         ));
         // SAFETY: an open list; the clamped records are copied for the check.
         unsafe {
@@ -2816,7 +2862,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 (src, 0),
                 None,
                 (KIND_DISPATCH, STEP, groups.len() as u32),
-                true,
+                true, Waits::BOTH,
             ));
             state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
             // SAFETY: an open list; the worker's root signature and
@@ -3003,11 +3049,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         src_ptr.cast::<u32>().add(w).write_volatile(word);
                     }
                     if batched {
-                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, true);
                         assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
-                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false, Waits::BOTH));
                     }
                     gpu.list.SetComputeRootSignature(&worker.root);
                     gpu.list.SetPipelineState(&worker.pso);
@@ -3113,7 +3159,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 // SAFETY: mapped buffers; nothing runs.
                 unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
                 if batched {
-                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu, true);
                     // SAFETY: the mapped table; the list has not run.
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
                     assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
@@ -3126,7 +3172,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         (&src, offset),
                         None,
                         (*kind, stride, 1),
-                        false,
+                        false, Waits::BOTH,
                     ));
                 }
                 // SAFETY: an open list; the records are readable as arguments.
@@ -3161,7 +3207,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, true);
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -3291,10 +3337,10 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 let mut table = batch::Table::default();
                 for i in 0..EXECUTIONS {
                     if run == 0 {
-                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false, Waits::BOTH));
                     } else if i % run == 0 {
                         let k = u64::from(i / run) * batch::TABLE;
-                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);
+                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k, true);
                         // SAFETY: the mapped table; the list has not run.
                         table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
                     }
