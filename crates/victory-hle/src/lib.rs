@@ -169,3 +169,12 @@ mod tests {
         assert_eq!(r.classify("rpcrt4.dll", &name("RpcServerRegisterIf")), None);
     }
 }
+
+/// With `VICTORY_LEDGER=1`: crash reports look up our writes into title
+/// memory at the title's heap-node walk's faults (`victory_gpu` keeps them).
+#[cfg(windows)]
+pub fn ledger_into_crash_reports() {
+    if victory_gpu::ledger_on() {
+        victory_loader::on_crash_report(victory_gpu::ledger_crash_lines);
+    }
+}

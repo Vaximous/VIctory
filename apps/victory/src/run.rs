@@ -188,6 +188,9 @@ pub fn run(
     crate::cache::launch(*CACHE_MODE.get_or_init(|| crate::cache::Mode::pick(None)), title_dir)?;
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // Our writes into title memory, looked up at the heap-node walk's faults
+    // (VICTORY_LEDGER=1).
+    victory_hle::ledger_into_crash_reports();
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

@@ -674,7 +674,11 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
+        let merge = |take| {
+            crate::ledger::writing(title + from, n, crate::ledger::Path::Landing, || unsafe {
+                crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take)
+            })
+        };
         let mut done = merge(take && beside.is_some());
         if !done.there && beside.is_none() {
             // Away only while the runtime changes a mapping beside it: the

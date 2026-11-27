@@ -10079,6 +10079,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
+        crate::ledger::note(dst as usize, len, crate::ledger::Path::CopyMapped);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -10283,6 +10284,10 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    crate::ledger::writing(dst as usize, len, crate::ledger::Path::WriteMapped, || write_mapped_in(dst, src, len));
+}
+
+fn write_mapped_in(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();

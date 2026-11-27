@@ -4887,6 +4887,7 @@ pub fn kernel_wrote(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::ledger::note(at, len, crate::ledger::Path::Kernel);
     let end = at.saturating_add(len);
     let pages: Vec<(usize, u16)> = (at / PAGE..end.div_ceil(PAGE))
         .map(|page| {

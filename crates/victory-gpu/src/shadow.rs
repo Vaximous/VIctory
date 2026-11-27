@@ -3364,6 +3364,10 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    crate::ledger::writing(at, title.len(), crate::ledger::Path::PutBack, || put_changed_in(at, title, merged))
+}
+
+fn put_changed_in(at: usize, title: &[u8], merged: &[u8]) -> usize {
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());

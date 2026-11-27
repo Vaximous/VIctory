@@ -108,6 +108,10 @@ pub mod upscale;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
+mod ledger;
+#[cfg(windows)]
+pub use ledger::{crash_lines as ledger_crash_lines, on as ledger_on};
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod readprobe;

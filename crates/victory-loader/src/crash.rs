@@ -560,6 +560,18 @@ unsafe fn thrown(p: &[usize]) -> String {
 
 /// # Safety
 /// See [`report_unhandled`].
+/// More lines for a crash report, from a crate the loader does not know:
+/// given where the fault was (as [`locate`] says it) and the registers rax,
+/// rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8-r15.
+type ReportMore = fn(&str, &[u64; 16]) -> Vec<String>;
+
+static MORE: std::sync::OnceLock<ReportMore> = std::sync::OnceLock::new();
+
+/// Has `more` add its lines to every crash report from now on.
+pub fn on_crash_report(more: ReportMore) {
+    let _ = MORE.set(more);
+}
+
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
@@ -619,6 +631,13 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    if let Some(more) = MORE.get() {
+        let c = context;
+        let regs = [c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15];
+        for l in more(&locate(at), &regs) {
+            line(l);
+        }
     }
     if to_file {
         let said = title_output();

@@ -384,6 +384,7 @@ fn put_merged(ticket: &Ticket, before: &[u8], tiled: &mut [u8]) {
         return;
     }
     crate::watch::writing(at, size);
+    crate::ledger::note(at, size, crate::ledger::Path::Texback);
     let (mut put, mut kept) = (0u64, 0u64);
     for i in (0..size & !3).step_by(4) {
         let (old, new) = (&before[i..i + 4], &tiled[i..i + 4]);
