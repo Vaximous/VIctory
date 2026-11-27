@@ -110,6 +110,9 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    /// Whether it lies in the card's memory ([`on_card`]): then nothing
+    /// crosses the bus at the sends, and `upq` leaves it be.
+    on_card: bool,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -147,6 +150,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     // submissions send differs from frame to frame.
     let size = size.max(8 << 20).next_power_of_two();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
+    let on_card = mapped.is_some();
     let (buffer, data) = match mapped {
         Some(made) => made,
         None => host.upload_buffer(size)?,
@@ -156,6 +160,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        on_card,
     })
 }
 
@@ -184,6 +189,8 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    /// Bytes of the memory used, from its start.
+    used: u64,
 }
 
 /// Runs whose pairs are one piece of work.
@@ -250,13 +257,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    Some(Own { memory, copies, used: at })
 }
 
 impl Own {
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
-    /// left readable by compute shaders.
+    /// left readable by compute shaders. They read `from` if given: a copy
+    /// of the memory's used bytes, at the same offsets, in the card's memory
+    /// (`crate::host::upq`), which the list's queue has waited for.
     ///
     /// # Safety
     /// An open list of ours, whose compute state is set anew behind this.
@@ -266,7 +275,9 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
+        from: Option<&ID3D12Resource>,
     ) {
+        let source = from.unwrap_or(&self.memory.buffer);
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -274,7 +285,7 @@ impl Own {
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -301,7 +312,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -320,6 +331,12 @@ impl Own {
                 list.ResourceBarrier(&last);
             }
         }
+    }
+
+    /// The memory and the bytes of it used, for `upq` to bring up whole;
+    /// `None` if it lies in the card's memory already.
+    pub(super) fn source(&self) -> Option<(&ID3D12Resource, u64)> {
+        (!self.memory.on_card).then_some((&self.memory.buffer, self.used))
     }
 
     /// The memory, to be kept until the submission has run.

@@ -285,8 +285,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             D3D12_RESOURCE_STATES(before as i32),
             D3D12_RESOURCE_STATES(state as i32),
         );
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // SAFETY: an open list and a live texture (the list's states hold
+        // it).
+        unsafe { list.list.barriers(&[barrier]) };
         before
     });
     if !first && before.is_none() {
@@ -912,8 +913,10 @@ fn record_upload(
                 }),
             },
         };
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[aliasing]) };
+        // SAFETY: an open list and a live texture. (Joined with the state
+        // change that follows, and with the last texture's after its
+        // upload: those were most of the calls joined.)
+        unsafe { list.list.barriers(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging/plane upload buffer lives until the list is reset.
