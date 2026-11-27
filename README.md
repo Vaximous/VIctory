@@ -26,40 +26,82 @@ All numbers below come from one PC:
 
 The benchmark is a scripted walk through the open world from a fixed save. The
 numbers are the mean frame time over world frames 1000-3000, the same stretch of
-route in every run.
+route in every run (about 5,000-6,500 draws a frame).
 
 | Build | ms / frame | fps | p99 | Notes |
 |---|---|---|---|---|
 | Starting point (2026-11-25) | 70.0 | 14.3 | | |
 | bench7 | 64.8 | 15.4 | | CCD split: our threads on the second die |
 | bench8 | 62.5 | 16.0 | 162 ms | hold-waits, clamp waits, ray misses, tiled residency |
-| **bench9** | **60.4** | **16.6** | **135 ms** | early depth, copies split across threads, no-freeze pipelines |
+| bench9 | 60.4 | 16.6 | 135 ms | early depth, copies split across threads, no-freeze pipelines |
+| bench10 | 58.2 | 17.2 | | parts of a joined submission sent as soon as each is ready; only changed 4 KiB parts go up |
+| bench11 | 50.1 | 20.0 | 77 ms | textures copied out under a short hold; never-read buffers stay on the card |
+| bench12 | 48.4 | 20.7 | 110 ms | sharded mapping lock, dead passes skipped, list resets on their own thread |
+| bench13 | 48.8 | 20.5 | 68 ms | landed card copies compared per 4 KiB part (bus 89 -> 8 MB a frame) |
+| bench15 | 45.6 | 21.9 | 74 ms | a write fault opens only the 4 KiB part written |
+| bench16 | 44.7 | 22.4 | 68 ms | blocks the title rewrites whole are opened whole |
+| bench17 | ~44 | ~22.7 | | changed-part compare done in place (AVX2), alignment-correct |
+| bench18 | 42.5 | 23.5 | 66 ms | scalar buffer loads read four dwords a call, fitted to the view's end |
+| **bench19** | **41.4** | **24.1** | **70 ms** | the graphics heap is write-watched by the kernel instead of guarded; landing merge fixed |
 
-Averaged over every frame after the first minute, bench9 runs 64.2 ms. Light
-scenes on foot run at 52-58 ms (17-19 fps). Interiors with a lot on screen can
-drop to 10 fps.
+Averaged over every frame after the first minute, bench19 runs 42.7 ms
+(23.4 fps), and its worst frame is 124 ms (bench18: 44.0 ms, worst 228 ms).
+Per 1000 draws it costs 7.27 ms a frame against bench18's 7.38.
 
-### Where a frame goes (bench9, moving)
+### Where a frame goes (bench19, moving)
 
 | Part | ms per frame | What it is |
 |---|---|---|
-| Preparing (CPU) | ~45-51 | The submitting thread translates and joins the title's command lists. Much of this time it spin-waits on 6 helper threads that sit idle about half the time, because job sizes are uneven. |
-| ...of which copies | 15-25 | 100-220 MB a frame of title memory copied to the card |
-| GPU | ~42 | Drawing |
-| Copying back | ~16-18 | ~20-30 MB a frame of GPU results copied back to title memory |
+| Preparing (CPU) | ~37 | The submitting thread translates the title's command lists and works out which title memory changed |
+| ...of which list steps | ~22 | Refreshes of changed title memory (~15) and the rest of translating the lists |
+| ...of which asking the write watch | ~4.6 | Which 4 KiB pages of the watched heap were written |
+| GPU | ~33 | Drawing |
+| Copying back | ~6 | GPU results copied back to title memory (was 17 ms at bench9) |
 
-**The limit is serialization, not any single part.** The CPU and GPU parts each
-fit under 50 ms, but they still run largely one after the other. Most of the
-remaining speed is in overlapping them and in copying less:
+**The CPU sets the pace, and most of it is memory tracking.** To know what the
+title changed, its memory used to be write-protected in 64 KiB blocks: every
+write to a protected block faulted into our handler, about 750 faults a frame,
+roughly 17-20 ms a frame of the title's own threads spent in our code. In
+bench19 the 185 MB graphics heap, which took about 690 of those faults, is
+ordinary write-watched memory at the title's own addresses instead, and the
+kernel says which pages were written. Faults fell to about 47 a frame and bytes
+sent to the card from 118 to 52 MB a frame.
 
-Being tested for the next build (not in this one yet):
+What was learned along the way:
 
-- The title submits work as about 8 joined parts. Sending each part to the card as
-  soon as it is ready reached a 58.7 ms steady state in testing.
-- Leaving GPU results in write-combined memory on the card cut copy-back by
-  about a third.
-- A read probe shows which copied-back memory the title actually reads, so the
-  rest can stay on the card.
+- **Copy less, not faster.** The biggest wins (bench10-13) came from sending only
+  the 4 KiB parts that actually changed, and from keeping buffers the title never
+  reads on the card. Bus traffic fell from 100-220 MB to under 10 MB a frame.
+- **Fault granularity matters both ways.** Opening only the 4 KiB part written
+  (bench15) cut refreshed bytes; reopening blocks the title rewrites whole as a
+  whole (bench16) cut the extra faults that caused.
+- **Remembering blocks longer loses.** Keeping blocks open for 2 s, or raising the
+  part cap from 4 to 8, refreshed more bytes and was slower each of the three
+  times it was tried.
+- **Locks:** sharding the mapping lock into 256 pieces, and making the kernel call
+  for a part outside the shared map's lock, removed those waits. Most of the wait
+  left is title threads writing different parts of the same block at once and
+  taking turns on that block's claim.
+- **Ask the kernel once, not per submission.** The first write-watch version asked
+  about the whole heap at each of ~14 submissions a frame and spent 28-35 ms doing
+  it, mostly in VirtualQuery splitting ranges across the heap's mapped runs. One
+  walk a frame (0.2 ms), runs that meet treated as one span, cached region splits
+  and asking only the pieces each submission covers brought it to 4.6 ms.
+- **A stale card side must never win.** Landing card results back used to store
+  every byte where the card's copy differed from ours, even where the CPU had
+  written since. That reverted the title's own pointers (a crash at world load)
+  and its lighting curves (posterized banding), seemingly at random. The merge now
+  stores a byte only where the title still holds what we last knew.
+- **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
+  between the title's first list call and its first submission are not waits on
+  us: its submitting thread waits on no fence, event or label at all.
+- **The GPU is the next ceiling.** With our CPU cost at zero, ~31-33 ms of GPU
+  work still caps this card near 30 fps.
+- **Shared memory: reading title memory in place loses here.** The card can open
+  system memory directly (OpenExistingHeapFromAddress, custom L0 heaps), but every
+  shader read then crosses PCIe. Our test was 73.5 against 60.5 ms, and another
+  fork measured about 5 ms less CPU for 15 ms more GPU on NVIDIA. With under
+  60 MB a frame copied, the copies are not the cost; the tracking is.
 
 ### What did not help
 
@@ -70,6 +112,19 @@ Being tested for the next build (not in this one yet):
   away. Each pipeline is now waited on once.
 - Two copies of the game on one card: when Windows rebalances video memory
   between them, the card stalls for seconds. Run one game at a time.
+- Copying resting blocks every time they are asked about (471 MB a frame).
+- Telling labels earlier: about 40 labels a frame wait on a card-copy compare,
+  but the title never waits on labels, so moving them changed nothing.
+- Wide scalar loads cost about 0.6 ms of GPU on NVIDIA in later tests; their
+  first version read past the end of views and drew glowing halos.
+- A compare-in-place version that counted 32-byte records from an unaligned start
+  resent the previous 4 KiB piece and overwrote bytes the card had written:
+  posterized banding in dim scenes. Fixed in bench17.
+- Faster fault handling (shorter lock holds, per-part claims, leaving hot blocks
+  unguarded): each made a fault cheaper or rarer but none beat bench18; the fix
+  was to stop faulting.
+- Per-part claims and some refresh orderings made the title crash, which turned
+  out to be the landing-merge bug above, exposed by different timing.
 
 ## Optimizations in Blueyes
 
@@ -88,6 +143,19 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_WAKE_FEW`, `VICTORY_TOUCHED_LIST` | One helper thread woken per job; changed copies kept in a list instead of rescanned. |
 | `VICTORY_PIPELINE_WAIT_ONCE` | A pipeline still compiling is waited on once per run, so the picture never freezes. |
 | `VICTORY_KEEP_SHOWN`, `VICTORY_BAKE_REPLAY` | Textures already on screen don't drop back to grey; face bakes that sampled missing inputs are redrawn. |
+| `VICTORY_SEND_PARTS_EARLY=1` (set it; off in code) | Each part of a joined submission goes to the card when ready; card copies are compared once, on the last part. |
+| `VICTORY_SEND_PARTS`, `VICTORY_LANDED_PARTS` | Only the changed 4 KiB parts of written pages, and of landed card copies, are sent up. |
+| `VICTORY_COMPARE_IN_PLACE` | The changed-part compare runs in place with AVX2 instead of through a copy. |
+| `VICTORY_GUARD_PARTS`, `VICTORY_PARTS_WIDE` | A write fault opens only the 4 KiB part written; a block lately opened whole is opened whole again. |
+| `VICTORY_TEXTURE_SHORT_HOLD`, `VICTORY_RANGED_MAPPING` | Changed textures are copied out under a short lock and detiled after; the mapping lock is split into 256 shards by address range. |
+| `VICTORY_LEAVE_UNREAD`, `VICTORY_UC_NO_BACK`, `VICTORY_WC_NO_BACK` | Buffers the title never reads, and large uncached or write-combined copies, stay on the card. |
+| `VICTORY_REAPER` | Host command-list resets and retired-object drops run on a thread of their own. |
+| `VICTORY_SKIP_DEAD_PASSES` | Three passes proven to have no visible output are left out; `VICTORY_DEAD_PASSES=<hashes>` overrides the list. |
+| `VICTORY_LIGHT_GAPS`, `VICTORY_EACH_ITEMS` | Empty refreshes of GPU-written ranges are skipped; per-item work is batched. |
+| `VICTORY_WIDE_LOADS` | Scalar buffer loads read four dwords a host call, checking the view's size and falling back near its end. |
+| `VICTORY_WATCHED_PAGES` | Long runs of fresh physical pages mapped below 4 GiB become write-watched private memory at the title's addresses; remaps copy them back first. |
+| `VICTORY_WATCH_NOT_GUARD`, `VICTORY_WATCH_ONCE` | Watched memory is never guarded; it is walked once a frame and later submissions ask only what they cover. |
+| `VICTORY_REGION_CACHE`, `VICTORY_WATCH_PIECES` | Region splits of private memory are remembered; watched copies are asked about piece by piece. |
 
 The grey placeholder is kept on purpose: it shows what hasn't streamed in yet.
 
@@ -209,7 +277,10 @@ A real controller works alongside.
   texture slot with an array view. A fix that keeps showing the old texture is in
   progress.
 - **Hitches:** a slow-compiling pipeline or a face bake gives a single hitch of
-  about 100 ms.
+  about 100 ms. The first sight of a new area creates a few thousand small card
+  copies one by one and can stall for one to three seconds; a fix is in testing. A synchronous decal-bake texture pass can stall one frame for
+  about a second, every couple of minutes in the open world; an asynchronous
+  version is in testing.
 - **Under memory pressure** (low RAM, or another heavy process on the card),
   texture streaming falls behind and shows blocks.
 
@@ -234,6 +305,11 @@ commits taken from elsewhere name the commit and its source.
   and **[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)**:
   the face-skinning fix (half views), BVH miss, NaN scrub, target variants,
   pipeline wait-once and submit-thread work ported here.
+- **[adanaport](https://github.com/adanaport/adanaport)**: the idea of turning the
+  graphics heap into write-watched memory, and measurements of in-place heaps.
+- **[NitricAcidDev/VIctory-Omega-Fork](https://github.com/NitricAcidDev/VIctory-Omega-Fork)**
+  (per-item batching), and **[Xeltax/VIcky](https://github.com/Xeltax/VIcky)**
+  with Grein and Grimkaaah (the list reaper thread).
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**,
   **[myokex/victory-amd](https://github.com/myokex/victory-amd)**, Geckomacabre and
   cxy0072019-sketch.
