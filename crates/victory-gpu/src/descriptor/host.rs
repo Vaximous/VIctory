@@ -1967,6 +1967,30 @@ impl HostHeap {
         (TextureQueue::in_order(due, max), census)
     }
 
+    /// Up to `max` title slots due at `upto` whose view was written, or
+    /// that were made due anew, in frames `first..=last`, each with its
+    /// write number, in the order to serve them, and the queue's counts at
+    /// `frame`: the inputs of a decoration bake drawn then
+    /// (`crate::draw`'s targeted bake passes).
+    pub(crate) fn texture_slots_due_written(
+        &self,
+        frame: u64,
+        upto: u64,
+        first: u64,
+        last: u64,
+        max: usize,
+    ) -> (Vec<(u32, u64)>, [u64; 5]) {
+        let (due, census) = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let mut due = textures.all_due(upto);
+            for part in &mut due {
+                part.retain(|&(written, _, _)| (first..=last).contains(&written));
+            }
+            (due, textures.census(frame))
+        };
+        (TextureQueue::in_order(due, max), census)
+    }
+
     /// A number that changes when a slot is written or made due anew, and
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
