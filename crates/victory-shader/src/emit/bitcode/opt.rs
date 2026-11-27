@@ -61,14 +61,23 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// No pass, a mark of the translation: [`WIDE`]'s calls fit the view.
+/// Each call of four dwords whose last one lies past the end of the view
+/// (`getDimensions`) is read a dword a call, as the console does (the
+/// dwords in it as they are, the others 0), where one call past the end may
+/// read none of them. Always so now; the bit keys the shader cache apart
+/// from translations of [`WIDE`] made before (run ow28-move: halos and
+/// black blocks with them).
+pub const FIT: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+pub const ALL: u32 = MODULE | FIRST | WIDE | FIT;
+/// The passes that run when nothing says which: every one
+/// (`VICTORY_WIDE_LOADS=0` leaves out [`WIDE`] and [`FIT`]).
+pub const DEFAULT: u32 = ALL;
+/// [`DEFAULT`] with `VICTORY_WIDE_LOADS=0`: the passes of the builds before.
+pub const NARROW: u32 = ALL & !(WIDE | FIT);
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").

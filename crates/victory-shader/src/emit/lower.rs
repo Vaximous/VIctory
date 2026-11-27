@@ -7173,6 +7173,54 @@ impl<'a> Lower<'a> {
         out
     }
 
+    /// [`Self::raw_dwords`] of a buffer view `h` that may end inside the
+    /// load ([`super::bitcode::opt::FIT`]): where its last dword lies past
+    /// the view's end (`getDimensions`, in bytes), the dwords are read again
+    /// a call each, in a branch all lanes take alike (the address is the
+    /// scalar load's), so that each reads as the console's does: as it is
+    /// inside the view, 0 outside. A call of four dwords that is out of the
+    /// view in part may read none of them (run ow28-move, with the wide
+    /// reads alone: halos around lights, black blocks in bright windows).
+    fn wide_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let wide = self.raw_dwords(h, addr, count);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let size = self.s.m.extract(c, d, 0);
+        let bytes = self.s.m.i32(4 * count);
+        let end = self.s.m.bin(c, Bin::Add, addr, bytes);
+        // Out of the view: the end past its size, or the address so near
+        // 2^32 that the end wrapped.
+        let past = self.s.m.cmp(c, pred::IULT, size, end);
+        let wrapped = self.s.m.cmp(c, pred::IULT, end, addr);
+        let out = self.s.m.bin(c, Bin::Or, past, wrapped);
+        let at = self.begin_guarded(Some(out));
+        let b = self.cur;
+        let mut both = Vec::with_capacity(count as usize);
+        for (k, &x) in wide.iter().enumerate() {
+            let off = self.s.m.i32(4 * k as u32);
+            let a = self.s.m.bin(b, Bin::Add, addr, off);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(i32t), self.s.m.i32(4));
+            let r = self.s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+            let one = self.s.m.extract(b, r, 0);
+            both.push((self.as_int(one), x));
+        }
+        self.end_guarded(at, &both)
+    }
+
+    /// [`Self::wide_dwords`] of a view from the heap, which has an end the
+    /// host keeps to; [`Self::raw_dwords`] of a root descriptor, which has
+    /// none (no read through it is checked, a dword a call or not).
+    fn fit_dwords(&mut self, src: &Source, h: V, addr: V, count: u32) -> Vec<V> {
+        match src {
+            Source::Loaded { .. } => self.wide_dwords(h, addr, count),
+            _ => self.raw_dwords(h, addr, count),
+        }
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -7257,7 +7305,7 @@ impl<'a> Lower<'a> {
             let mut raw = Vec::new();
             let wide = Self::wide_loads();
             if wide {
-                let dwords = self.raw_dwords(h, addr, count);
+                let dwords = self.fit_dwords(src, h, addr, count);
                 raw.extend(dwords.into_iter().map(|x| (x, zero)));
             }
             for k in 0..if wide { 0 } else { count } {
@@ -7328,8 +7376,12 @@ impl<'a> Lower<'a> {
                 }
                 None => self.handle(site, src, false, (11, 0))?,
             };
-            if Self::wide_loads() {
-                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+            // (Not for the size in a header: it is made sane below, which
+            // the wide reads leave out. Title memory by address has no end
+            // to fit in: its view is all of it.)
+            if Self::wide_loads() && !(size && root) {
+                let dwords = if root { self.raw_dwords(h, addr, count) } else { self.fit_dwords(src, h, addr, count) };
+                for (k, x) in dwords.into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }
                 return Ok(());

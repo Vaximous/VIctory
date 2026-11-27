@@ -208,21 +208,25 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: every pass below (255); without the last two with
+///   `VICTORY_WIDE_LOADS=0` (63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
 ///   which half has a lane (where every lane has one).
-///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   64 the dwords of one console load read by one call for every four,
+///   128 (a mark) each such call read only where it fits in the view.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let wide = std::env::var_os("VICTORY_WIDE_LOADS").is_none_or(|v| v != "0");
+        parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref(), wide)
+    })
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -324,14 +328,15 @@ pub fn translation_fingerprint() -> Vec<u8> {
 
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
-fn parse_shader_opt(value: Option<&str>) -> u32 {
+fn parse_shader_opt(value: Option<&str>, wide: bool) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
+    let usual = if wide { bitcode::opt::DEFAULT } else { bitcode::opt::NARROW };
+    parsed.map_or(usual, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -1265,14 +1270,16 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
-        assert_eq!(parse_shader_opt(None), usual);
-        assert_eq!(parse_shader_opt(Some("0")), 0);
-        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
-        assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), usual);
+        assert_eq!(usual, 255);
+        assert_eq!(super::bitcode::opt::NARROW, 63, "the passes of the builds before the wide loads");
+        assert_eq!(parse_shader_opt(None, true), usual);
+        assert_eq!(parse_shader_opt(None, false), 63);
+        assert_eq!(parse_shader_opt(Some("0"), true), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 "), true), 1);
+        assert_eq!(parse_shader_opt(Some("0x1"), false), 1);
+        assert_eq!(parse_shader_opt(Some("255"), false), all);
+        assert_eq!(parse_shader_opt(Some("0xffffffff"), true), all);
+        assert_eq!(parse_shader_opt(Some("on"), true), usual);
     }
 
     #[test]
@@ -2272,11 +2279,12 @@ mod tests {
     }
 
     /// `s_buffer_load_dwordx4`, `x8` and `x16` from a raw SRV read the dwords
-    /// the console's range-checked load reads, a call a dword or
-    /// (`VICTORY_SHADER_OPT` with 64) a call for every four: also where a
-    /// call's four dwords lie across the view's end (the dwords out of it
-    /// are 0, the others are read). On the software adapter only: run the
-    /// test once plain and once with `VICTORY_SHADER_OPT=127`.
+    /// the console's range-checked load reads, a call for every four (as
+    /// by default) or a call a dword: also where a call's four dwords lie
+    /// across the view's end (the dwords out of it are 0, the others are
+    /// read; there the wide reads are read again a dword a call,
+    /// `bitcode::opt::FIT`). On the software adapter only: run the test
+    /// once plain and once with `VICTORY_WIDE_LOADS=0`.
     #[test]
     #[cfg(windows)]
     fn scalar_buffer_loads_read_the_same_dwords_one_call_or_four() {
@@ -2362,7 +2370,8 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
-        // The calls that read the SRV: 28 a dword, 7 with four a call.
+        // The calls that read the SRV: 28 a dword, 7 with four a call (and
+        // 28 more where a load runs past the view's end).
         let wide = shader_opt() & super::bitcode::opt::WIDE != 0;
         let mut dxil = l.dxil;
         if let Ok(mut v) = super::validator::Validator::load(
