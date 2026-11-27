@@ -1456,18 +1456,41 @@ thread_local! {
 /// ([`Claims`]).
 static BUSY: Bits = Bits::new();
 
-/// Claims of blocks ([`BUSY`]), let go when dropped.
-struct Claims(Vec<usize>);
+/// Of the claims in [`BUSY`], those a refresh's guarding holds: a fault that
+/// waits for a claim says whose it waited for (the port-6 line).
+static REFRESHING: Bits = Bits::new();
+
+/// Claims of blocks ([`BUSY`]), let go when dropped; whether a refresh's
+/// guarding holds them ([`REFRESHING`]).
+struct Claims(Vec<usize>, bool);
 
 impl Claims {
     /// The claims of `blocks` (in order, each once), waited for one after
     /// the other: who waits holds only claims of lower blocks.
     fn wait_for(blocks: &[usize]) -> Claims {
+        Self::waited_for(blocks, false, false)
+    }
+
+    /// [`Claims::wait_for`] by a fault: the wait counted by whose claim it was.
+    fn wait_for_fault(blocks: &[usize]) -> Claims {
+        Self::waited_for(blocks, false, true)
+    }
+
+    /// [`Claims::wait_for`] by a refresh's guarding.
+    fn wait_for_refresh(blocks: &[usize]) -> Claims {
+        Self::waited_for(blocks, true, false)
+    }
+
+    fn waited_for(blocks: &[usize], refresh: bool, fault: bool) -> Claims {
         debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
         let mut spun = 0u64;
         for &block in blocks {
             let mut tries = 0u32;
+            let mut since: Option<(std::time::Instant, bool)> = None;
             while !BUSY.try_set(block) {
+                if fault && since.is_none() {
+                    since = Some((std::time::Instant::now(), REFRESHING.any(block, block + 1)));
+                }
                 tries += 1;
                 spun += 1;
                 if tries < 64 {
@@ -1477,17 +1500,26 @@ impl Claims {
                     std::thread::yield_now();
                 }
             }
+            if refresh {
+                REFRESHING.set(block);
+            }
+            if let Some((at, by_refresh)) = since {
+                port6_count(if by_refresh { P6_CLAIM_REFRESH_NS } else { P6_CLAIM_OTHER_NS }, at.elapsed().as_nanos() as u64);
+            }
         }
         if spun != 0 {
             port6_count(P6_CLAIM_SPINS, spun);
         }
-        Claims(blocks.to_vec())
+        Claims(blocks.to_vec(), refresh)
     }
 
     /// The claim of `block` if it is free; nothing waited for.
     fn try_one(&mut self, block: usize) -> bool {
         let got = BUSY.try_set(block);
         if got {
+            if self.1 {
+                REFRESHING.set(block);
+            }
             self.0.push(block);
         } else {
             port6_count(P6_CLAIMS_MISSED, 1);
@@ -1495,8 +1527,9 @@ impl Claims {
         got
     }
 
-    fn none() -> Claims {
-        Claims(Vec::new())
+    /// No claims yet, of a refresh's guarding.
+    fn none_refresh() -> Claims {
+        Claims(Vec::new(), true)
     }
 
     fn holds(&self, block: usize) -> bool {
@@ -1507,6 +1540,9 @@ impl Claims {
 impl Drop for Claims {
     fn drop(&mut self) {
         for &block in &self.0 {
+            if self.1 {
+                REFRESHING.clear(block);
+            }
             BUSY.clear(block);
         }
     }
@@ -1517,7 +1553,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static PORT6: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1540,6 +1576,10 @@ const P6_REMAPS_ALONE: usize = 12;
 const P6_FAULT_HOLD_NS: usize = 13;
 const P6_FAULT_CLAIM_NS: usize = 14;
 const P6_PARTS_LOCK_NS: usize = 15;
+/// Nanoseconds faults waited for claims a refresh's guarding held, and for
+/// others' (another fault's, mostly).
+const P6_CLAIM_REFRESH_NS: usize = 16;
+const P6_CLAIM_OTHER_NS: usize = 17;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1556,7 +1596,8 @@ pub(crate) fn port_guard_line(frames: f64) {
          refreshes' guards done shared {:.1}, blocks left written for want of their claim {:.1}, spins for claims {:.0}; \
          blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}; \
          parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS);          the title's mappings looked at shared {:.1}, taken alone {:.1} (VICTORY_REMAP_LOOK); \
-         the faults held the lock shared {:.2} ms, {:.2} of it waiting for claims, {:.2} for the open parts' map (VICTORY_PARTS_APART)",
+         the faults held the lock shared {:.2} ms, {:.2} of it waiting for claims, {:.2} for the open parts' map (VICTORY_PARTS_APART); \
+         of the claims waited for, {:.2} ms a refresh's guarding held, {:.2} others' (VICTORY_CLAIMS_PER_RUN)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1573,6 +1614,8 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_FAULT_HOLD_NS] / 1e6,
         n[P6_FAULT_CLAIM_NS] / 1e6,
         n[P6_PARTS_LOCK_NS] / 1e6,
+        n[P6_CLAIM_REFRESH_NS] / 1e6,
+        n[P6_CLAIM_OTHER_NS] / 1e6,
     );
 }
 
@@ -1928,7 +1971,7 @@ fn open_claimed(g: &Guards, block: usize, fault: bool, part: Option<usize>) -> u
     let mut views: Vec<usize> = vec![block];
     loop {
         let claiming = std::time::Instant::now();
-        let _claims = Claims::wait_for(&views);
+        let _claims = if fault { Claims::wait_for_fault(&views) } else { Claims::wait_for(&views) };
         if fault {
             port6_count(P6_FAULT_CLAIM_NS, claiming.elapsed().as_nanos() as u64);
         }
@@ -3240,7 +3283,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
                 continue;
             }
             // (No other claim is held here.)
-            let mut claims = Claims::wait_for(&[block]);
+            let mut claims = Claims::wait_for_refresh(&[block]);
             if g.protected.contains(block) && !g.clean.contains(block) {
                 // Parts of it open alone: read-only whole again, and only
                 // those told written.
@@ -3282,18 +3325,49 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
 /// claims can be had now, each run, its other views' blocks only where their
 /// claims can be had too.
 fn protect_claimed(g: &Guards, from: usize, to: usize) {
-    let mut claims = Claims::none();
+    let mut claims = Claims::none_refresh();
     let mut start = None;
+    let most = if claims_per_run() { RUN_MOST } else { usize::MAX };
     for block in from..to {
+        if let Some(s) = start
+            && block - s >= most
+        {
+            // A run as long as that: guarded, and its claims let go, before
+            // the next is claimed.
+            protect_run(g, s, block, &mut claims);
+            claims = Claims::none_refresh();
+            start = None;
+        }
         if claims.try_one(block) {
             start.get_or_insert(block);
         } else if let Some(s) = start.take() {
             protect_run(g, s, block, &mut claims);
+            if claims_per_run() {
+                // The run is guarded and noted: its claims let go now, not
+                // after the runs behind it.
+                claims = Claims::none_refresh();
+            }
         }
     }
     if let Some(s) = start {
         protect_run(g, s, to, &mut claims);
     }
+}
+
+/// The most blocks [`protect_claimed`] claims and guards in one go with
+/// [`claims_per_run`] (512 KiB): a fault in a run waits for no more of the
+/// kernel's change than that.
+const RUN_MOST: usize = 8;
+
+/// Whether [`protect_claimed`] lets go of each run's claims once that run
+/// is guarded, a run being at most [`RUN_MOST`] blocks
+/// (`VICTORY_CLAIMS_PER_RUN`, on unless `=0`). Held to the end of the range,
+/// a write fault of the title's in its first block waited for the kernel's
+/// changes of every block after it: the faults spent 6.4 ms a frame
+/// of their 19.8 ms holding the guards' lock waiting for claims in run
+/// ow45-move.
+fn claims_per_run() -> bool {
+    crate::toggled!("VICTORY_CLAIMS_PER_RUN")
 }
 
 fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
