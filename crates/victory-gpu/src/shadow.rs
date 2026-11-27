@@ -5033,6 +5033,9 @@ impl Shadow {
                 let tail = first + records * RECORD;
                 bits.clear();
                 bits.resize(records.div_ceil(64).max(1), 0);
+                // A block the guards leave open for being written all the
+                // time: its compare counted, and told the guards.
+                let hot = crate::watch::is_hot(at / crate::watch::PAGE).then(|| (std::time::Instant::now(), new));
                 // SAFETY: the CPU's side holds the copy's bytes at its
                 // offsets, and nothing else reads or writes these (no
                 // shader's range holds them, and the parts lie apart); the
@@ -5061,6 +5064,9 @@ impl Shadow {
                 if !read {
                     all = false;
                     return;
+                }
+                if let Some((began, before)) = hot {
+                    crate::watch::hot_compared(at / crate::watch::PAGE, (next - at) as u64, new - before, began.elapsed().as_nanos() as u64);
                 }
                 at = next;
             }

@@ -1585,8 +1585,166 @@ fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a block the title writes at every asking is left unguarded and
+/// compared in place instead (`VICTORY_HOT_UNGUARDED`, on unless `=0`;
+/// renderer port #6).
+///
+/// Some 700-850 write faults a frame, 13-15 us of the guards' lock each and
+/// more of the title's thread, fell on blocks the title writes every frame,
+/// opened a part at a time and made read-only again at the next asking. A
+/// block found written at [`HOT_STREAK`] askings in a row, each within
+/// [`HOT_TICK`] of the last, is opened whole and left so: each asking tells
+/// it written, and the copies compare it in place 4 KiB at a time and send
+/// only what changed. Once their compares found it the same [`HOT_SAME`]
+/// times running and for at least [`HOT_TICK`], or none looked at it for
+/// [`HOT_UNSEEN`], it is guarded again. At most [`HOT_MOST`] blocks.
+fn hot_unguarded() -> bool {
+    crate::toggled!("VICTORY_HOT_UNGUARDED") && port_guard()
+}
+
+const HOT_STREAK: u8 = 3;
+const HOT_SAME: u32 = 8;
+const HOT_TICK: std::time::Duration = std::time::Duration::from_millis(64);
+const HOT_UNSEEN: std::time::Duration = std::time::Duration::from_secs(1);
+/// 64 MB.
+const HOT_MOST: usize = 1024;
+
+/// The blocks left unguarded ([`hot_unguarded`]), a bit each, read with no lock.
+static HOT_BITS: Bits = Bits::new();
+
+#[derive(Clone, Copy)]
+struct Hot {
+    /// When it was made hot, last compared, last found changed.
+    seen: std::time::Instant,
+    changed: std::time::Instant,
+    /// Compares in a row that found it the same.
+    same: u32,
+}
+
+#[derive(Default)]
+struct HotSet {
+    hot: std::collections::HashMap<usize, Hot>,
+    /// Blocks found written at askings: when last, how many askings in a row.
+    streaks: std::collections::HashMap<usize, (std::time::Instant, u8)>,
+}
+
+static HOT_SET: Mutex<Option<HotSet>> = Mutex::new(None);
+
+/// Since the last line: blocks made hot, guarded again; compares of hot
+/// blocks' 64 KiB, their nanoseconds, bytes compared, bytes found changed;
+/// and the hot blocks now.
+static HOT_COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+const HOT_MADE: usize = 0;
+const HOT_GUARDED: usize = 1;
+const HOT_COMPARES: usize = 2;
+const HOT_NS: usize = 3;
+const HOT_BYTES: usize = 4;
+const HOT_NEW: usize = 5;
+const HOT_NOW: usize = 6;
+
+fn hot_set<T>(f: impl FnOnce(&mut HotSet) -> T) -> T {
+    f(HOT_SET.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HotSet::default))
+}
+
+/// A refresh found guarded `block` written: whether it is made hot now.
+fn hot_written(block: usize) -> bool {
+    if !hot_unguarded() {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    hot_set(|h| {
+        if h.streaks.len() >= 1 << 14 {
+            h.streaks.retain(|_, (at, _)| now.duration_since(*at) < HOT_TICK);
+        }
+        let streak = match h.streaks.get(&block) {
+            Some(&(at, n)) if now.duration_since(at) < HOT_TICK => n.saturating_add(1),
+            _ => 1,
+        };
+        if streak < HOT_STREAK || h.hot.len() >= HOT_MOST {
+            h.streaks.insert(block, (now, streak));
+            return false;
+        }
+        h.streaks.remove(&block);
+        h.hot.insert(block, Hot { seen: now, changed: now, same: 0 });
+        HOT_BITS.set(block);
+        HOT_COUNTS[HOT_MADE].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HOT_COUNTS[HOT_NOW].store(h.hot.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        true
+    })
+}
+
+/// Whether a refresh leaves unguarded `block`, written: one that is hot
+/// still. One whose time is up is no longer hot, and is guarded.
+fn hot_keeps(block: usize) -> bool {
+    if !HOT_BITS.any(block, block + 1) {
+        return false;
+    }
+    hot_set(|h| {
+        let Some(hot) = h.hot.get(&block).copied() else {
+            HOT_BITS.clear(block);
+            return false;
+        };
+        let done = hot.seen.elapsed() >= HOT_UNSEEN || hot.same >= HOT_SAME && hot.changed.elapsed() >= HOT_TICK;
+        if done {
+            h.hot.remove(&block);
+            HOT_BITS.clear(block);
+            HOT_COUNTS[HOT_GUARDED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            HOT_COUNTS[HOT_NOW].store(h.hot.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        !done
+    })
+}
+
+/// Whether `block` is left unguarded now ([`hot_unguarded`]).
+pub(crate) fn is_hot(block: usize) -> bool {
+    HOT_BITS.any(block, block + 1)
+}
+
+/// A copy compared `bytes` of hot `block` in place in `ns`, `new` of them
+/// changed.
+pub(crate) fn hot_compared(block: usize, bytes: u64, new: u64, ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOT_COUNTS[HOT_COMPARES].fetch_add(1, Relaxed);
+    HOT_COUNTS[HOT_NS].fetch_add(ns, Relaxed);
+    HOT_COUNTS[HOT_BYTES].fetch_add(bytes, Relaxed);
+    HOT_COUNTS[HOT_NEW].fetch_add(new, Relaxed);
+    let now = std::time::Instant::now();
+    hot_set(|h| {
+        if let Some(hot) = h.hot.get_mut(&block) {
+            hot.seen = now;
+            if new != 0 {
+                hot.same = 0;
+                hot.changed = now;
+            } else {
+                hot.same = hot.same.saturating_add(1);
+            }
+        }
+    });
+}
+
+/// The hot blocks' line of the frame lines, per frame.
+fn hot_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !hot_unguarded() {
+        return;
+    }
+    let n: Vec<f64> = HOT_COUNTS[..HOT_NOW].iter().map(|c| c.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "blocks the title writes at every asking left unguarded (VICTORY_HOT_UNGUARDED): {} now, {:.1} made so a frame, \
+         {:.1} guarded again; their compares in place per frame: {:.0}, {:.2} ms, {:.2} MB compared, {:.2} MB found changed",
+        HOT_COUNTS[HOT_NOW].load(Relaxed),
+        n[HOT_MADE],
+        n[HOT_GUARDED],
+        n[HOT_COMPARES],
+        n[HOT_NS] / 1e6,
+        n[HOT_BYTES] / 1e6,
+        n[HOT_NEW] / 1e6,
+    );
+}
+
 /// Renderer port #6's line of the frame lines, per frame.
 pub(crate) fn port_guard_line(frames: f64) {
+    hot_line(frames);
     let n: Vec<f64> = PORT6.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
     if !port_guard() && n.iter().all(|&v| v == 0.0) {
         return;
@@ -3220,7 +3378,7 @@ fn guard_told(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
             if cover(&g, block, block + 1, None) {
                 g.clean.insert(block);
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) && !hot_keeps(block) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             put(&mut g, from, to);
@@ -3288,7 +3446,16 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
             }
             // (No other claim is held here.)
             let mut claims = Claims::wait_for_refresh(&[block]);
-            if g.protected.contains(block) && !g.clean.contains(block) {
+            if g.protected.contains(block) && !g.clean.contains(block) && !g.aliased.contains(block) && hot_written(block) {
+                // Written at every asking lately: left open from now on,
+                // told written whole at each asking and compared in place,
+                // until the compares find it the same ([`hot_unguarded`]).
+                let parts = parts_open(block);
+                if parts != 0 {
+                    told.push((block, parts));
+                }
+                unguard(&g, &[block]);
+            } else if g.protected.contains(block) && !g.clean.contains(block) {
                 // Parts of it open alone: read-only whole again, and only
                 // those told written.
                 let parts = parts_close(block);
@@ -3299,7 +3466,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
                     g.clean.insert(block);
                 }
             }
-        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+        } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) && !hot_keeps(block) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
             protect_claimed(&g, from, to);
