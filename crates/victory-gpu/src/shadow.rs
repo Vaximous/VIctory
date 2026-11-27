@@ -2519,7 +2519,7 @@ fn send_parts() -> bool {
 /// [`whole_changed`] read title memory once, in place, against the CPU's
 /// side (`safecopy::changed`: 32 bytes a step, put in where they differ),
 /// and not through a copy of every 4 KiB first, compared and copied again
-/// (`VICTORY_COMPARE_IN_PLACE`, off unless `=1`). Run ow38-move with it on
+/// (`VICTORY_COMPARE_IN_PLACE`, on unless `=0`). Run ow38-move with it on
 /// ended in heavy banding: its records of 32 bytes were counted from the
 /// range's start, so from an unaligned start each lay across two 4 KiB
 /// pieces, and a byte that differed at the head of one piece sent the piece
@@ -2553,7 +2553,7 @@ fn light_gaps() -> bool {
 
 fn compare_in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_IN_PLACE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_IN_PLACE").is_none_or(|v| v != "0"))
 }
 
 fn landed_parts() -> bool {
