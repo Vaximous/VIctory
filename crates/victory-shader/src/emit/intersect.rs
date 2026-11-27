@@ -59,6 +59,22 @@ struct Ray {
     inverse: [V; 3],
 }
 
+/// `VICTORY_BVH_MISS` (default 1; 0 off): every box and triangle test misses without
+/// reading its node, so a walk ends at the root (a box gives no child, a triangle the
+/// triangle miss). The structure builder does not run on this host, so what lies in a
+/// structure's memory is stale or never built, and walking it is not the console's
+/// walk: it costs some 10 ms a frame and may never end. With it off the tests are made
+/// as the console's. Not in this crate's own tests, which check the walks; part of the
+/// shader cache key. Ported from victory-nvidia-megafork 24a479d329, where it is off
+/// unless =1.
+fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return false;
+    }
+    *ON.get_or_init(|| std::env::var("VICTORY_BVH_MISS").as_deref().map(str::trim) != Ok("0"))
+}
+
 impl<'a> Lower<'a> {
     /// `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`.
     pub(super) fn bvh(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -191,11 +207,21 @@ impl<'a> Lower<'a> {
             .m
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
-        let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        // Every node missed unread ([`bvh_miss`]).
+        let miss = bvh_miss();
+        let boxes = if miss {
+            [self.s.m.i32(bvh::NONE); 4]
+        } else {
+            self.bvh_boxes(at, kind, &ray, sort)
+        };
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
-        let triangle = self.bvh_triangle(at, kind, &ray);
+        let triangle = if miss {
+            bvh::MISS.map(|f| self.s.m.i32(f.to_bits()))
+        } else {
+            self.bvh_triangle(at, kind, &ray)
+        };
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;

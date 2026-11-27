@@ -94,6 +94,8 @@ fn build() -> [u8; 32] {
             // Colours and float image stores made finite or free of NaN.
             "VICTORY_FINITE_COLOUR",
             "VICTORY_NAN_SCRUB",
+            // Ray walks that end at the root.
+            "VICTORY_BVH_MISS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
