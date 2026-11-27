@@ -778,7 +778,9 @@ impl Shader {
         }
         // The slot feedback's writes only where they change something (and the atomics of
         // one value per wave from its first lane), after the clean-up merged the repeats.
-        if self.touched_frame.is_some() {
+        // On frames without notes (`VICTORY_SLOT_FEEDBACK_EVERY`) the epoch dword holds 0:
+        // nothing is stored, and the guard's load reads dword 0, the same for every wave.
+        if let Some(frame) = self.touched_frame {
             let (res, i32t, handle) = (self.t.res_ret, self.t.i32, self.t.handle);
             let (i8t, i32p) = (self.m.int(8), i32t);
             let fty = self.m.func_ty(res, vec![i32p, handle, i32p, i32p, i8t, i32p]);
@@ -789,17 +791,22 @@ impl Shader {
                 let (op, touched, at) = (args[0], args[1], if args.len() > 7 { args[2] } else { args[3] });
                 let (k139, one, align) = (m.i32(139), m.i8(1), m.i32(4));
                 let iu = m.undef(i32t);
+                let zero = m.i32(0);
+                let epoch_now = m.cast(b, super::bitcode::Cast::Bitcast, frame, i32t);
+                let noting = m.cmp(b, super::bitcode::pred::NE, epoch_now, zero);
+                let at = m.select(b, noting, at, zero);
                 let r = m.call(b, load, vec![k139, touched, at, iu, one, align]);
                 let now = m.extract(b, r, 0);
                 let now = m.cast(b, super::bitcode::Cast::Bitcast, now, i32t);
-                if m.int_value(op) == Some(140) {
+                let changes = if m.int_value(op) == Some(140) {
                     // a store of the epoch: where another is there
                     let epoch = m.cast(b, super::bitcode::Cast::Bitcast, args[4], i32t);
                     m.cmp(b, super::bitcode::pred::NE, now, epoch)
                 } else {
                     // an atomic maximum: past what is there
                     m.cmp(b, super::bitcode::pred::IUGT, args[6], now)
-                }
+                };
+                m.bin(b, super::bitcode::Bin::And, noting, changes)
             });
             if firsts > 0 {
                 self.flags |= flags::WAVE_OPS;

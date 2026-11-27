@@ -33,6 +33,22 @@ pub fn frames_per_epoch() -> u64 {
     })
 }
 
+/// `VICTORY_SLOT_FEEDBACK_EVERY`: shaders note their slots on one frame in this many
+/// (8 by default; 1: every frame). On the others dword 0 holds 0, and the translated
+/// shaders leave their notes out (`victory_shader` guards each on a non-zero epoch).
+/// The feedback cost about 10 ms of the card's time a frame noted every frame (runs
+/// ow11, ow13 against ow9).
+pub fn feedback_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SLOT_FEEDBACK_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n: &u64| n > 0)
+            .unwrap_or(8)
+    })
+}
+
 struct Feedback {
     card: ID3D12Resource,
     /// What the PC reads (and, zeroed, the first fill of `card`).
@@ -57,6 +73,10 @@ struct Feedback {
     levels: Arc<Vec<u32>>,
     /// The last list sent copied the buffer back.
     copied: bool,
+    /// The epoch the copy back was made in.
+    copied_epoch: u32,
+    /// What dword 0 holds now: the epoch, or 0 on frames without notes.
+    shown: u32,
 }
 
 // SAFETY: free-threaded objects; the mapping is read under the mutex.
@@ -113,6 +133,12 @@ pub(crate) fn tick(frame: u64) {
         return;
     };
     if fb.sent > 0 && frame < fb.began + frames_per_epoch() {
+        // Notes on one frame in [`feedback_every`] of the epoch.
+        let want = if (frame - fb.began).is_multiple_of(feedback_every()) { fb.epoch } else { 0 };
+        if want != fb.shown {
+            // SAFETY: as below.
+            unsafe { show(fb, want) };
+        }
         return;
     }
     // SAFETY: plain queries and recording on objects of our own; the
@@ -126,7 +152,7 @@ pub(crate) fn tick(frame: u64) {
             let words = std::slice::from_raw_parts(fb.mapped, 2 * n + 1);
             fb.seen = Arc::new(words[1..=n].to_vec());
             fb.levels = Arc::new(words[n + 1..].to_vec());
-            fb.seen_epoch = words[0];
+            fb.seen_epoch = if words[0] != 0 { words[0] } else { fb.copied_epoch };
             fb.copied = false;
         }
         let Some(h) = host() else { return };
@@ -146,6 +172,7 @@ pub(crate) fn tick(frame: u64) {
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )]);
             fb.copied = true;
+            fb.copied_epoch = fb.epoch;
             D3D12_RESOURCE_STATE_COPY_DEST
         } else {
             D3D12_RESOURCE_STATE_COPY_DEST
@@ -166,6 +193,37 @@ pub(crate) fn tick(frame: u64) {
         let _ = h.queue.Signal(&fb.fence, fb.sent);
     }
     fb.began = frame;
+    fb.shown = fb.epoch;
+}
+
+/// Dword 0 of the buffer becomes `value` (the epoch, or 0: no notes), in a list of its
+/// own once the last one ran (if it did not yet: at a later frame).
+///
+/// # Safety
+/// The list and allocator are reset only after the list that used them ran.
+unsafe fn show(fb: &mut Feedback, value: u32) {
+    let Some(h) = host() else { return };
+    // SAFETY: the caller's.
+    unsafe {
+        if fb.fence.GetCompletedValue() < fb.sent {
+            return;
+        }
+        if fb.allocator.Reset().is_err() || fb.list.Reset(&fb.allocator, None).is_err() {
+            return;
+        }
+        let card = &fb.card;
+        fb.list.ResourceBarrier(&[transition(card, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        let words = [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: card.GetGPUVirtualAddress(), Value: value }];
+        fb.list2.WriteBufferImmediate(1, words.as_ptr(), None);
+        fb.list.ResourceBarrier(&[transition(card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+        if fb.list.Close().is_err() {
+            return;
+        }
+        h.queue.ExecuteCommandLists(&[Some(fb.list.clone().into())]);
+        fb.sent += 1;
+        let _ = h.queue.Signal(&fb.fence, fb.sent);
+    }
+    fb.shown = value;
 }
 
 /// The epoch shaders note now (0 before the first), and per view-heap slot
@@ -267,6 +325,8 @@ impl Host {
                 seen_epoch: 0,
                 levels: Arc::new(Vec::new()),
                 copied: false,
+                copied_epoch: 0,
+                shown: 0,
             })
         }
     }
