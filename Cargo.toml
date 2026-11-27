@@ -71,9 +71,16 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Thin LTO and one code unit (after Belobug/VIctory-Belobug-AMD e9428969f0).
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+# Thin LTO across the crates as in release, with code units kept for build
+# time.
+lto = "thin"
+codegen-units = 16

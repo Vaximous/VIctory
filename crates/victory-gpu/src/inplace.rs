@@ -66,12 +66,27 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: as 2, and the page pool
+/// too: the runtime makes its sections committed ([`pool_committed`]) and
+/// title memory its views show from one section is a buffer placed in the
+/// heap opened on that section ([`place_in_pool`]); title buffers whose
+/// card copy was turned down go in place rather than to a copy in the PC's
+/// memory (`shadow.rs` `lookup`, `VICTORY_INPLACE_CARD_KB`).
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
+/// Measured (open world, moving, frames 600-1800): level 3 is slower,
+/// 73.5 ms against 60.5 (prep 58.6/43.4, card 50.7/38.4), and left the PC
+/// with 4.6 GB of commit instead of 9.6 (5 GB more in memory). The title
+/// maps its pool's 64 KiB pages one by one at addresses whose offsets in
+/// the section do not follow each other, so only 89 windows (424 MB) of
+/// ~770 were ever one run of a section; 1,138 asks were turned down.
+/// Showing scattered pages needs tile mappings, which such heaps refuse
+/// (device removed). Kept off.
+///
+/// What stages 1 and 2 cover is private memory (`XMemVirtualAlloc`'s).
+/// View memory (the page pool) is turned down there: its section is made
+/// reserved, which the host refuses. What a view shows changes when the
+/// title maps pages: [`title_memory_freeing`] lets go of what is in place
+/// there.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
@@ -100,8 +115,10 @@ fn most() -> u64 {
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// because of [`most`]; and what was let go because its memory changed;
+/// then of those in place, how many in the page pool ([`place_in_pool`]),
+/// and the pool's sections opened as heaps.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -139,9 +156,20 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
+        if level() >= 3
+            && let Some(placed) = place_in_pool(start, len, window)
+        {
+            let at = if window { 0 } else { 2 };
+            STATS[at].fetch_add(1, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+            return Some(placed);
+        }
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    // (The page pool's views are counted apart: they are locked by no
+    // opening, the section's heap holds them.)
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
@@ -165,6 +193,115 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             None
         }
     }
+}
+
+/// Where `[at, at + len)` lies in one section, if every view of the title's
+/// pages that touches it is of that section at one and the same distance
+/// between address and offset: the section and the offset of `at`. With
+/// `holes` the range may have unmapped pages (what lies at their offsets in
+/// the section is then shown there too; nothing should read them); without,
+/// it must be one run.
+fn section_run_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize, holes: bool) -> Option<(usize, u64)> {
+    let end = at.checked_add(len.max(1))?;
+    if !holes {
+        return match cover_in(views, at, len) {
+            Cover::Run(section, offset) => Some((section, offset)),
+            _ => None,
+        };
+    }
+    let first = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at);
+    let mut found: Option<(usize, i128)> = None;
+    for (&base, &(_, section, offset)) in first.into_iter().chain(views.range(at.saturating_add(1)..end)) {
+        let delta = base as i128 - offset as i128;
+        match found {
+            None => found = Some((section, delta)),
+            Some(f) if f == (section, delta) => {}
+            Some(_) => return None,
+        }
+    }
+    let (section, delta) = found?;
+    let offset = at as i128 - delta;
+    (offset >= 0).then_some((section, offset as u64))
+}
+
+/// The heaps opened on committed sections of the page pool, by the
+/// section's handle; opened when first needed, let go with the section
+/// (placed buffers hold their own reference).
+static POOL_HEAPS: std::sync::Mutex<Vec<(usize, ID3D12Heap)>> = std::sync::Mutex::new(Vec::new());
+
+/// Title memory `[start, start + len)` that the title's views show from a
+/// committed section of its page pool ([`pool_committed`]): a buffer placed
+/// in the heap opened on the section, at the offset the views show. A
+/// window may have unmapped pages; a title buffer must be one run (shaders
+/// may write it, and a hole's offset is another page of the pool).
+///
+/// The heap is the section, not the views: the title may map, unmap and
+/// guard its views at will. When it changes what an address shows,
+/// [`title_memory_freeing`] lets the placed buffer go and the next ask
+/// looks again.
+fn place_in_pool(start: u64, len: u64, window: bool) -> Option<Placed> {
+    let (at, bytes) = (start as usize, len as usize);
+    let (section, offset, size) = {
+        let v = views();
+        let (section, offset) = section_run_in(&v.views, at, bytes, window)?;
+        let &(_, size, committed) = v.sections.iter().find(|s| s.0 == section)?;
+        if !committed {
+            return None;
+        }
+        (section, offset, size)
+    };
+    let from = offset & !(K64 as u64 - 1);
+    let bias = offset - from;
+    let width = (offset + len.max(1)).next_multiple_of(K64 as u64) - from;
+    if from + width > size {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let heap = {
+        let mut heaps = POOL_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some(h) => h.1.clone(),
+            None => match open(&host.device, From::Section(section)) {
+                Ok(heap) => {
+                    STATS[9].fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(section = format_args!("{section:#x}"), mb = size >> 20, "a section of the page pool opened as a heap: title memory there is read in place");
+                    heaps.push((section, heap.clone()));
+                    heap
+                }
+                Err(e) => {
+                    if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(error = %e, "a committed section of the page pool not opened as a heap");
+                    }
+                    return None;
+                }
+            },
+        }
+    };
+    let buffer = match place(&host.device, &heap, from, width) {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(error = %e, "no buffer placed in the page pool's heap: a copy instead");
+            }
+            return None;
+        }
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Some(Placed { buffer, heap, gpu, bias })
+}
+
+/// Whether the runtime makes the title's physical pages as committed
+/// sections, which can be opened as heaps (`VICTORY_POOL_COMMIT`; on with
+/// [`level`] 3 unless `=0`). The runtime keeps the host's commit headroom
+/// and makes reserved sections past it.
+pub fn pool_committed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_POOL_COMMIT").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("1") => true,
+        _ => level() >= 3,
+    })
 }
 
 /// What [`place_for`] gave is gone.
@@ -199,7 +336,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} placed in the page pool so far, {} of its sections opened as heaps",
         s[0],
         s[1] >> 20,
         s[2],
@@ -207,7 +344,9 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        s[8],
+        s[9]
     );
 }
 
@@ -307,11 +446,15 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
     v.sections.push((section, bytes, committed));
+    drop(v);
+    // So was the heap opened on it.
+    POOL_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != section);
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    POOL_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| h.0 != section);
     let whole = {
         let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
@@ -1317,6 +1460,32 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// A range is in one section where every view touching it is of that
+    /// section at one distance; holes only where they are allowed.
+    #[test]
+    fn a_section_run_may_have_holes_but_one_distance() {
+        let mut views = BTreeMap::new();
+        let at = 0x9_0000_0000usize;
+        views.insert(at, (2 * K64, 4, 10 * K64 as u64));
+        // A page left unmapped, then the same distance again.
+        views.insert(at + 3 * K64, (K64, 4, 13 * K64 as u64));
+        assert_eq!(section_run_in(&views, at + 100, 4 * K64, true), Some((4, 10 * K64 as u64 + 100)));
+        assert_eq!(section_run_in(&views, at + 100, 4 * K64, false), None, "a hole in a title buffer");
+        assert_eq!(section_run_in(&views, at, 2 * K64, false), Some((4, 10 * K64 as u64)));
+        // Another distance.
+        views.insert(at + 4 * K64, (K64, 4, 2 * K64 as u64));
+        assert_eq!(section_run_in(&views, at, 5 * K64, true), None);
+        // Another section.
+        views.insert(at + 4 * K64, (K64, 5, 14 * K64 as u64));
+        assert_eq!(section_run_in(&views, at, 5 * K64, true), None);
+        // A range no view touches.
+        assert_eq!(section_run_in(&views, at + 8 * K64, K64, true), None);
+        // An offset that would be below the section's start.
+        let mut low = BTreeMap::new();
+        low.insert(at + K64, (K64, 6, 0u64));
+        assert_eq!(section_run_in(&low, at, 2 * K64, true), None);
     }
 
     /// What the runtime forgets when memory is mapped anew.
