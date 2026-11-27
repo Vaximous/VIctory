@@ -305,6 +305,11 @@ fn world_ms() -> Option<u64> {
     })
 }
 
+/// The last texture pass's microseconds: before its slots were asked
+/// for, asking for them (and sorting), the looks again ahead, the textures
+/// made ahead (for the lines of slow passes).
+pub(crate) static PASS_PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Host textures made ahead of a texture pass (`VICTORY_PREMAKE`).
 pub(crate) static PREMADE: AtomicU64 = AtomicU64::new(0);
 
@@ -2360,6 +2365,10 @@ impl State {
                 uploaded = HEAP_TEXTURES.load(Ordering::Relaxed) - made_before,
                 mb = (HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) - bytes_before) >> 20,
                 tile_mapping_us = crate::tiles::STATS[7].load(Ordering::Relaxed) - tile_us,
+                before_us = PASS_PHASES[0].load(Ordering::Relaxed),
+                due_us = PASS_PHASES[1].load(Ordering::Relaxed),
+                looks_us = PASS_PHASES[2].load(Ordering::Relaxed),
+                premade_us = PASS_PHASES[3].load(Ordering::Relaxed),
                 loading = loading(),
                 "a frame's texture pass took 50 ms or more on the recording thread"
             );
@@ -2633,7 +2642,14 @@ impl State {
                 }
                 let took = began.elapsed().as_millis() as u64;
                 if took >= 50 {
-                    tracing::info!(frame, ms = took, "a decoration bake's synchronous texture pass took 50 ms or more");
+                    tracing::info!(
+                        frame,
+                        ms = took,
+                        before_us = PASS_PHASES[0].load(Ordering::Relaxed),
+                        due_us = PASS_PHASES[1].load(Ordering::Relaxed),
+                        looks_us = PASS_PHASES[2].load(Ordering::Relaxed),
+                        "a decoration bake's synchronous texture pass took 50 ms or more"
+                    );
                 }
                 BAKED_MS.fetch_add(took, Ordering::Relaxed);
                 return;
@@ -2773,6 +2789,7 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return true;
         }
+        let pass_began = std::time::Instant::now();
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.
@@ -2914,6 +2931,8 @@ impl State {
                 EVICTED_UNTOUCHED[1].fetch_add(bytes, Ordering::Relaxed);
             }
         }
+        PASS_PHASES[0].store(pass_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let due_began = std::time::Instant::now();
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // Slots shaders read lately first (`VICTORY_TOUCHED_FIRST=0`: only
         // with eviction, as before).
@@ -3020,7 +3039,16 @@ impl State {
         // The looks again of slots uploaded whole read 48 KiB of title memory
         // each: done ahead, on threads of ours, for as many as the pass
         // could reach (`VICTORY_RECHECK_THREADS`, 6; 0: here, one by one).
-        let prints = recheck_prints(host, &due);
+        PASS_PHASES[1].store(due_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let prints_began = std::time::Instant::now();
+        // Only for as many as the pass may reach: all of them was 4,096
+        // looks of 48 KiB a pass (200 MB; 65,536 in a bake), passes of
+        // 125-220 ms that uploaded nothing, bakes of a second and more
+        // (run ow14-warm).
+        let reach = if baking || sync.is_some() { 4096 } else if loading() { 1024 } else { 256 };
+        let prints = recheck_prints(host, &due[..due.len().min(reach)]);
+        PASS_PHASES[2].store(prints_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let premake_began = std::time::Instant::now();
         // The host textures of the first due slots that have none yet are
         // made ahead of the pass and waited for as one until the card has
         // them mapped (`crate::host::batch_mapped`; one wait each, 0.25 to
@@ -3058,6 +3086,7 @@ impl State {
                 PREMADE.fetch_add(made as u64, Ordering::Relaxed);
             });
         }
+        PASS_PHASES[3].store(premake_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         for (index, write) in due {
             in_system = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {

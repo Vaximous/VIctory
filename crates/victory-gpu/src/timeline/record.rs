@@ -176,6 +176,7 @@ pub struct Span {
 /// A span named `name`.
 #[inline(always)]
 pub fn span(name: &'static str) -> Span {
+    opened(name);
     Span {
         name,
         began: if on() { ticks() } else { 0 },
@@ -187,6 +188,7 @@ impl Span {
     #[inline(always)]
     pub fn next(&mut self, name: &'static str) {
         self.close();
+        opened(name);
         (self.name, self.began) = (name, if on() { ticks() } else { 0 });
     }
 
@@ -208,6 +210,7 @@ impl Span {
 impl Drop for Span {
     #[inline(always)]
     fn drop(&mut self) {
+        closed(self.name);
         if self.began != 0 {
             self.close();
         }
@@ -674,5 +677,135 @@ mod tests {
         assert_eq!(parse("120+130.5,20,D:/a,b.json"), (Some((vec![120.0, 130.5], 20)), "D:/a,b.json"));
         assert_eq!(parse("D:/a,1,2.json"), (None, "D:/a,1,2.json"));
         assert_eq!(parse("D:/a.json"), (None, "D:/a.json"));
+    }
+}
+
+/// The stall watch (`VICTORY_STALL_WATCH=0`: off): each thread's span begun
+/// last is known to a thread of ours, which tells when no frame was
+/// presented for a second what the threads were in, and since when. (A
+/// frame of 2.5 s in run ow14-warm had no line at all to tell its cause.)
+fn stall_watch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_STALL_WATCH").is_none_or(|v| v != "0");
+        if on {
+            let _ = std::thread::Builder::new().name("victory-stall-watch".into()).spawn(watch_stalls);
+        }
+        on
+    })
+}
+
+/// Threads watched at most.
+const WATCHED: usize = 96;
+
+/// A thread's span begun last: its name (pointer, length; length 0: none
+/// open) and when it began.
+struct Open {
+    at: AtomicUsize,
+    len: AtomicUsize,
+    began: std::sync::atomic::AtomicU64,
+}
+
+static OPEN: [Open; WATCHED] =
+    [const { Open { at: AtomicUsize::new(0), len: AtomicUsize::new(0), began: std::sync::atomic::AtomicU64::new(0) } }; WATCHED];
+
+/// The watched threads' names, by their place in [`OPEN`].
+static OPEN_THREADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// This thread's place in [`OPEN`] (`None`: past [`WATCHED`]).
+fn open_slot() -> Option<usize> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local!(static SLOT: Cell<usize> = const { Cell::new(usize::MAX) });
+    let slot = SLOT.with(|slot| {
+        if slot.get() == usize::MAX {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            if n < WATCHED {
+                let name = std::thread::current().name().map_or_else(|| format!("{:?}", std::thread::current().id()), str::to_owned);
+                let mut names = OPEN_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+                if names.len() <= n {
+                    names.resize(n + 1, String::new());
+                }
+                names[n] = name;
+            }
+            slot.set(n.min(WATCHED));
+        }
+        slot.get()
+    });
+    (slot < WATCHED).then_some(slot)
+}
+
+#[inline(always)]
+fn opened(name: &'static str) {
+    if !stall_watch() {
+        return;
+    }
+    if let Some(slot) = open_slot() {
+        let open = &OPEN[slot];
+        open.len.store(0, Ordering::Relaxed);
+        open.at.store(name.as_ptr() as usize, Ordering::Relaxed);
+        open.began.store(ticks(), Ordering::Relaxed);
+        open.len.store(name.len(), Ordering::Release);
+    }
+}
+
+#[inline(always)]
+fn closed(name: &'static str) {
+    if !stall_watch() {
+        return;
+    }
+    if let Some(slot) = open_slot()
+        && OPEN[slot].at.load(Ordering::Relaxed) == name.as_ptr() as usize
+    {
+        OPEN[slot].len.store(0, Ordering::Release);
+    }
+}
+
+/// The stall watch's thread: every 100 ms, whether a frame was presented.
+fn watch_stalls() {
+    let mut last = (crate::queue::presented(), std::time::Instant::now());
+    let mut told = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let frame = crate::queue::presented();
+        let since = last.1.elapsed();
+        if frame != last.0 {
+            if told {
+                tracing::warn!(frame, ms = since.as_millis() as u64, "the stall ended: a frame was presented again");
+            }
+            last = (frame, std::time::Instant::now());
+            told = false;
+            continue;
+        }
+        if told || frame == 0 || since < std::time::Duration::from_secs(1) {
+            continue;
+        }
+        told = true;
+        let now = ticks();
+        let names = OPEN_THREADS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut open: Vec<(u64, String)> = Vec::new();
+        for (slot, thread) in names.iter().enumerate() {
+            let o = &OPEN[slot];
+            let len = o.len.load(Ordering::Acquire);
+            let at = o.at.load(Ordering::Relaxed);
+            let began = o.began.load(Ordering::Relaxed);
+            if len == 0 || at == 0 || len != o.len.load(Ordering::Acquire) {
+                continue;
+            }
+            // SAFETY: the pointer and length of a `&'static str` stored
+            // together (the length read the same before and after).
+            let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(at as *const u8, len)) };
+            let ms = micros(now.saturating_sub(began)) / 1000;
+            if ms >= 250 {
+                open.push((ms, format!("{thread}: {name} for {ms} ms")));
+            }
+        }
+        open.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let open: Vec<String> = open.into_iter().map(|(_, s)| s).collect();
+        tracing::warn!(
+            frame,
+            ms = since.as_millis() as u64,
+            "no frame presented for a second; spans open for 250 ms or more: {}",
+            if open.is_empty() { "none (the stall is outside our spans: the title, or the system)".to_owned() } else { open.join("; ") }
+        );
     }
 }
