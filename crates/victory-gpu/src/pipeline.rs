@@ -136,6 +136,10 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether it can write any memory a later shader reads: [`stores`] or an image
+    /// store or atomic ([`stores_images`]). What a wait of the title's is held for
+    /// (`crate::list`'s barrier groups).
+    pub(crate) writes: bool,
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
@@ -219,6 +223,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let writes = stores || programs.iter().any(stores_images);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -237,6 +242,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        writes,
         picks: Default::default(),
         native: None,
     })
@@ -393,6 +399,20 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether a console program can store to or make atomics on an image (or its code
+/// does not decode).
+#[cfg(windows)]
+fn stores_images(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Mimg)
+            && i.name().is_none_or(|n| n.contains("store") || n.contains("atomic"))
     })
 }
 

@@ -63,6 +63,45 @@ pub(crate) struct Rec {
     /// lock).
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Whether the list may have written memory since its last wait for every
+    /// shader write ([`Rec::title_wait`]): any use of it outside a quiet span sets
+    /// it. A list starts so (an earlier one of the submission may have written).
+    dirty: AtomicBool,
+    /// A wait of the title's held: nothing that could write was recorded since the
+    /// last wait, so none is needed yet; it is made before the next thing that may.
+    waiting: AtomicBool,
+    /// A draw or dispatch whose shaders write nothing is being recorded
+    /// ([`Rec::quiet`]): its uses of the list neither write nor need the held wait.
+    quiet: AtomicBool,
+}
+
+/// `VICTORY_HOLD_WAITS` (on by default; `0` off): the title's waits for every shader
+/// write (its barrier groups, pipeline syncs) are left out where nothing since the
+/// last one could have written memory, and made only before the next thing that may
+/// (which would otherwise overtake what was read before the wait). In the open world
+/// some 800 such waits a frame each drained the card, most between draws that store
+/// nothing. Render targets, depth and copies are kept in order by their state
+/// changes, which stay.
+pub(crate) fn hold_waits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HOLD_WAITS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLD_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: the title's waits made at once, held, and made
+/// later of those held.
+pub(crate) static WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// A wait for every shader write: an unordered-access barrier naming nothing.
+fn wait_barrier() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+    }
 }
 
 impl Rec {
@@ -71,7 +110,47 @@ impl Rec {
             list,
             any: AtomicBool::new(false),
             held: Mutex::new(Held::default()),
+            dirty: AtomicBool::new(true),
+            waiting: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
         }
+    }
+
+    /// The title waits for every earlier shader write: the wait is made, or held
+    /// where nothing could have written since the last one ([`hold_waits`]).
+    ///
+    /// # Safety
+    /// An open list.
+    pub(crate) unsafe fn title_wait(&self) {
+        self.quiet.store(false, Relaxed);
+        if hold_waits() && !self.dirty.load(Relaxed) {
+            self.waiting.store(true, Relaxed);
+            WAITS[1].fetch_add(1, Relaxed);
+            return;
+        }
+        self.waiting.store(false, Relaxed);
+        // SAFETY: the caller's; it names no resource.
+        unsafe { self.barriers(&[wait_barrier()]) };
+        self.dirty.store(false, Relaxed);
+        WAITS[0].fetch_add(1, Relaxed);
+    }
+
+    /// A draw or dispatch is being recorded: quiet if `writes` is false (its uses
+    /// of the list then write nothing a shader reads and need no held wait), until
+    /// the next [`Rec::title_wait`], [`Rec::loud`] or quiet draw that writes.
+    pub(crate) fn quiet(&self, writes: bool) {
+        self.quiet.store(false, Relaxed);
+        if writes {
+            // The held wait first, and the list may write from here.
+            let _ = &**self;
+        } else {
+            self.quiet.store(true, Relaxed);
+        }
+    }
+
+    /// The end of a quiet span (a title call begins, the list closes).
+    pub(crate) fn loud(&self) {
+        self.quiet.store(false, Relaxed);
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -142,6 +221,9 @@ impl Rec {
     /// be left).
     pub(crate) fn forget(&self) {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        self.dirty.store(true, Relaxed);
+        self.waiting.store(false, Relaxed);
+        self.quiet.store(false, Relaxed);
         self.any.store(false, Relaxed);
         held.barriers.clear();
         held.alive.clear();
@@ -174,8 +256,17 @@ fn every_write(b: &D3D12_RESOURCE_BARRIER) -> bool {
 impl std::ops::Deref for Rec {
     type Target = ID3D12GraphicsCommandList;
 
-    /// The list, with what is held recorded first.
+    /// The list, with what is held recorded first: outside a quiet span the
+    /// title's held wait too, and the list may have written from here.
     fn deref(&self) -> &ID3D12GraphicsCommandList {
+        if !self.quiet.load(Relaxed) {
+            if self.waiting.swap(false, Relaxed) {
+                // SAFETY: an open list (it is being used); the barrier names nothing.
+                unsafe { self.barriers(&[wait_barrier()]) };
+                WAITS[2].fetch_add(1, Relaxed);
+            }
+            self.dirty.store(true, Relaxed);
+        }
         self.flush();
         &self.list
     }
@@ -186,5 +277,11 @@ pub(crate) fn line(frames: f64) {
     let [asked, made] = [0, 1].map(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
     if asked > 0.0 {
         tracing::info!("barrier calls per frame (VICTORY_JOIN_BARRIERS): {asked:.0} asked for, {made:.0} made of them");
+    }
+    let [now, held, later] = [0, 1, 2].map(|i| WAITS[i].swap(0, Relaxed) as f64 / frames);
+    if now + held > 0.0 {
+        tracing::info!(
+            "the title's waits for every shader write per frame (VICTORY_HOLD_WAITS): {now:.0} made, {held:.0} held, {later:.0} of them made later"
+        );
     }
 }

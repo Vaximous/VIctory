@@ -184,7 +184,13 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    let host = unsafe { (*this.cast::<List>()).host.as_ref() };
+    // A call of the title's ends any quiet span (`crate::host::rec`).
+    #[cfg(windows)]
+    if let Some(h) = host {
+        h.list.loud();
+    }
+    host
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
@@ -1609,7 +1615,6 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
     {
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
             {
                 // The shapes of the title's calls, each once.
@@ -1628,10 +1633,8 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
-            unsafe { list.list.barriers(&[barrier]) };
+            unsafe { list.list.title_wait() };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2199,12 +2202,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.barriers(&[barrier]) };
+        unsafe { list.list.title_wait() };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

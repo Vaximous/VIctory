@@ -1820,6 +1820,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // A draw or dispatch whose shaders write nothing needs no wait of the
+        // title's held before it (`crate::host::rec`): what it records is quiet.
+        list.list.quiet(p.stages.iter().any(|s| s.translated().writes));
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
