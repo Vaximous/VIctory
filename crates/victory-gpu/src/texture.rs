@@ -495,6 +495,29 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a changed texture whose memory is all mapped is copied out
+/// before it is detiled, so that title memory is held still
+/// (`crate::watch::title_memory_reading`) only for the copy
+/// (`VICTORY_TEXTURE_SHORT_HOLD`, on; =0 held through the detiling, as
+/// before).
+///
+/// A refresh held the lock through the hash and the detiling (a big
+/// texture's subresources on the threads beside). The runtime's remapping
+/// waited for the longest of those, and every refresh that came after the
+/// remapping asked waited behind it: in run ow22-move texture refreshes
+/// spent 14.5 ms a frame of their 21.5 waiting for title memory to hold
+/// still. Hashing stays in place (35.8 MB a frame, 3.1 MB of it changed):
+/// only the changed bytes are copied.
+fn short_hold() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SHORT_HOLD").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TEXTURE_SHORT_HOLD") {
+        return on;
+    }
+    on
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -1528,7 +1551,17 @@ impl Staging {
         }
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        if short_hold() {
+            // The bytes copied out while the lock is held, the lock let go,
+            // and the copy detiled: the runtime waits for the copy only.
+            with_read(size, move |read| {
+                copy_in_pieces(read.as_mut_ptr(), self.memory, size);
+                drop(_mapped);
+                self.detile(read);
+            });
+        } else {
+            self.detile(tiled);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
