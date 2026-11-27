@@ -64,9 +64,15 @@ appears, at about 9,400-9,700 draws a frame.
 | Build | ms / frame | fps | p99 | worst | per 1000 draws (frame / prep / GPU) | Notes |
 |---|---|---|---|---|---|---|
 | bench20 | 47.7 | 21.0 | 120 ms | 654 ms | 4.99 / 4.07 / 4.35 | outdoor baseline |
-| **bench21** | **45.7** | **21.9** | **75 ms** | **216 ms** | **4.71 / 3.77 / 4.40** | front spans of a copy joined; sends streamed into upload memory |
+| bench21 | 45.7 | 21.9 | 75 ms | 216 ms | 4.71 / 3.77 / 4.40 | front spans of a copy joined; sends streamed into upload memory |
+| **bench22** | | | | 144 ms | not slower (see below) | merges into title memory by whole qwords (crash fix); more helper threads, kept awake |
 
 (ms, fps, p99 and worst over world frames 1000-3000; per-draw figures over the window.)
+
+bench22's run left the route and stayed indoors (about 2,850 draws a frame,
+37.0 ms, 27.0 fps), so it has no same-scene figures. Fitted against bench21 at
+the same draw counts it was within noise: frame -3.3 ms, preparing +0.5, GPU
++0.4. It is the base because it closes a crash path.
 
 ### Where a frame goes (bench19, moving)
 
@@ -128,6 +134,12 @@ What was learned along the way:
 - **Making memory resident one object at a time blocks.** Thousands of blocking
   residency calls at world entry cost over 2 s; creating memory resident lets the
   system page it in without holding the thread (in testing).
+- **Merge pointers whole.** Card results landing in title memory were merged a
+  dword at a time where the title had not written since. When the title rewrote
+  a pointer while a landing was merging it, one half of the pointer could come
+  from each side, and the title later crashed walking its heap lists. Merging
+  each aligned qword with one compare-exchange stops torn pointers; it costs about
+  2.5 times as much per merge, but on the copy-back threads, not the submitting one.
 - **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
   between the title's first list call and its first submission are not waits on
   us: its submitting thread waits on no fence, event or label at all.
@@ -197,6 +209,8 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_BAKE_SLICE_MS` | The decal bake's texture pass runs in time slices with a catch-up of the slots written lately. |
 | `VICTORY_JOIN_SPANS` | Front spans of one copy that touch or overlap are joined before they are looked at, so fewer looks and refresh items. |
 | `VICTORY_STREAM_SENDS` | Bytes sent up at a submission are written into upload memory with streaming stores. |
+| `VICTORY_MERGE_QWORDS` | Landed card results are merged into title memory by whole aligned qwords, each with one compare-exchange, so a pointer is never half old and half new. |
+| `VICTORY_WIDE_SPIN=100` | Helper threads stay awake 100 us after a job before sleeping; a third of the machine's threads (up to 8) take shared work, and 6 to 8 refresh title bytes under in-flight writes. |
 
 The grey placeholder is kept on purpose: it shows what hasn't streamed in yet.
 
