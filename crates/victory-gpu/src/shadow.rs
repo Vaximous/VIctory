@@ -541,10 +541,21 @@ fn copy_made(at: [std::time::Duration; 4], again: bool) {
 /// is where the place ends ([`Shadow::width`]); the barriers of our own
 /// lists are one per big buffer (one state for all of it); and whether
 /// anything still shows it is the count of its [`Held`]s
-/// ([`Shadow::held_elsewhere`]), not the buffer's references.
+/// ([`Shadow::held_elsewhere`]), not the buffer's references. The
+/// card's sides only with `VICTORY_SUBALLOC_CARD=1` ([`suballoc_card`]).
 /// `VICTORY_SUBALLOC_COPIES=0`: buffers of their own, as before.
 fn suballoc_on() -> bool {
     crate::toggled!("VICTORY_SUBALLOC_COPIES")
+}
+
+/// Whether the card's sides are places too (`VICTORY_SUBALLOC_CARD=1`;
+/// off by default, the CPU's sides only). Off since run ow63-gpu: the
+/// title crashed on its heap's block footers (image+0x4e9b578, read of 0)
+/// after card places had gone to second copies, and no offset of ours
+/// was found wrong.
+fn suballoc_card() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBALLOC_CARD").is_some_and(|v| v == "1"))
 }
 
 /// The bytes of a place: a small copy's size, rounded.
@@ -554,8 +565,9 @@ const SLOT: u64 = 1 << 16;
 const SLOT_BLOCK: u64 = 64 << 20;
 
 /// Fewer free places than this: the next buffer is made on a thread of
-/// its own, ahead of the copies that will want it.
-const SLOTS_LOW: usize = 256;
+/// its own, ahead of the copies that will want it (an area's first sight
+/// takes some 3,400 in a second or two).
+const SLOTS_LOW: usize = 1024;
 
 /// The buffers places are cut from ([`take_slot`]), with where each is
 /// mapped (0 on the card), and the free places: by buffer and number,
@@ -612,15 +624,16 @@ fn add_slot_block(card: bool) -> bool {
     true
 }
 
-/// The buffers of places made before any copy wants one: two on each
-/// side, on a thread of their own once the host is there.
+/// The buffers of places made before any copy wants one: four on each
+/// side (an area's first sight takes some 3,400 places), on a thread of
+/// their own once the host is there.
 pub(crate) fn premake_slots() {
     if !suballoc_on() {
         return;
     }
     let _ = std::thread::Builder::new().name("victory-slots".into()).spawn(|| {
-        for card in [false, false, true, true] {
-            if card && !(cards() && host().is_some_and(|h| h.card_ready())) {
+        for card in [false, false, false, false, true, true, true, true] {
+            if card && !(suballoc_card() && cards() && host().is_some_and(|h| h.card_ready())) {
                 continue;
             }
             add_slot_block(card);
@@ -646,8 +659,19 @@ fn take_slot(card: bool) -> Option<(ID3D12Resource, *mut u8, u64, u32, u32, bool
             let (buffer, data) = slots.blocks[block as usize].clone();
             break (buffer, data, block, i, again);
         }
+        // Another thread making one: wait for it, not make more.
+        let making = slots.making;
+        if !making {
+            slots.making = true;
+        }
         drop(slots);
-        if !add_slot_block(card) {
+        if making {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            continue;
+        }
+        let made = add_slot_block(card);
+        SLOTS[side].lock().unwrap_or_else(|e| e.into_inner()).making = false;
+        if !made {
             return None;
         }
     };
@@ -769,7 +793,7 @@ fn cpu_slot(size: u64) -> Option<(ID3D12Resource, *mut u8, u64, CpuSlot)> {
 /// another copy had it before (its bytes are that copy's then).
 fn card_slot(size: u64) -> Option<(ID3D12Resource, u64, Arc<CardSlot>, bool)> {
     use windows::core::Interface;
-    if !suballoc_on() || size > SLOT {
+    if !suballoc_on() || !suballoc_card() || size > SLOT {
         return None;
     }
     let (buffer, _, at, block, i, again) = take_slot(true)?;
@@ -4301,6 +4325,29 @@ impl Shadow {
     /// Where the copy begins in `buffer` ([`Shadow::at`]): what an offset
     /// in the copy (from `start`) adds to be one in the buffer.
     pub(crate) fn base(&self) -> u64 {
+        self.at
+    }
+
+    /// [`Shadow::base`] for bytes `[lo, hi)` of the copy read back from
+    /// its card side: checked to lie in the copy's own place (debug
+    /// builds stop; others say so, the first times).
+    pub(crate) fn fetch_base(&self, lo: u64, hi: u64) -> u64 {
+        let size = self.card.as_ref().map_or(self.len, |c| c.size);
+        let inside = lo <= hi && hi <= size;
+        debug_assert!(inside, "a fetch of {lo:#x}..{hi:#x} outside its copy's {size:#x} bytes");
+        if !inside {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    lo,
+                    hi,
+                    size,
+                    at = self.at,
+                    "a read-back of a copy's card side reaches outside the copy's place"
+                );
+            }
+        }
         self.at
     }
 

@@ -5207,7 +5207,7 @@ impl Host {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, shadow.base() + *lo as u64, (*hi - *lo) as u64);
+                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, shadow.fetch_base(*lo as u64, *hi as u64) + *lo as u64, (*hi - *lo) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -5525,7 +5525,7 @@ impl Host {
                     list.Reset(allocator, None)?;
                     for &(i, lo, hi, at) in &pieces {
                         let shadow = &plan.ranges[i].shadow;
-                        list.CopyBufferRegion(fetched, at, &shadow.buffer, shadow.base() + lo as u64, (hi - lo) as u64);
+                        list.CopyBufferRegion(fetched, at, &shadow.buffer, shadow.fetch_base(lo as u64, hi as u64) + lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -10196,7 +10196,7 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
-                list.CopyBufferRegion(&buffer, 0, &shadow.buffer, shadow.base(), len);
+                list.CopyBufferRegion(&buffer, 0, &shadow.buffer, shadow.fetch_base(0, len), len);
                 list.Close()?;
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 self.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
