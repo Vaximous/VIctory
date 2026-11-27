@@ -11449,6 +11449,11 @@ mod refresh_tests {
         if std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v != "0") {
             assert_eq!(again, []);
             assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 132), (2 * PAGE + 136, 2 * PAGE + 144)]);
+        } else if std::env::var_os("VICTORY_SEND_PARTS").is_none_or(|v| v != "0") {
+            // The landing's page holds on the CPU's side what title memory
+            // holds; of the page written, the 4 KiB part that differs.
+            assert_eq!(again, []);
+            assert_eq!(written, [(2 * PAGE, 2 * PAGE + 4096)]);
         } else {
             assert_eq!(again, [(PAGE, 2 * PAGE)]);
             assert_eq!(written, [(2 * PAGE, 3 * PAGE)]);
