@@ -14,6 +14,14 @@
 //! `WaitForMultipleObjects(Ex)` and `WaitOnAddress` are bound to wrappers that
 //! time a wait only when its object is one of those. A line a second:
 //! [`line`].
+//!
+//! Every wait of the title's through those, `Sleep(Ex)` and
+//! `SleepConditionVariable{SRW,CS}` is also timed whatever it is on
+//! (`VICTORY_WAIT_KINDS`, on unless `=0`): a second line a second gives the
+//! time blocked a frame by kind of object (the kernel's type name of a
+//! handle, an address, a condition variable, a sleep) and by whether our GPU
+//! path sets it (a fence's event or value, a label), and the thread blocked
+//! the most. A wait shorter than [`BRIEF_US`] is counted as brief, unasked.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -257,10 +265,146 @@ pub(crate) fn timed<T>(object: Option<Object>, call: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Whether every wait of the title's is timed by kind.
+pub fn kinds_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_KINDS").is_none_or(|v| v != "0"))
+}
+
+/// A wait shorter than this (microseconds) did not block to speak of: its
+/// object is not asked for.
+pub const BRIEF_US: u64 = 50;
+
+/// What a wait was on, for [`kinds_on`]'s line.
+enum Kind {
+    /// Handles: the first one.
+    Handle(usize),
+    /// An address (`WaitOnAddress`).
+    Address,
+    /// A condition variable: of a slim lock (true) or a critical section.
+    Condition(bool),
+    /// `Sleep(Ex)`.
+    Sleep,
+}
+
+/// The kernel's type name of `handle` ("Event", "Semaphore", "Thread", ...).
+fn type_name(handle: usize) -> String {
+    type Query = unsafe extern "system" fn(usize, u32, *mut c_void, u32, *mut u32) -> i32;
+    static QUERY: OnceLock<usize> = OnceLock::new();
+    let at = *QUERY.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: a module every process has; NUL-terminated names.
+        unsafe { GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"NtQueryObject".as_ptr().cast()) }
+            .map_or(0, |f| f as usize)
+    });
+    if at == 0 {
+        return "handle".into();
+    }
+    // SAFETY: the address of NtQueryObject.
+    let query: Query = unsafe { std::mem::transmute::<usize, Query>(at) };
+    // PUBLIC_OBJECT_TYPE_INFORMATION: a UNICODE_STRING (length, maximum, buffer)
+    // and the name after it.
+    let mut buf = [0u64; 64];
+    let mut len = 0u32;
+    // SAFETY: ObjectTypeInformation (2) into a buffer of ours of that size.
+    let status = unsafe { query(handle, 2, buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf) as u32, &mut len) };
+    if status < 0 {
+        return "closed".into();
+    }
+    let bytes = (buf[0] & 0xFFFF) as usize;
+    let name = buf[1] as *const u16;
+    let start = buf.as_ptr() as usize;
+    let end = start + std::mem::size_of_val(&buf);
+    if name.is_null() || (name as usize) < start || name as usize + bytes > end {
+        return "handle".into();
+    }
+    // SAFETY: inside our buffer, checked above.
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, bytes / 2) })
+}
+
+/// Since the last line: (kind, set by our GPU path) to microseconds and
+/// waits; and microseconds by thread.
+type Blocked = (HashMap<(String, bool), (u64, u64)>, HashMap<u32, u64>);
+static BLOCKED: Mutex<Option<Blocked>> = Mutex::new(None);
+
+/// Runs `call`, a wait of the title's on `kind`, timed by kind (with
+/// [`kinds_on`]) and, if it is on `ours`, by object ([`timed`]).
+fn blocked<T>(kind: Kind, ours: Option<Object>, call: impl FnOnce() -> T) -> T {
+    if !kinds_on() {
+        return timed(ours, call);
+    }
+    let since = Instant::now();
+    let result = timed(ours, call);
+    let us = since.elapsed().as_micros() as u64;
+    // SAFETY: plain queries of this thread's own.
+    unsafe {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        let error = GetLastError();
+        inside(|| {
+            let name = if us < BRIEF_US {
+                "brief".to_string()
+            } else {
+                match kind {
+                    Kind::Handle(h) => type_name(h),
+                    Kind::Address => "address".into(),
+                    Kind::Condition(true) => "condition (slim lock)".into(),
+                    Kind::Condition(false) => "condition (critical section)".into(),
+                    Kind::Sleep => "sleep".into(),
+                }
+            };
+            let thread = GetCurrentThreadId();
+            let mut all = BLOCKED.lock().unwrap_or_else(|e| e.into_inner());
+            let (kinds, threads) = all.get_or_insert_with(Default::default);
+            let e = kinds.entry((name, ours.is_some())).or_default();
+            *e = (e.0 + us, e.1 + 1);
+            *threads.entry(thread).or_default() += us;
+        });
+        SetLastError(error);
+    }
+    result
+}
+
+/// The second line of a second (see [`kinds_on`]): `frames` the frames in it.
+fn kinds_line(frames: f64) {
+    let Some((kinds, threads)) = BLOCKED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    let total: u64 = kinds.iter().filter(|(k, _)| k.0 != "brief").map(|(_, v)| v.0).sum();
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_unstable_by_key(|k| std::cmp::Reverse(k.1.0));
+    let kinds: Vec<String> = kinds
+        .iter()
+        .take(8)
+        .map(|((name, ours), (us, n))| {
+            format!("{name}{} {:.2} ms in {:.1}", if *ours { " (ours)" } else { "" }, ms(*us), *n as f64 / frames)
+        })
+        .collect();
+    let mut threads: Vec<_> = threads.into_iter().collect();
+    threads.sort_unstable_by_key(|t| std::cmp::Reverse(t.1));
+    let threads: Vec<String> = threads.iter().take(3).map(|(t, us)| format!("{t} {:.1} ms", ms(*us))).collect();
+    tracing::info!(
+        "title blocked {:.1} ms a frame over its threads in waits (VICTORY_WAIT_KINDS): {}; threads blocked most: {}",
+        ms(total),
+        kinds.join(", "),
+        threads.join(", "),
+    );
+}
+
 /// The real functions, by the wrappers' order.
-static REAL: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
-const NAMES: [&str; 5] =
-    ["WaitForSingleObject", "WaitForSingleObjectEx", "WaitForMultipleObjects", "WaitForMultipleObjectsEx", "WaitOnAddress"];
+static REAL: [AtomicUsize; 9] = [const { AtomicUsize::new(0) }; 9];
+const NAMES: [&str; 9] = [
+    "WaitForSingleObject",
+    "WaitForSingleObjectEx",
+    "WaitForMultipleObjects",
+    "WaitForMultipleObjectsEx",
+    "WaitOnAddress",
+    "Sleep",
+    "SleepEx",
+    "SleepConditionVariableSRW",
+    "SleepConditionVariableCS",
+];
 
 fn real<F: Copy>(i: usize) -> F {
     let at = REAL[i].load(Relaxed);
@@ -272,13 +416,13 @@ fn real<F: Copy>(i: usize) -> F {
 unsafe extern "system" fn wait_one(object: Handle, ms: u32) -> u32 {
     let real: unsafe extern "system" fn(Handle, u32) -> u32 = real(0);
     // SAFETY: the title's own call.
-    timed(event_object(&[object as usize]), || unsafe { real(object, ms) })
+    blocked(Kind::Handle(object as usize), event_object(&[object as usize]), || unsafe { real(object, ms) })
 }
 
 unsafe extern "system" fn wait_one_ex(object: Handle, ms: u32, alertable: i32) -> u32 {
     let real: unsafe extern "system" fn(Handle, u32, i32) -> u32 = real(1);
     // SAFETY: the title's own call.
-    timed(event_object(&[object as usize]), || unsafe { real(object, ms, alertable) })
+    blocked(Kind::Handle(object as usize), event_object(&[object as usize]), || unsafe { real(object, ms, alertable) })
 }
 
 /// The handles of a `WaitForMultipleObjects` call.
@@ -293,19 +437,54 @@ pub(crate) fn handles(count: u32, objects: *const Handle) -> Vec<usize> {
 unsafe extern "system" fn wait_many(count: u32, objects: *const Handle, all: i32, ms: u32) -> u32 {
     let real: unsafe extern "system" fn(u32, *const Handle, i32, u32) -> u32 = real(2);
     // SAFETY: the title's own call.
-    timed(event_object(&handles(count, objects)), || unsafe { real(count, objects, all, ms) })
+    blocked(Kind::Handle(first(count, objects)), event_object(&handles(count, objects)), || unsafe { real(count, objects, all, ms) })
 }
 
 unsafe extern "system" fn wait_many_ex(count: u32, objects: *const Handle, all: i32, ms: u32, alertable: i32) -> u32 {
     let real: unsafe extern "system" fn(u32, *const Handle, i32, u32, i32) -> u32 = real(3);
     // SAFETY: the title's own call.
-    timed(event_object(&handles(count, objects)), || unsafe { real(count, objects, all, ms, alertable) })
+    blocked(Kind::Handle(first(count, objects)), event_object(&handles(count, objects)), || unsafe {
+        real(count, objects, all, ms, alertable)
+    })
 }
 
 unsafe extern "system" fn wait_on_address(at: Handle, compare: Handle, size: usize, ms: u32) -> i32 {
     let real: unsafe extern "system" fn(Handle, Handle, usize, u32) -> i32 = real(4);
     // SAFETY: the title's own call.
-    timed(address_object(at as usize), || unsafe { real(at, compare, size, ms) })
+    blocked(Kind::Address, address_object(at as usize), || unsafe { real(at, compare, size, ms) })
+}
+
+/// The first of the handles of a `WaitForMultipleObjects` call.
+fn first(count: u32, objects: *const Handle) -> usize {
+    if objects.is_null() || count == 0 {
+        return 0;
+    }
+    // SAFETY: the caller passes `count` handles.
+    (unsafe { *objects }) as usize
+}
+
+unsafe extern "system" fn sleep(ms: u32) {
+    let real: unsafe extern "system" fn(u32) = real(5);
+    // SAFETY: the title's own call.
+    blocked(Kind::Sleep, None, || unsafe { real(ms) })
+}
+
+unsafe extern "system" fn sleep_ex(ms: u32, alertable: i32) -> u32 {
+    let real: unsafe extern "system" fn(u32, i32) -> u32 = real(6);
+    // SAFETY: the title's own call.
+    blocked(Kind::Sleep, None, || unsafe { real(ms, alertable) })
+}
+
+unsafe extern "system" fn sleep_srw(cv: Handle, lock: Handle, ms: u32, flags: u32) -> i32 {
+    let real: unsafe extern "system" fn(Handle, Handle, u32, u32) -> i32 = real(7);
+    // SAFETY: the title's own call.
+    blocked(Kind::Condition(true), None, || unsafe { real(cv, lock, ms, flags) })
+}
+
+unsafe extern "system" fn sleep_cs(cv: Handle, section: Handle, ms: u32) -> i32 {
+    let real: unsafe extern "system" fn(Handle, Handle, u32) -> i32 = real(8);
+    // SAFETY: the title's own call.
+    blocked(Kind::Condition(false), None, || unsafe { real(cv, section, ms) })
 }
 
 /// What the title's import `name`, found at `address`, is bound to: the
@@ -317,6 +496,9 @@ pub fn import(name: &str, address: usize) -> usize {
     let Some(i) = NAMES.iter().position(|n| *n == name) else {
         return address;
     };
+    if i >= 5 && !kinds_on() {
+        return address;
+    }
     if REAL[i].load(Relaxed) == 0 {
         REAL[i].store(address, Relaxed);
     }
@@ -333,7 +515,11 @@ pub fn import(name: &str, address: usize) -> usize {
         1 => wait_one_ex as *const () as usize,
         2 => wait_many as *const () as usize,
         3 => wait_many_ex as *const () as usize,
-        _ => wait_on_address as *const () as usize,
+        4 => wait_on_address as *const () as usize,
+        5 => sleep as *const () as usize,
+        6 => sleep_ex as *const () as usize,
+        7 => sleep_srw as *const () as usize,
+        _ => sleep_cs as *const () as usize,
     }
 }
 
@@ -345,6 +531,9 @@ pub(crate) fn line(frames: f64) {
     let s: Vec<u64> = STATS.iter().map(|s| s.swap(0, Relaxed)).collect();
     let (by, longest) = BY.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let f = frames.max(1.0);
+    if kinds_on() {
+        kinds_line(f);
+    }
     let ms = |us: u64| us as f64 / 1e3;
     let mut top: Vec<(Object, (u64, u64))> = by.into_iter().collect();
     top.sort_unstable_by_key(|t| std::cmp::Reverse(t.1.1));
