@@ -292,15 +292,16 @@ fn frame_ms(frame: u64, now: u64) -> u64 {
 }
 
 /// The milliseconds a frame's texture passes may take on the recording
-/// thread in the world, once it is loaded (`VICTORY_TEXTURE_WORLD_MS`, 3;
-/// 0: the passes' own budgets, 250 ms and more, as before): what does not
-/// fit waits for the next frame. Bakes keep theirs.
+/// thread in the world, once it is loaded (`VICTORY_TEXTURE_WORLD_MS`;
+/// unset or 0: the passes' own budgets): what does not fit waits for the
+/// next frame. Bakes keep theirs. (Off: at 3 ms, run ow14-move left 30,000
+/// slots due, and the bakes, which take all that is due, ran 0.3-2 s.)
 fn world_ms() -> Option<u64> {
     static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_WORLD_MS")
             .ok()
-            .map_or(Some(3), |v| v.trim().parse::<u64>().ok())
+            .map_or(None, |v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
     })
 }

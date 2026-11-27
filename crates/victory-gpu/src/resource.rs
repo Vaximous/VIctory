@@ -1805,7 +1805,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                     let side = crate::tiles::coarse_side();
                     // (Whole for a bake too: it samples its sources once, at
                     // their finest, and keeps what it made.)
-                    let whole = side == 0 || crate::texture::BAKING.get() || (crate::draw::loading() && room_lately());
+                    let whole = side == 0 || (crate::texture::BAKING.get() && bake_whole()) || (crate::draw::loading() && room_lately());
                     let mut first = 0;
                     while !whole && (r.desc.width >> first).max(u64::from(r.desc.height) >> first) > side {
                         first += 1;
@@ -2890,6 +2890,14 @@ fn host_texture(
     clear: *const c_void,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     host_texture_as(desc, state, clear, false)
+}
+
+/// Whether textures made during a decoration bake are made whole, not
+/// coarse first (`VICTORY_BAKE_WHOLE=1`; off: in run ow14 it did not change
+/// the white face, and made the bakes' passes longer).
+fn bake_whole() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_WHOLE").is_some_and(|v| v != "0"))
 }
 
 /// [`host_texture`]; `reserved`: without memory of its own, to be given
