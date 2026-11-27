@@ -70,14 +70,16 @@ const MOST_ELEMENTS: u64 = 1 << 27;
 
 /// The raw view (`R32_TYPELESS`, first element and count, in dwords) of the
 /// constant buffer of `size` bytes at byte `offset` of a host buffer of
-/// `width` bytes; `None` if there is none: not on 4 bytes (the console puts
-/// them on 16), outside the buffer, or less than a dword.
+/// `width` bytes; `None` if there is none: not on 16 bytes (a raw view
+/// must start on 16: one on 4 removed the device in run ow15-warm, the
+/// debug layer naming `FirstElement` 1), outside the buffer, or less than a
+/// dword.
 ///
 /// It covers the title's `size` bytes and no more (a read past them gives 0,
 /// as on the console), and never more than the buffer holds past `offset`
 /// (a view past a resource's end is refused, or worse).
 pub(crate) fn raw_window(offset: u64, width: u64, size: u32) -> Option<(u64, u32)> {
-    if !offset.is_multiple_of(4) || offset >= width {
+    if !offset.is_multiple_of(16) || offset >= width {
         return None;
     }
     let bytes = u64::from(size).min(width - offset) & !3;
@@ -113,9 +115,10 @@ mod tests {
         // Whole dwords only.
         assert_eq!(raw_window(0, 0x1_0000, 18), Some((0, 4)));
         assert_eq!(raw_window(0, 0x1_0000, 3), None);
-        assert_eq!(raw_window(0xfffe, 0x1_0000, 16), None);
-        // Not on 4 bytes, or outside.
+        assert_eq!(raw_window(0xfff0, 0x1_0000, 3), None);
+        // Not on 16 bytes, or outside.
         assert_eq!(raw_window(0x1002, 0x10_0000, 16), None);
+        assert_eq!(raw_window(0x1004, 0x10_0000, 16), None);
         assert_eq!(raw_window(0x1_0000, 0x1_0000, 16), None);
         // A size the title's heap holds in slots it does not use.
         assert_eq!(raw_window(0, u64::MAX, u32::MAX), Some((0, 1 << 27)));
