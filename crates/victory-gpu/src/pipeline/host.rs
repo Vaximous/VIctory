@@ -150,6 +150,85 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// The formats of what a draw draws into, as the host has them
+/// (`VICTORY_TARGET_VARIANTS`): the eight render targets (0 where there is
+/// none), then depth (0 for none).
+pub(crate) type TargetFormats = [u32; 9];
+
+/// Whether a draw into views of the formats `bound` cannot go to the host
+/// with a pipeline that declares `declared`: a render target slot for which
+/// the pipeline declares a format has a view of another format bound. On
+/// the console the view's format rules (a full-screen zoom and blur
+/// declaring R10G10B10A2_UNORM drawn into R11G11B10_FLOAT); on the host
+/// such a draw is an invalid call, undefined without the debug layer. Empty
+/// slots, views in undeclared slots and depth do not count.
+pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
+    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
+}
+
+/// The formats a pipeline for a draw into `bound` declares: the title's,
+/// but the declared render target slots with a view bound take its format.
+pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
+    let mut formats = *declared;
+    for i in 0..8 {
+        if declared[i] != 0 && bound[i] != 0 {
+            formats[i] = bound[i];
+        }
+    }
+    formats
+}
+
+impl GraphicsState {
+    /// The formats the state declares ([`TargetFormats`]).
+    pub(crate) fn formats(&self) -> TargetFormats {
+        let mut formats = [0; 9];
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
+            *to = from.0 as u32;
+        }
+        formats[8] = self.depth_format.0 as u32;
+        formats
+    }
+
+    /// The same state for a draw into views of the formats `bound` (from
+    /// [`formats_for`]): those render target formats, everything else the
+    /// title's (blending on integer targets goes off when the host pipeline
+    /// is made, [`host_blend`]). Its description differs, so it has a name
+    /// of its own in the library. The input elements are made anew: theirs
+    /// point into the names, which are copied.
+    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        let mut targets = self.targets;
+        let n = (targets.NumRenderTargets as usize).min(8);
+        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
+            *to = DXGI_FORMAT(from as i32);
+        }
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+}
+
 impl GraphicsState {
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
@@ -1233,6 +1312,33 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    /// A pipeline is made again only for a declared slot with a view of
+    /// another format, and takes the bound formats in those slots alone.
+    #[test]
+    fn target_variants_follow_declared_slots() {
+        let (a, b, c) = (
+            DXGI_FORMAT_R10G10B10A2_UNORM.0 as u32,
+            DXGI_FORMAT_R11G11B10_FLOAT.0 as u32,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+        );
+        let d = DXGI_FORMAT_D32_FLOAT.0 as u32;
+        let declared: TargetFormats = [a, c, 0, 0, 0, 0, 0, 0, d];
+        // The same, an empty slot, an undeclared slot, another depth.
+        assert!(!formats_differ(&declared, &declared));
+        assert!(!formats_differ(&declared, &[a, 0, 0, 0, 0, 0, 0, 0, d]));
+        assert!(!formats_differ(&declared, &[a, c, b, 0, 0, 0, 0, 0, 0]));
+        let bound: TargetFormats = [b, c, a, 0, 0, 0, 0, 0, 0];
+        assert!(formats_differ(&declared, &bound));
+        assert_eq!(formats_for(&declared, &bound), [b, c, 0, 0, 0, 0, 0, 0, d]);
+        let mut g = GraphicsState::default();
+        g.targets = targets(&[DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM]);
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        assert_eq!(g.formats(), declared);
+        let v = g.with_formats(&formats_for(&declared, &bound));
+        assert_eq!(v.formats(), [b, c, 0, 0, 0, 0, 0, 0, d]);
+        assert_ne!(v.describe(), g.describe());
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
