@@ -94,6 +94,25 @@ pub(crate) fn hold_waits() -> bool {
 /// later of those held.
 pub(crate) static WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// `VICTORY_CLAMP_WAITS` (on by default; `0` off): the argument clamps
+/// (`crate::indirect`) wait for every earlier shader write only where the list
+/// may have written since its last such wait ([`Rec::clamp_wait`]), and make no
+/// second wait after their pass: the records they write are ordered before their
+/// executions by the scratch buffer's move to indirect arguments, and the budget
+/// is only ever touched by atomics. Off, each clamp made both waits, some 190
+/// pairs a frame in the open world, each a drain of the card.
+pub(crate) fn clamp_waits() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CLAMP_WAITS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: the clamps' first waits made, and left out.
+pub(crate) static CLAMP_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// A wait for every shader write: an unordered-access barrier naming nothing.
 fn wait_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
@@ -154,6 +173,21 @@ impl Rec {
             WAITS[2].fetch_add(1, Relaxed);
         }
         self.dirty.store(true, Relaxed);
+    }
+
+    /// An argument clamp is about to read what earlier shaders may have written:
+    /// whether it must wait for every shader write first. With [`clamp_waits`]
+    /// only where the list may have written since its last wait; the caller then
+    /// records that wait, which also stands for a held one of the title's.
+    pub(crate) fn clamp_wait(&self) -> bool {
+        if clamp_waits() && !self.dirty.load(Relaxed) {
+            CLAMP_WAITS[1].fetch_add(1, Relaxed);
+            return false;
+        }
+        self.dirty.store(false, Relaxed);
+        self.waiting.store(false, Relaxed);
+        CLAMP_WAITS[0].fetch_add(1, Relaxed);
+        true
     }
 
     /// The end of a quiet span (a title call begins), or with `closing` the end
@@ -289,5 +323,9 @@ pub(crate) fn line(frames: f64) {
         tracing::info!(
             "the title's waits for every shader write per frame (VICTORY_HOLD_WAITS): {now:.0} made, {held:.0} held, {later:.0} of them made later"
         );
+    }
+    let [made, left] = [0, 1].map(|i| CLAMP_WAITS[i].swap(0, Relaxed) as f64 / frames);
+    if made + left > 0.0 {
+        tracing::info!("argument clamps' waits per frame (VICTORY_CLAMP_WAITS): {made:.0} made, {left:.0} left out");
     }
 }
