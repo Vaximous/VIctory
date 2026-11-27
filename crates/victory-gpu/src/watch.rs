@@ -1917,6 +1917,7 @@ fn open_claimed(g: &Guards, block: usize, fault: bool, part: Option<usize>) -> u
             && guard_parts()
             && g.protected.contains(block)
             && !g.aliased.contains(block)
+            && !(parts_wide() && g.opened_lately(block))
             && let Some(opened) = open_part(g, block, wrote)
         {
             return opened;
@@ -1955,6 +1956,18 @@ fn open_claimed(g: &Guards, block: usize, fault: bool, part: Option<usize>) -> u
 /// opened whole, as before; a block with other views is opened whole.
 fn guard_parts() -> bool {
     crate::toggled!("VICTORY_GUARD_PARTS") && port_guard()
+}
+
+/// Whether a block opened whole in the last [`HOT_AGAIN`] (too many of its
+/// parts written, or other views) by a fault is opened whole again at its
+/// first fault, not a part at a time (`VICTORY_PARTS_WIDE`, on unless `=0`).
+/// In run ow34-move 127 blocks a frame were opened whole after their fifth
+/// part, 4 faults each spent for nothing: 953 faults a frame against 253,
+/// the faults' shared holds of the guards' lock 18.5 ms a frame against 7.3,
+/// and the refreshes' guarding waited for their claims (16.7 ms of askings
+/// against 9.3).
+fn parts_wide() -> bool {
+    crate::toggled!("VICTORY_PARTS_WIDE")
 }
 
 /// Parts of a block [`open_part`] opens alone before the block is opened
@@ -2425,6 +2438,11 @@ impl Guards {
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
         !rest.is_zero()
             && self.opened.lock().unwrap_or_else(|e| e.into_inner()).get(&block).is_some_and(|&(at, heat)| at.elapsed() < rest * (1 << heat))
+    }
+
+    /// Whether `block` was opened whole in the last [`HOT_AGAIN`].
+    fn opened_lately(&self, block: usize) -> bool {
+        self.opened.lock().unwrap_or_else(|e| e.into_inner()).get(&block).is_some_and(|&(at, _)| at.elapsed() < HOT_AGAIN)
     }
 
     /// A write fault opened `block`. A block opened again soon after its
