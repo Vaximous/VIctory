@@ -1189,7 +1189,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(&[views_touched(&physical, base, n * PAGE)]);
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1273,7 +1273,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_in(&[views_touched(&physical, to, len)]);
     unmap(&mut physical, to, len);
     if from == 0 {
         return true;
@@ -1492,7 +1492,8 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let touches: Vec<(usize, usize)> = ops.iter().map(|op| views_touched(&physical, op.at, PAGE)).collect();
+        let _changing = victory_gpu::title_memory_remapping_in(&touches);
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1530,7 +1531,8 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let touches: Vec<(usize, usize)> = ops.iter().map(|op| views_touched(&physical, op.at, PAGE)).collect();
+        let _changing = victory_gpu::title_memory_remapping_in(&touches);
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1985,6 +1987,25 @@ fn commit_limit_message(
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
+/// What a change of `[base, base + len)` touches, as (address, bytes): its
+/// own pages, and every page of a view it unmaps (one it cuts is unmapped
+/// whole and what stays mapped again, [`unmap`]). Reads of title memory
+/// elsewhere need not wait for it (`victory_gpu::title_memory_remapping_in`).
+fn views_touched(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len.max(1));
+    let (mut from, mut to) = (base, end);
+    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
+        && at + size > base
+    {
+        from = at;
+        to = to.max(at + size);
+    }
+    if let Some((&at, &(size, _))) = physical.views.range(base..end).next_back() {
+        to = to.max(at + size);
+    }
+    (from, to - from)
+}
+
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views

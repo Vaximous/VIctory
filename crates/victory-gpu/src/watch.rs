@@ -3462,9 +3462,51 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Beside [`MAPPING`], for reads of a known range ([`title_memory_reading_in`]):
+/// a lock per 64 MiB of address space (hashed onto [`MAP_SHARDS`] of them),
+/// held shared by such a read for the regions it reads, and alone by the
+/// runtime for the regions its change touches (all of them when it does not
+/// say). A change always takes [`MAPPING`] alone too, and the changes are
+/// one after the other as before; only a read of a range waits for no change
+/// elsewhere.
+///
+/// Run ow23-move: texture refreshes waited 44-45 ms a frame (all threads,
+/// of 53) for title memory to hold still, while the runtime mapped pages of
+/// its pool one by one, nearly always somewhere else.
+static MAP_LOCKS: [std::sync::RwLock<()>; MAP_SHARDS] = [const { std::sync::RwLock::new(()) }; MAP_SHARDS];
+const MAP_SHARDS: usize = 256;
+const MAP_SHIFT: u32 = 26;
+
+/// The locks of [`MAP_LOCKS`] that `ranges` (address, bytes) lie in, in
+/// order.
+fn map_shards_of(ranges: &[(usize, usize)]) -> Vec<usize> {
+    let mut all = Vec::new();
+    for &(at, len) in ranges.iter().filter(|r| r.1 != 0) {
+        let (first, last) = (at >> MAP_SHIFT, (at.saturating_add(len) - 1) >> MAP_SHIFT);
+        if last - first + 1 >= MAP_SHARDS {
+            return (0..MAP_SHARDS).collect();
+        }
+        all.extend((first..=last).map(|r| r % MAP_SHARDS));
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// Whether reads of a known range take only the locks of the regions they
+/// read ([`MAP_LOCKS`]; `VICTORY_RANGED_MAPPING`, on unless `=0`: they
+/// take [`MAPPING`] and wait for every change, as before).
+fn ranged_mapping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGED_MAPPING").is_none_or(|v| v != "0"))
+}
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    #[allow(dead_code)] Vec<std::sync::RwLockWriteGuard<'static, ()>>,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -3611,6 +3653,13 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_in(&[(0, usize::MAX)])
+}
+
+/// [`title_memory_remapping`] of a change that touches only `ranges`
+/// (address, bytes): every page a view it unmaps showed, also what it maps
+/// again. Reads of other ranges ([`title_memory_reading_in`]) go on.
+pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3622,20 +3671,54 @@ pub fn title_memory_remapping() -> Remapping {
         }
     }
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let shards = map_shards_of(ranges).into_iter().map(|i| MAP_LOCKS[i].write().unwrap_or_else(|e| e.into_inner())).collect();
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, shards)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] ReadHeld);
+
+enum ReadHeld {
+    All(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Some(#[allow(dead_code)] Vec<std::sync::RwLockReadGuard<'static, ()>>),
+}
+
+/// [`title_memory_reading`] for a read of `[at, at + len)` only: no change
+/// that touches it begins until what it returns is dropped; changes
+/// elsewhere are not waited for (`VICTORY_RANGED_MAPPING`). The same rules:
+/// not taken twice by one thread, nor held across anything that maps title
+/// memory or takes [`title_memory_reading`].
+pub fn title_memory_reading_in(at: usize, len: usize) -> Reading {
+    if !ranged_mapping() {
+        return title_memory_reading();
+    }
+    Reading(ReadHeld::Some(map_shards_of(&[(at, len.max(1))]).into_iter().map(|i| MAP_LOCKS[i].read().unwrap_or_else(|e| e.into_inner())).collect()))
+}
+
+/// [`title_memory_reading_in`] if it can be had at once.
+pub fn title_memory_reading_in_now(at: usize, len: usize) -> Option<Reading> {
+    if !ranged_mapping() {
+        return title_memory_reading_now();
+    }
+    let mut held = Vec::new();
+    for i in map_shards_of(&[(at, len.max(1))]) {
+        match MAP_LOCKS[i].try_read() {
+            Ok(guard) => held.push(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => held.push(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    }
+    Some(Reading(ReadHeld::Some(held)))
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    Reading(ReadHeld::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -3643,8 +3726,8 @@ pub fn title_memory_reading() -> Reading {
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+        Ok(guard) => Some(Reading(ReadHeld::All(guard))),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(ReadHeld::All(e.into_inner()))),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
@@ -5224,6 +5307,33 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    /// A read of a range waits for a change that touches it, and not for one
+    /// elsewhere; the regions are found in order, each once.
+    #[test]
+    fn a_read_of_a_range_waits_only_for_changes_there() {
+        use super::{MAP_SHARDS, map_shards_of, title_memory_reading_in, title_memory_remapping_in};
+        assert_eq!(map_shards_of(&[(0, 1)]), vec![0]);
+        assert_eq!(map_shards_of(&[(64 << 20, 1), (0, 1), (3 << 26, (1 << 26) + 1)]), vec![0, 1, 3, 4]);
+        assert_eq!(map_shards_of(&[(0, usize::MAX)]).len(), MAP_SHARDS);
+        assert!(map_shards_of(&[(5, 0)]).is_empty());
+        let here = 0x7100_0000_0000usize;
+        let elsewhere = here + (5 << 26);
+        let changing = title_memory_remapping_in(&[(here, 4096)]);
+        let read = |at: usize| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _reading = title_memory_reading_in(at, 4096);
+                let _ = tx.send(());
+            });
+            rx
+        };
+        read(elsewhere).recv_timeout(std::time::Duration::from_secs(5)).expect("a read elsewhere waited for the change");
+        let there = read(here + 100);
+        assert!(there.recv_timeout(std::time::Duration::from_millis(100)).is_err(), "a read there did not wait");
+        drop(changing);
+        there.recv_timeout(std::time::Duration::from_secs(5)).expect("a read there never went on");
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.

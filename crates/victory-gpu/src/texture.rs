@@ -1067,7 +1067,7 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
+    let _pin = crate::watch::title_memory_reading_in(at, len);
     // SAFETY: the list owns this full upload allocation until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
@@ -1435,12 +1435,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_in_now(self.memory as usize, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_in(self.memory as usize, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
