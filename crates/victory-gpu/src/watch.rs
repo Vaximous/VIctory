@@ -784,8 +784,44 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         return None;
     }
     pages.clear();
-    ask_cut(first * PAGE, last * PAGE, &mut pages).then_some(pages)
+    if ask_cut(first * PAGE, last * PAGE, &mut pages) {
+        return Some(pages);
+    }
+    // Refused part way: the parts asked before the refusal were answered,
+    // and the kernel forgot what it told (the asking resets). Thrown away
+    // with the refusal, those writes were lost for good: copies of the
+    // pages kept their old bytes, and nothing asked would ever find them
+    // written again (runs ow61-ow64-move: tone curves and other title data
+    // stale, the picture banded). They are noted here, under a number of
+    // their own, and the caller goes on as refused.
+    note_found(&pages);
+    None
 }
+
+/// Pages a refused asking found written before its refusal
+/// ([`kernel_written`]), noted in the journal under a new number: every
+/// copy of them is older.
+fn note_found(pages: &[(usize, u16)]) {
+    if pages.is_empty() {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        FOUND_REFUSED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FOUND_REFUSED[1].fetch_add(pages.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    note_hot(pages);
+    let mut j = journal_mut();
+    let now = next_asking();
+    for &(page, parts) in pages {
+        j.notes.note(page, parts, now);
+    }
+}
+
+/// Since the last line: refused askings that had found pages written before
+/// the refusal, and those pages ([`note_found`]).
+#[cfg(feature = "diagnostics")]
+static FOUND_REFUSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The [`WATCHED`] runs, in order (pages).
 fn watched_runs() -> Vec<(usize, usize)> {
@@ -2511,6 +2547,15 @@ pub(crate) fn port_guard_line(frames: f64) {
     );
     once_split_line(frames);
     crate::safecopy::merge_line(frames);
+    #[cfg(feature = "diagnostics")]
+    {
+        let f: Vec<f64> = FOUND_REFUSED.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refused askings that had found pages written before the refusal, per frame: {:.2}, {:.1} pages of 64 KiB noted all the same (once lost)",
+            f[0],
+            f[1]
+        );
+    }
     #[cfg(feature = "diagnostics")]
     asked_by_thread_line(frames);
 }
