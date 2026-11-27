@@ -6091,6 +6091,15 @@ mod land_tests {
                         }
                     }
                 }
+                // Not in a dword both the card and the title wrote: there
+                // `land_card` keeps the title's write (`safecopy::merge`)
+                // and the relay's merge, without `VICTORY_LAND`, the card's.
+                for d in 0..LEN / 4 {
+                    let r = d * 4..d * 4 + 4;
+                    if now[r.clone()] != held[r.clone()] && title[r.clone()] != held[r.clone()] {
+                        title[r.clone()].copy_from_slice(&held[r]);
+                    }
+                }
                 let after = 4u64;
                 for (shadow, at) in [(&one, a), (&many, b)] {
                     crate::watch::writing(at, LEN);
