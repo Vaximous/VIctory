@@ -82,13 +82,18 @@ fn invalidate(matches: impl Fn(&Ticket) -> bool) {
     if !TRACKING.load(Ordering::Relaxed) {
         return;
     }
+    let mut gone = Vec::new();
     TICKETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
         let Some(ticket) = weak.upgrade() else { return false };
         if matches(&ticket) {
             ticket.valid.store(false, Ordering::Release);
+            gone.push(ticket.at);
         }
         true
     });
+    if !gone.is_empty() {
+        LAST.lock().unwrap_or_else(|e| e.into_inner()).retain(|(at, _)| !gone.contains(at));
+    }
 }
 
 pub(crate) fn released(owner: usize) {
@@ -293,6 +298,7 @@ fn write(landing: &Landing) {
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
+    let before = tiled.clone();
     for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
         let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
         let f = footprint.Footprint;
@@ -305,12 +311,115 @@ fn write(landing: &Landing) {
             return;
         }
     }
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    if merged() {
+        put_merged(&landing.ticket, &before, &mut tiled);
+    } else {
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    }
     spent(stat::TB_WORK, working);
     count(stat::TB_WRITTEN, 1);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
+    }
+}
+
+/// Whether a read-back goes into title memory by the dwords it changes, each
+/// only where title memory still holds what it held (`VICTORY_TEXBACK_MERGE`,
+/// on unless `0`).
+///
+/// It was written whole: title memory read, the texels tiled into that, all
+/// of it written back. Whatever the title wrote there in between went back to
+/// what it was, and so did whatever the title keeps in that memory once the
+/// texture no longer owns it, as long as nothing told us (a texture's memory
+/// in the title's own heaps, freed with no release we see). The title's heap
+/// keeps list nodes at the ends of its 64 KiB blocks, and it crashed on their
+/// pointers (image+0x4e9b578).
+fn merged() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_MERGE").is_none_or(|v| v != "0"))
+}
+
+/// By allocation: what the last read-back left in it; empty: someone else
+/// wrote it since, and it is left alone until it is released or remapped.
+static LAST: Mutex<Vec<(usize, Vec<u8>)>> = Mutex::new(Vec::new());
+
+/// Read-backs merged, dwords put, dwords someone else wrote since the read
+/// (left as they are), dwords someone else wrote since the last read-back.
+static MERGE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Puts `tiled` into title memory at `at`, which held `before` when it was
+/// read: by the dwords that differ, each only where title memory still holds
+/// what it held, and nowhere the title (or anything but us) wrote since the
+/// last read-back of the same allocation. If it did, the memory is taken to
+/// be someone else's now and is left alone from then on.
+fn put_merged(ticket: &Ticket, before: &[u8], tiled: &mut [u8]) {
+    use std::sync::atomic::AtomicU32;
+    let (at, size) = (ticket.at, tiled.len());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut others = 0u64;
+    if last.iter().any(|(a, w)| *a == at && w.is_empty()) {
+        return;
+    }
+    if let Some((_, was)) = last.iter().find(|(a, w)| *a == at && w.len() == size) {
+        for i in (0..size & !3).step_by(4) {
+            if before[i..i + 4] != was[i..i + 4] {
+                others += 1;
+                tiled[i..i + 4].copy_from_slice(&before[i..i + 4]);
+            }
+        }
+    }
+    if others > 0 {
+        MERGE[3].fetch_add(others, Ordering::Relaxed);
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            bytes = size,
+            dwords = others,
+            "a texture's memory was written by another since its last read-back: left alone from now on"
+        );
+        last.retain(|(a, _)| *a != at);
+        last.push((at, Vec::new()));
+        // (The caller holds the tickets' lock: this one only.)
+        ticket.valid.store(false, Ordering::Release);
+        return;
+    }
+    crate::watch::writing(at, size);
+    let (mut put, mut kept) = (0u64, 0u64);
+    for i in (0..size & !3).step_by(4) {
+        let (old, new) = (&before[i..i + 4], &tiled[i..i + 4]);
+        if old == new {
+            continue;
+        }
+        let old = u32::from_le_bytes(old.try_into().unwrap_or_default());
+        let new = u32::from_le_bytes(new.try_into().unwrap_or_default());
+        // SAFETY: inside the allocation, read whole just now under the lock
+        // against mapping changes, which is still held; 4-aligned (`at` is a
+        // texture's start, at least 256-aligned).
+        let word = unsafe { &*((at + i) as *const AtomicU32) };
+        match word.compare_exchange(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => put += 1,
+            Err(now) => {
+                kept += 1;
+                tiled[i..i + 4].copy_from_slice(&now.to_le_bytes());
+            }
+        }
+    }
+    MERGE[0].fetch_add(1, Ordering::Relaxed);
+    MERGE[1].fetch_add(put, Ordering::Relaxed);
+    MERGE[2].fetch_add(kept, Ordering::Relaxed);
+    let n = MERGE[0].load(Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(256) {
+        tracing::info!(
+            merged = n,
+            dwords_put = MERGE[1].load(Ordering::Relaxed),
+            kept_title = MERGE[2].load(Ordering::Relaxed),
+            written_by_others = MERGE[3].load(Ordering::Relaxed),
+            "texture read-backs merged into title memory (VICTORY_TEXBACK_MERGE)"
+        );
+    }
+    match last.iter_mut().find(|(a, _)| *a == at) {
+        Some(entry) => entry.1 = tiled.to_vec(),
+        None => last.push((at, tiled.to_vec())),
     }
 }
 
