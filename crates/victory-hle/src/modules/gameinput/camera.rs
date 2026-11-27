@@ -84,7 +84,6 @@ fn note_heading(found: impl FnOnce() -> Option<(f32, f32)>) {
 }
 
 /// The first found camera's yaw and pitch now.
-#[cfg(feature = "diagnostics")]
 fn heading(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<(f32, f32)> {
     list.iter().filter(|c| present(memory, base, c)).find_map(|c| {
         let y = read_f32(memory, resolve(memory, base, &c.yaw)?)?;
@@ -350,6 +349,22 @@ fn trace() -> Option<&'static [(f64, f32, f32)]> {
         .as_deref()
 }
 
+/// With a camera trace: when the found camera's yaw first read other than
+/// zero (the title's gameplay camera came up; before it, from the world's
+/// first frame on, it reads exactly 0). The route is held at the trace's
+/// first checkpoint until then (`route::clock`).
+static READY: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// When the gameplay camera came up ([`READY`]).
+pub(super) fn ready_at() -> Option<std::time::Instant> {
+    READY.get().copied()
+}
+
+/// The trace's first checkpoint, in route microseconds.
+pub(super) fn trace_from_us() -> Option<u64> {
+    trace().and_then(|p| p.first()).map(|p| (p.0 * 1e6) as u64)
+}
+
 /// The trace is followed no further than this route second.
 const TRACE_UNTIL_S: f64 = 80.0;
 
@@ -423,6 +438,14 @@ pub(super) fn apply() {
         return;
     }
     let counts = (DX.swap(0, Ordering::Relaxed), DY.swap(0, Ordering::Relaxed));
+    #[cfg(windows)]
+    if READY.get().is_none()
+        && trace().is_some()
+        && heading(&host::Own, cameras.base, &cameras.list).is_some_and(|(yaw, _)| yaw != 0.0)
+        && READY.set(std::time::Instant::now()).is_ok()
+    {
+        tracing::info!(route_s = super::route::route_now_us().map(|us| us as f64 / 1e6), "route camera trace: the gameplay camera came up (its yaw read other than 0)");
+    }
     #[cfg(windows)]
     let found = if let Some(found) = turn_to_trace(&host::Own, cameras.base, &cameras.list) {
         found

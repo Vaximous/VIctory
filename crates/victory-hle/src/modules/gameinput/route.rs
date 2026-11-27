@@ -318,6 +318,34 @@ fn clock(route: &Route) -> u64 {
             );
         });
         let by_world = world + now.saturating_sub(here);
+        // With a camera trace: held at its first checkpoint until the
+        // title's gameplay camera comes up, then by the time since; one that
+        // has not come up within `CAMERA_WAIT_US` of the world falls back
+        // to the settling below.
+        if let Some(from) = super::camera::trace_from_us().filter(|&f| f > world) {
+            if let Some(ready) = super::camera::ready_at() {
+                let there = ready.saturating_duration_since(zero()).as_micros() as u64;
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        route_after_world_ms = (from - world) / 1000,
+                        replay_after_world_ms = there.saturating_sub(here) / 1000,
+                        "route: anchored on the gameplay camera coming up (VICTORY_ROUTE_CAMERA_TRACE): from here the route plays by the time since it"
+                    );
+                });
+                return from + now.saturating_sub(there);
+            }
+            if now.saturating_sub(here) < CAMERA_WAIT_US {
+                return by_world.min(from - 1);
+            }
+            static GAVE_UP: std::sync::Once = std::sync::Once::new();
+            GAVE_UP.call_once(|| {
+                tracing::warn!(
+                    wait_s = CAMERA_WAIT_US / 1_000_000,
+                    "route: the gameplay camera did not come up; anchored on the world's settling instead"
+                );
+            });
+        }
         let Some(settle) = route.settle.filter(|&s| s > world) else { return by_world };
         // The settling, or at the latest the route's own distance from the
         // world to it and `settle_most` more: the replay's anchor, its time
@@ -437,6 +465,10 @@ fn until() -> u64 {
         std::env::var("VICTORY_ROUTE_UNTIL_S").ok().and_then(|v| v.trim().parse::<f64>().ok()).map_or(u64::MAX, |s| (s * 1e6) as u64)
     })
 }
+
+/// How long after the world's first frame a replay with a camera trace
+/// waits for the gameplay camera before it goes by the settling.
+const CAMERA_WAIT_US: u64 = 60_000_000;
 
 /// How much later after the world than the route's own the replay's world
 /// may settle before the route goes on without it, in microseconds
