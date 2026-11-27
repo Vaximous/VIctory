@@ -2146,11 +2146,14 @@ struct Workers {
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
-/// most (0, the default: not at all): asleep, a thread is woken in 50 us and
-/// more, 95 times a frame.
+/// most (100 by default; 0: not at all): asleep, a thread is woken in 50 us
+/// and more, 95 times a frame, and the submitting thread waits on the
+/// refreshes it hands to the threads (8.5 ms a frame outdoors, run
+/// ow75b-out). With 24 threads on the machine and some 17 busy, a tenth of
+/// a millisecond awake after each job costs a core at most.
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100));
     if most == 0 {
         return;
     }
@@ -2162,12 +2165,14 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS`): a third
+/// of the machine's, 2 to 8 (a quarter, at most 6, before: 6 of 24, with
+/// the refreshes handed to them the submitting thread's longest wait).
 fn wide_threads() -> usize {
     std::env::var("VICTORY_WIDE_THREADS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 8))
         .clamp(1, 16)
 }
 
