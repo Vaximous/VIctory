@@ -31,7 +31,7 @@ pub fn on() -> bool {
 
 /// What a wait was on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Object {
+pub(crate) enum Object {
     /// A fence (its address), for an event or its value.
     Fence(usize),
     /// A label: the address of a bottom-of-pipe write.
@@ -185,14 +185,14 @@ pub(crate) fn polled(fence: usize, value: u64) {
 }
 
 /// What the title waits on in `objects`, if it is one of ours.
-fn event_object(objects: &[usize]) -> Option<Object> {
+pub(crate) fn event_object(objects: &[usize]) -> Option<Object> {
     if EVENTS.load(Relaxed) == 0 {
         return None;
     }
     known(|k| objects.iter().find_map(|o| k.events.get(o).map(|&(fence, _)| Object::Fence(fence))))
 }
 
-fn address_object(at: usize) -> Option<Object> {
+pub(crate) fn address_object(at: usize) -> Option<Object> {
     known(|k| {
         if let Some(&fence) = k.values.get(&at) {
             Some(Object::Fence(fence))
@@ -219,7 +219,7 @@ fn waited(object: Object, since: Instant) {
 }
 
 /// Runs `call`, a wait of the title's, timed if it is on `object`.
-fn timed<T>(object: Option<Object>, call: impl FnOnce() -> T) -> T {
+pub(crate) fn timed<T>(object: Option<Object>, call: impl FnOnce() -> T) -> T {
     let Some(object) = object else {
         return call();
     };
@@ -260,7 +260,7 @@ unsafe extern "system" fn wait_one_ex(object: Handle, ms: u32, alertable: i32) -
 }
 
 /// The handles of a `WaitForMultipleObjects` call.
-fn handles(count: u32, objects: *const Handle) -> Vec<usize> {
+pub(crate) fn handles(count: u32, objects: *const Handle) -> Vec<usize> {
     if objects.is_null() || count == 0 || EVENTS.load(Relaxed) == 0 {
         return Vec::new();
     }
