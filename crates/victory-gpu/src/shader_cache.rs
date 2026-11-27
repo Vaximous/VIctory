@@ -120,6 +120,9 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    // Whether pixel programs may be marked to test depth first: the switches, and
+    // not for a translation made again without the mark (`Shader::code_late`).
+    hash.update(&[u8::from(victory_shader::emit::early_depth_allowed())]);
     *hash.finalize().as_bytes()
 }
 
@@ -207,7 +210,7 @@ fn cached(
 
 /// The form of an entry ([`encode`]): change it with the form. It is part of
 /// the key ([`build`]), so entries of another form are not looked at.
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -303,6 +306,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, u32::from(slot));
         word(&mut out, dword);
     }
+    word(&mut out, u32::from(s.early_depth));
     out
 }
 
@@ -376,6 +380,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     for _ in 0..n {
         half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
     }
+    let early_depth = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -387,6 +396,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         half_views,
+        early_depth,
     })
 }
 
@@ -422,6 +432,7 @@ mod tests {
                 shift: 5,
             }],
             half_views: vec![(0, 8), (4, 0)],
+            early_depth: true,
         }
     }
 
@@ -446,7 +457,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH2 broken").unwrap();
+            std::fs::write(e, b"VSH3 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

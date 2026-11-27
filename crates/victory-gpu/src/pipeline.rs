@@ -66,6 +66,10 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A pixel program's code without `[earlydepthstencil]`, for the pipelines where
+    /// the mark is not known to be safe ([`Shader::code_late`]).
+    #[cfg(windows)]
+    late: OnceLock<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -118,6 +122,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                late: OnceLock::new(),
             })
         })
         .clone()
@@ -197,12 +202,55 @@ impl Shader {
 
 #[cfg(windows)]
 impl Shader {
+    /// The host code of a pixel program the translation marked `[earlydepthstencil]`
+    /// (`victory_shader::emit::early_depth_safe`), made again without the mark: for a
+    /// pipeline where it is not known to be safe
+    /// (`host::GraphicsState::early_depth_unsafe`). `None` when
+    /// the translation has no mark (or this one fails): its own code serves.
+    pub(crate) fn code_late(&self) -> Option<&[u8]> {
+        if !self.translated()?.host.early_depth {
+            return None;
+        }
+        let late = self.late.get_or_init(|| {
+            let made = victory_shader::emit::without_early_depth(|| crate::shader_cache::host_shader(&self.container));
+            EARLY_DEPTH[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match made {
+                Ok(t) if !t.early_depth => Some(t.dxil),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(stage = self.stage, hash = %self.hash, error = %e, "no translation without early depth");
+                    None
+                }
+            }
+        });
+        late.as_deref()
+    }
+
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
         let c = Container::parse(&self.container).ok()?;
         let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
         victory_shader::native_programs(part.data).ok()
+    }
+}
+
+/// Since the start: pipelines made with a pixel program marked `[earlydepthstencil]`
+/// (`VICTORY_EARLY_DEPTH_SAFE`); such programs translated again without the mark; and
+/// pipelines that took that code, where the mark is not known to be safe
+/// (`host::GraphicsState::early_depth_unsafe`).
+pub(crate) static EARLY_DEPTH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// For the frame-rate line: [`EARLY_DEPTH`], when it changed.
+pub(crate) fn early_depth_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let [marked, again, late] = [0, 1, 2].map(|i| EARLY_DEPTH[i].load(Relaxed));
+    let all = marked + again + late;
+    if all != 0 && SHOWN.swap(all, Relaxed) != all {
+        tracing::info!(
+            "pipelines whose pixel program tests depth first (VICTORY_EARLY_DEPTH_SAFE), since the start: {marked} with the mark, {late} without it (alpha to coverage, no colour written, depth bias or no depth clip; {again} programs translated again for them)"
+        );
     }
 }
 

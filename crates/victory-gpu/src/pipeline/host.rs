@@ -119,6 +119,31 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
     )
 }
 
+impl GraphicsState {
+    /// Whether its draws could come out otherwise, or may be shadows, with the pixel
+    /// program testing depth before it runs (`[earlydepthstencil]`,
+    /// `victory_shader::emit::early_depth_safe`): alpha to coverage (the coverage the
+    /// program's alpha makes would no longer keep depth from being written), no colour
+    /// target written (a depth or shadow pass), a depth bias or depth clipping off (what
+    /// shadow passes set). Such pipelines take the program without the mark
+    /// (`Shader::code_late`).
+    pub(crate) fn early_depth_unsafe(&self) -> bool {
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let per_target = self.blend.IndependentBlendEnable.as_bool();
+        let writes = (0..count).any(|i| {
+            self.targets.RTFormats[i] != DXGI_FORMAT_UNKNOWN
+                && self.blend.RenderTarget[if per_target { i } else { 0 }].RenderTargetWriteMask != 0
+        });
+        let r = &self.rasterizer;
+        self.blend.AlphaToCoverageEnable.as_bool()
+            || !writes
+            || r.DepthBias != 0
+            || r.SlopeScaledDepthBias != 0.0
+            || r.DepthBiasClamp != 0.0
+            || !r.DepthClipEnable.as_bool()
+    }
+}
+
 /// The title's blend state as the host takes it: blending off on integer
 /// render targets. The console ignores blending there, and titles leave it
 /// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
@@ -701,12 +726,23 @@ impl HostPipeline {
                 return None;
             }
         };
+        // A pixel program marked to test depth first, in a pipeline where that is not
+        // known to be safe: its code without the mark.
+        let ps_late = stages.get(1).filter(|_| compute.is_none()).and_then(|(s, _)| {
+            if !s.translated().is_some_and(|t| t.host.early_depth) {
+                return None;
+            }
+            let unsafe_here = g.is_some_and(|g| g.early_depth_unsafe());
+            super::EARLY_DEPTH[if unsafe_here { 2 } else { 0 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if unsafe_here { s.code_late() } else { None }
+        });
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| {
                     let dxil = match &t.native {
                         Some(n) if native => &n[..],
+                        _ if i == 1 => ps_late.unwrap_or(&t.host.dxil[..]),
                         _ => &t.host.dxil[..],
                     };
                     D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() }
@@ -1178,6 +1214,35 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// Testing depth before the pixel program runs is kept to pipelines that write a
+    /// colour target, with no alpha to coverage, no depth bias and depth clipping on.
+    #[test]
+    fn early_depth_only_where_it_cannot_change_the_picture() {
+        let colour = || {
+            let mut g = GraphicsState::default();
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g
+        };
+        assert!(!colour().early_depth_unsafe());
+        assert!(GraphicsState::default().early_depth_unsafe(), "a depth or shadow pass");
+        let mut g = colour();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0;
+        assert!(g.early_depth_unsafe(), "no colour written");
+        let mut g = colour();
+        g.blend.AlphaToCoverageEnable = true.into();
+        assert!(g.early_depth_unsafe(), "alpha to coverage");
+        let mut g = colour();
+        g.rasterizer.DepthBias = 4;
+        assert!(g.early_depth_unsafe(), "a depth bias");
+        let mut g = colour();
+        g.rasterizer.SlopeScaledDepthBias = 1.5;
+        assert!(g.early_depth_unsafe(), "a slope-scaled depth bias");
+        let mut g = colour();
+        g.rasterizer.DepthClipEnable = false.into();
+        assert!(g.early_depth_unsafe(), "depth clipping off");
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

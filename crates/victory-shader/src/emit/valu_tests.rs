@@ -182,6 +182,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        early_depth: false,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1920,6 +1921,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         half_views: lowered.half_views,
+        early_depth: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2131,6 +2133,7 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        early_depth: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2509,6 +2512,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        early_depth: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut dxil = shader.dxil.clone();
@@ -2781,6 +2785,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             root_uavs: l.root_uavs,
             root_indexed_views: res.root_indexed_views,
             half_views: l.half_views,
+            early_depth: false,
         }
     };
     // v1 = first[v0] (one channel).
