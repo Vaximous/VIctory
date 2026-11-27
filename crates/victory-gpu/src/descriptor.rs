@@ -566,8 +566,9 @@ static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::ato
 #[cfg(windows)]
 fn sync_jobs() -> (usize, usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fine = crate::ab::pick("VICTORY_SYNC_FINE")
-        .unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0")));
+    let fine = *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    let fine = crate::ab::pick("VICTORY_SYNC_FINE").unwrap_or(fine);
     if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
 }
 
