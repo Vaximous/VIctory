@@ -1787,7 +1787,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // Residency (`crate::tiles::residency`): every such texture.
             let partly = readable
                 && bytes >= crate::tiles::floor()
-                && (crate::tiles::residency()
+                && ((crate::tiles::residency() && block_compressed(r.desc.format))
                     || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
@@ -3145,6 +3145,15 @@ impl OnDemand {
             crate::descriptor::host::levels_changed(memory);
         }
     }
+}
+
+/// Whether title format `format` is block compressed (BC1 to BC7) on the
+/// host. Residency takes only such textures: lookup tables, curves and
+/// noise (uncompressed, often one level) sampled through a coarse level
+/// band the picture (run ow10).
+#[cfg(windows)]
+fn block_compressed(format: u32) -> bool {
+    matches!(pc_format(format), 70..=84 | 94..=99)
 }
 
 /// Residency (`crate::tiles::residency`): shaders asked level `level` of
