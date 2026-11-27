@@ -1803,7 +1803,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 // loads and the card has room for it whole.
                 if crate::tiles::residency() {
                     let side = crate::tiles::coarse_side();
-                    let whole = side == 0 || (crate::draw::loading() && room_lately());
+                    // (Whole for a bake too: it samples its sources once, at
+                    // their finest, and keeps what it made.)
+                    let whole = side == 0 || crate::texture::BAKING.get() || (crate::draw::loading() && room_lately());
                     let mut first = 0;
                     while !whole && (r.desc.width >> first).max(u64::from(r.desc.height) >> first) > side {
                         first += 1;

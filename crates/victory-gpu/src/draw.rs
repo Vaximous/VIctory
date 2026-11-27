@@ -291,6 +291,27 @@ fn frame_ms(frame: u64, now: u64) -> u64 {
     (last.2 as u64).max(1)
 }
 
+/// The milliseconds a frame's texture passes may take on the recording
+/// thread in the world, once it is loaded (`VICTORY_TEXTURE_WORLD_MS`, 3;
+/// 0: the passes' own budgets, 250 ms and more, as before): what does not
+/// fit waits for the next frame. Bakes keep theirs.
+fn world_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_WORLD_MS")
+            .ok()
+            .map_or(Some(3), |v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+    })
+}
+
+/// Whether the due slots shaders read lately are taken first
+/// (`VICTORY_TOUCHED_FIRST=0`: only with eviction).
+fn touched_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TOUCHED_FIRST").is_none_or(|v| v != "0"))
+}
+
 /// Microseconds the residency's steering took on its thread, since the
 /// start (`crate::tiles::status`).
 pub(crate) static STEER_MICROS: AtomicU64 = AtomicU64::new(0);
@@ -2315,7 +2336,24 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
+        let textures_began = std::time::Instant::now();
+        let (made_before, bytes_before) =
+            (HEAP_TEXTURES.load(Ordering::Relaxed), HEAP_TEXTURE_BYTES.load(Ordering::Relaxed));
+        let tile_us = crate::tiles::STATS[7].load(Ordering::Relaxed);
         let _ = self.heap_textures(list, heap, host, None);
+        let took = textures_began.elapsed();
+        if took.as_millis() >= 50 {
+            // A hitch: what the pass did in it.
+            tracing::info!(
+                frame,
+                ms = took.as_millis() as u64,
+                uploaded = HEAP_TEXTURES.load(Ordering::Relaxed) - made_before,
+                mb = (HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) - bytes_before) >> 20,
+                tile_mapping_us = crate::tiles::STATS[7].load(Ordering::Relaxed) - tile_us,
+                loading = loading(),
+                "a frame's texture pass took 50 ms or more on the recording thread"
+            );
+        }
         stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2583,7 +2621,11 @@ impl State {
                 if run_pass && served && exact {
                     BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
                 }
-                BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+                let took = began.elapsed().as_millis() as u64;
+                if took >= 50 {
+                    tracing::info!(frame, ms = took, "a decoration bake's synchronous texture pass took 50 ms or more");
+                }
+                BAKED_MS.fetch_add(took, Ordering::Relaxed);
                 return;
             }
             // Fallback when no host GPU list can be created (e.g. headless tests).
@@ -2609,6 +2651,7 @@ impl State {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
             return;
         }
+        let early_ms = if loading() { early_ms } else { world_ms().map_or(early_ms, |ms| early_ms.min(ms)) };
         let budget = if first && early_ms > 0 {
             (early_ms, 64 << 20)
         } else {
@@ -2862,7 +2905,10 @@ impl State {
             }
         }
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
-        if let Some((now, seen)) = &feedback {
+        // Slots shaders read lately first (`VICTORY_TOUCHED_FIRST=0`: only
+        // with eviction, as before).
+        let touched = if feedback.is_none() && touched_first() { crate::host::touched::slot_epochs() } else { None };
+        if let Some((now, seen)) = feedback.as_ref().or(touched.as_ref()) {
             // Stable: the queue's own order within each part.
             due.sort_by_key(|&(index, _)| seen.get(index as usize).is_none_or(|&read| read == 0 || now.saturating_sub(read) > 3));
         }
@@ -2924,7 +2970,15 @@ impl State {
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
-        let (per_frame, span) = if loading() { (per_frame * 4, span * 4) } else { (per_frame, span) };
+        // In the world, a strict time a frame on the recording thread
+        // ([`world_ms`]); while loading, the old budget four times over.
+        let (per_frame, span) = if loading() {
+            (per_frame * 4, span * 4)
+        } else if let Some(ms) = world_ms() {
+            (per_frame, span.min(std::time::Duration::from_millis(ms)))
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
