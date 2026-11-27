@@ -8081,6 +8081,45 @@ fn steps_beside_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_STEPS_BESIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
+/// Whether the refreshes in front of a submission that cover much are made
+/// in pieces of [`REFRESH_PIECE`] bytes, each a job any of the threads
+/// takes (`VICTORY_REFRESH_PIECES`, on unless `=0`: a copy's span one job).
+///
+/// Run fm14: the threads that refresh were busy half the time they were
+/// given (6 threads, 7.6 ms a frame of the submitting thread's waiting for
+/// them, wake-ups and tails a tenth of it): the longest refresh of a group
+/// is 37 us at the median and 527 us at the 90th percentile, and the others
+/// stand while it runs.
+pub(crate) fn refresh_pieces() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_PIECES").is_none_or(|v| v != "0"))
+}
+
+/// The bytes of a piece of [`refresh_pieces`]: whole pages of the copies'
+/// (whose bookkeeping is by page), so no two pieces share one.
+const REFRESH_PIECE: usize = 16 * crate::watch::PAGE;
+
+/// `spans` with each longer than [`REFRESH_PIECE`] cut where pieces of it
+/// begin on the page lines, in order.
+fn in_pieces(
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    if spans.iter().all(|s| s.2 - s.1 <= REFRESH_PIECE) {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    for (shadow, from, to) in spans {
+        let mut at = from;
+        while to - at > REFRESH_PIECE {
+            let cut = (at + REFRESH_PIECE) / REFRESH_PIECE * REFRESH_PIECE;
+            out.push((shadow.clone(), at, cut));
+            at = cut;
+        }
+        out.push((shadow, at, to));
+    }
+    out
+}
+
 /// The pages [`warm_filter`] keeps apart: a copy's refresh takes whole ones.
 const WARM_PAGE: usize = 1 << 16;
 
@@ -8769,6 +8808,9 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        // Long ones in pieces any thread takes ([`refresh_pieces`]): asked
+        // ahead and noted above whole, as before.
+        let spans = if refresh_pieces() && spans.len() + due.len() > 1 { in_pieces(spans) } else { spans };
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -10819,13 +10861,17 @@ mod refresh_tests {
         submission_warmed(ranges, flushes, false);
     }
 
+    /// One submission's preparing at a time, as the submission lock makes it.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// [`submission`], with `warmed` its refreshes made beside first, as
     /// `VICTORY_STEPS_BESIDE_REFRESH` does while the steps on the card are
     /// chosen (`super::warm_up`).
     fn submission_warmed(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize, warmed: bool) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = one_at_a_time();
         if warmed {
             super::warm_up(ranges.iter().map(|(shadow, at, len)| (shadow.clone(), *at, *at + *len)).collect());
         }
@@ -10845,6 +10891,57 @@ mod refresh_tests {
     /// copies (of both kinds of memory, over one another, none on a page
     /// line) are refreshed in which ranges: a refreshed range holds what
     /// title memory holds.
+    /// Long spans cut on the lines of pieces, whole pages each, in order and
+    /// covering what they did.
+    #[test]
+    fn long_refreshes_go_in_pieces_on_page_lines() {
+        let shadow = Shadow::unbacked(0x4000_0000, memory(PAGE), PAGE as u64, false);
+        let piece = super::REFRESH_PIECE;
+        let base = 0x4000_0000usize;
+        let spans = vec![(shadow.clone(), base + 100, base + 100 + 2 * piece + 7), (shadow.clone(), base + 5, base + 9)];
+        let pieces: Vec<(usize, usize)> = super::in_pieces(spans).iter().map(|s| (s.1 - base, s.2 - base)).collect();
+        assert_eq!(pieces, vec![(100, piece), (piece, 2 * piece), (2 * piece, 2 * piece + 107), (5, 9)]);
+        assert!(pieces.iter().all(|p| p.0 % PAGE == 0 || p.0 == 100 || p.0 == 5));
+    }
+
+    /// The refreshes in front, long ones in pieces on the threads: what they
+    /// cover holds title memory, round after round of the title's writes.
+    #[test]
+    fn refreshes_in_pieces_hold_title_memory() {
+        let mut random = Random(0x9E3C_E500_0000_0007);
+        let len = 3 * super::REFRESH_PIECE + 5 * PAGE;
+        let region = title(len, false);
+        let copies: Vec<_> = [(0, len), (PAGE + 33, len - 999), (super::REFRESH_PIECE - 5, 2 * super::REFRESH_PIECE + 77)]
+            .into_iter()
+            .map(|(from, to)| {
+                let data = memory(to - from);
+                (Shadow::unbacked((region + from) as u64, data, (to - from) as u64, false), data, from)
+            })
+            .collect();
+        for round in 0..40 {
+            for _ in 0..1 + random.below(40) {
+                let at = region + random.below(len - 64);
+                for i in 0..1 + random.below(60) {
+                    // SAFETY: the test's title memory.
+                    unsafe { ((at + i) as *mut u8).write_volatile(random.below(256) as u8) };
+                }
+            }
+            let spans: Vec<_> = copies.iter().map(|(shadow, _, from)| (shadow.clone(), region + from, region + from + shadow.span().1 as usize)).collect();
+            let asked: Vec<(usize, usize)> = spans.iter().map(|s| (s.1, s.2)).collect();
+            let _one = one_at_a_time();
+            crate::watch::ask_once(&asked);
+            let mut batch = Batch::default();
+            batch.refresh_spans(spans, Vec::new(), crate::timeline::span("test: planned"));
+            crate::watch::ask_once_end();
+            for (shadow, data, from) in &copies {
+                let n = shadow.span().1 as usize;
+                // SAFETY: the copy's memory and its title bytes.
+                let same = unsafe { std::slice::from_raw_parts(*data, n) == std::slice::from_raw_parts((region + from) as *const u8, n) };
+                assert!(same, "round {round}: the copy at +{from:#x} differs");
+            }
+        }
+    }
+
     /// The refreshes made beside the steps on the card, then the
     /// submission's own: the same bytes in the same ranges as the
     /// submission's alone, and title memory's.

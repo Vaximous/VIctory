@@ -434,6 +434,28 @@ thread_local! {
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
+/// From this many bytes of title memory a texture's refresh reads and
+/// detiles on the threads beside ([`copy_in_pieces`], [`Staging::detile`]).
+const BIG_TEXTURE: usize = 2 << 20;
+
+/// [`crate::host::copy_mapped`] of a texture's memory: a big one in pieces
+/// of 1 MiB on the threads beside (`crate::host::refresh_pieces`).
+fn copy_in_pieces(dst: *mut u8, src: *const u8, len: usize) {
+    const PIECE: usize = 1 << 20;
+    if len < BIG_TEXTURE || !crate::host::refresh_pieces() {
+        crate::host::copy_mapped(dst, src, len, false);
+        return;
+    }
+    #[derive(Clone, Copy)]
+    struct At(usize, usize);
+    let at = At(dst as usize, src as usize);
+    crate::shadow::wide_each(len.div_ceil(PIECE), move |i| {
+        let at = at;
+        let n = PIECE.min(len - i * PIECE);
+        crate::host::copy_mapped((at.0 + i * PIECE) as *mut u8, (at.1 + i * PIECE) as *const u8, n, false);
+    });
+}
+
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
@@ -1353,7 +1375,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                copy_in_pieces(read.as_mut_ptr(), self.memory, size);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1436,7 +1458,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                copy_in_pieces(read.as_mut_ptr(), self.memory, size);
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1587,7 +1609,36 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+        // A big texture's subresources on the threads beside
+        // (`crate::host::refresh_pieces`): each writes its own part of the
+        // staging buffer.
+        if crate::host::refresh_pieces() && self.footprints.len() > 1 && tiled.len() >= BIG_TEXTURE {
+            #[derive(Clone, Copy)]
+            struct At(*const Staging, *const u8, usize);
+            // SAFETY: both outlive the call, which waits for every job;
+            // the jobs write disjoint parts of the staging buffer.
+            unsafe impl Send for At {}
+            unsafe impl Sync for At {}
+            let at = At(std::ptr::from_ref(self), tiled.as_ptr(), tiled.len());
+            crate::shadow::wide_each(self.footprints.len(), move |i| {
+                let at = at;
+                // SAFETY: as above.
+                let (me, tiled) = unsafe { (&*at.0, std::slice::from_raw_parts(at.1, at.2)) };
+                me.detile_part(tiled, i, held);
+            });
+            return;
+        }
+        for i in 0..self.footprints.len() {
+            if !self.detile_part(tiled, i, held) {
+                return;
+            }
+        }
+    }
+
+    /// Subresource `i` of [`Staging::detile`]: false if it could not be.
+    fn detile_part(&self, tiled: &[u8], i: usize, held: u32) -> bool {
+        {
+            let (footprint, rows) = (&self.footprints[i], self.rows[i]);
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
@@ -1603,16 +1654,17 @@ impl Staging {
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
                 linear.fill(0);
-                continue;
+                return true;
             }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
         }
+        true
     }
 }
 
@@ -2437,5 +2489,19 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 1, &place);
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
+    }
+}
+
+#[cfg(test)]
+mod piece_tests {
+    /// A big texture's memory read in pieces on the threads holds what one
+    /// read holds, to the last byte of a piece that is not whole.
+    #[test]
+    fn a_big_read_in_pieces_is_the_whole_read() {
+        let len = 5 * (1 << 20) + 12_345;
+        let src: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+        let mut dst = vec![0u8; len];
+        super::copy_in_pieces(dst.as_mut_ptr(), src.as_ptr(), len);
+        assert!(dst == src);
     }
 }
