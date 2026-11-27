@@ -294,6 +294,18 @@ pub(crate) fn compared(src: usize, len: usize, written: usize) {
     e.1 += written as u64;
 }
 
+/// Per range (start, length): why the light look could not say it holds
+/// nothing new: not watched (yet), shaders writing it, its look said no, a
+/// gap's look said no.
+static WHY: Mutex<Option<HashMap<(usize, usize), [u64; 4]>>> = Mutex::new(None);
+
+/// The light look at `[src, src + len)` said it must ask, for `reason`
+/// ([`WHY`]).
+pub(crate) fn why(src: usize, len: usize, reason: usize) {
+    let mut map = WHY.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert([0; 4])[reason] += 1;
+}
+
 /// A refresh of `len` bytes from `src` took `us` and copied `taken` of them.
 pub(crate) fn range(src: usize, len: usize, us: u64, taken: usize) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1477,7 +1489,9 @@ pub(crate) fn log(frames: f64) {
     // 10 ms on the submitting thread, when this ran there). A line may name
     // the kind an address had when first seen.
     static KINDS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+    let whys = WHY.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     for ((src, len), (n, bytes, us, taken, empty)) in ranges.into_iter().take(16) {
+        let w = whys.get(&(src, len)).copied().unwrap_or_default();
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         let known = KINDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&src).copied();
         let kind = known.unwrap_or_else(|| {
@@ -1489,12 +1503,16 @@ pub(crate) fn log(frames: f64) {
             info.Type
         });
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame; {:.2} MB/frame taken, {:.1}x/frame took nothing",
+            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame; {:.2} MB/frame taken, {:.1}x/frame took nothing; the light look said ask {:.1}/{:.1}/{:.1}/{:.1}x/frame (not watched/shaders writing/its look/a gap's look)",
             n as f64 / frames,
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames,
             taken as f64 / 1e6 / frames,
-            empty as f64 / frames
+            empty as f64 / frames,
+            w[0] as f64 / frames,
+            w[1] as f64 / frames,
+            w[2] as f64 / frames,
+            w[3] as f64 / frames
         );
     }
 }
