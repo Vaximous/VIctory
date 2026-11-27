@@ -108,6 +108,8 @@ mod watch;
 #[cfg(windows)]
 mod readprobe;
 #[cfg(windows)]
+mod reaper;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

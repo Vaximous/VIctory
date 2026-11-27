@@ -3092,7 +3092,9 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 }
 
 /// Whether [`cover`] makes the other views' blocks read-only a run at a
-/// time (`VICTORY_ALIAS_RUNS`, on; =0 one block at a time, as before).
+/// time (`VICTORY_ALIAS_RUNS=1`; off by default: one block at a time).
+/// Off since run ow25-move: 6.4 such calls a frame for 23 blocks, the time
+/// changing protections no lower (7.4 ms against 6.9).
 ///
 /// The other views of a guarded range's pages are mostly a range too, and
 /// [`protect_alias`] changed them one page per call, under the guards'
@@ -3103,7 +3105,7 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 /// read-only and only notes them.
 fn alias_runs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_RUNS").is_none_or(|v| v != "0"));
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_RUNS").is_some_and(|v| v == "1"));
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_ALIAS_RUNS") {
         return on;

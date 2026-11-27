@@ -699,7 +699,7 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        crate::reaper::dispose(done);
     }
 }
 
@@ -3602,7 +3602,7 @@ fn land() {
         line.landed.drain(..n).collect()
     };
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        crate::reaper::recycle(lists, order);
     }
 }
 
@@ -5621,7 +5621,7 @@ impl Host {
     /// at each place of `order` in `parts` ([`joins`]).
     pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
         if order.is_empty() {
-            crate::list::recycle(lists, &order);
+            crate::reaper::recycle(lists, order);
             return;
         }
         late_threads();
@@ -5650,7 +5650,7 @@ impl Host {
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
-            crate::list::recycle(lists, &order);
+            crate::reaper::recycle(lists, order);
             return;
         };
         let told = !sent.writes.is_empty();
@@ -10404,6 +10404,7 @@ impl Meter {
         send_parts_early_line(frames);
         crate::readprobe::line(frames);
         beside_line(frames);
+        crate::reaper::line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let [wc_declared, wc_copies, wc_bytes] =
