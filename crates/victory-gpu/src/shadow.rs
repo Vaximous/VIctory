@@ -94,6 +94,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
+    /// 0 not known yet, 1 no, 2 yes.
+    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2221,15 +2224,107 @@ fn land_echo() -> bool {
 /// Whether a refresh of a copy in the card's memory whose title memory is
 /// not watched (neither the write watch nor the guards see it: every
 /// refresh takes it whole) sends up only the 4 KiB parts that differ from
-/// its CPU side (`VICTORY_WHOLE_CHANGED=1`; off: all of it, as before).
+/// its CPU side (`VICTORY_WHOLE_CHANGED`, on unless `=0`: all of it, as
+/// before; on by default since run ow19-move: 21 MB a frame of the same
+/// bytes went up for the upscaler's buffer alone, of 98 MB up in all).
 /// FSR4's 20 MB buffer is such a copy: shaders write all of it, it is
 /// fetched and landed, then every refresh took it whole and sent the same
 /// bytes back up, 21 MB a frame. It rests on what every send up rests on:
 /// outside ranges shaders may be writing, a copy's CPU side holds what its
 /// card side holds (`VICTORY_UPCOPY_CHECK=1` looks at that at rest).
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+///
+/// Ported from pepezin-ai/VIctory-NVIDIA, commits 50c15a145 and 2f81d0c85
+/// (GPL-3.0, as this): the registry and [`wc_no_back`], not the first's
+/// mapped copies in card memory (`VICTORY_WC_BAR`).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it (reads of such memory are uncached on the
+/// console; memory the title reads back is cacheable).
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner()).push((at as u64, (at + len) as u64));
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
+/// write-combined regions in it are forgotten.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    if all.is_empty() {
+        return;
+    }
+    all.retain(|&(from, to)| if len == 0 { from != at } else { to <= at || from >= end });
+}
+
+/// Whether all of `[start, start + len)` lies in one write-combined region.
+fn is_write_combined(start: u64, len: u64) -> bool {
+    WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether what shaders write into big copies in the card's memory of
+/// write-combined title memory stays on the card, without hashes, compare,
+/// fetch and merge into title memory (`VICTORY_WC_NO_BACK`, on unless `=0`;
+/// only copies of [`wc_no_back_min`] or more).
+///
+/// Their measure (VIctory-NVIDIA 2f81d0c85, a 4070 SUPER with DLSS Quality):
+/// gameplay 38.3 to 33.3 ms a frame, cutscene median 47.3 to 36.3 ms. Of a
+/// gameplay frame's compares about 360 of 730 MB a frame lay in
+/// write-combined memory, and 36 MB a frame of it came back.
+///
+/// What it risks: the title's CPU reading what shaders wrote there reads
+/// older bytes (write-combined memory is what the CPU writes and the GPU
+/// reads); a part the CPU writes goes up and takes back what shaders wrote
+/// in it since; another host copy of the same bytes does not see what
+/// shaders wrote.
+fn wc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_none_or(|v| v != "0"))
+}
+
+/// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
+/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 1024). With every copy left, their
+/// cutscenes went near black (small results the title reads back, such as
+/// exposure, came back stale); most of the saving is in a few ranges of
+/// hundreds of MB.
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
+    })
+}
+
+/// Bytes shaders were declared to write in write-combined copies and that
+/// were left on the card ([`wc_no_back`]), since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a refresh of a copy in the card's memory sends up, of the pages
+/// counted as written, only the 4 KiB parts in which title memory differs
+/// from the CPU's side (`VICTORY_SEND_PARTS`, on unless `=0`: the pages
+/// whole, as before). Where the write watch knows the 4 KiB parts written it
+/// cut them before; the guards of view memory know only blocks of 64 KiB,
+/// and those went up whole: run ow19-move sent 66 MB a frame for one 174 MB
+/// copy, where the kernel found 14 MB a frame of 4 KiB pages written in all.
+/// A page never taken goes up whole as long as no shader's write was ever
+/// declared for the copy, as with [`send_changed`] (kept off), which cuts to
+/// dwords; this rests on what [`whole_changed`] rests on: outside ranges
+/// shaders may be writing, the CPU's side holds what the card's side holds.
+fn send_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_PARTS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line, of [`send_parts`] refreshes: bytes found
+/// as the CPU's side held them (left), and bytes taken and sent up.
+pub(crate) static PARTS_SENT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 fn whole_changed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_CHANGED").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WHOLE_CHANGED").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, of [`whole_changed`] refreshes: bytes
@@ -3010,6 +3105,63 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod write_combined_tests {
+    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+
+    /// A copy counts as write-combined only inside one such region, and not
+    /// after the region is let go (part of it or the whole allocation).
+    #[test]
+    fn write_combined_regions() {
+        // Addresses of their own: other tests share the registry.
+        let base = 0x7f00_0000_0000usize;
+        title_memory_write_combined(base, 0x100_0000);
+        assert!(is_write_combined(base as u64, 0x1000));
+        assert!(is_write_combined(base as u64 + 0xff_f000, 0x1000));
+        assert!(!is_write_combined(base as u64 + 0xff_f000, 0x2000), "past its end");
+        assert!(!is_write_combined(base as u64 - 0x1000, 0x2000), "before its start");
+        write_combined_freed(base + 0x10_0000, 0x1000);
+        assert!(!is_write_combined(base as u64, 0x1000), "part of it decommitted");
+        let other = base + 0x1000_0000;
+        title_memory_write_combined(other, 0x10_0000);
+        write_combined_freed(other, 0);
+        assert!(!is_write_combined(other as u64, 0x1000), "the allocation released");
+    }
+}
+
+#[cfg(test)]
+mod send_parts_tests {
+    use super::{KERNEL_PAGE, Shadow};
+
+    /// Pages counted as written, of a copy in the card's memory: only the
+    /// 4 KiB parts where title memory differs from the CPU's side go up,
+    /// and the CPU's side holds the title's bytes after.
+    #[test]
+    fn only_the_parts_that_differ_go_up() {
+        const PAGES: usize = 6;
+        let room = vec![7u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = room.as_ptr() as usize;
+        let title = title.next_multiple_of(KERNEL_PAGE);
+        let mut side = vec![7u8; PAGES * KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        for page in [1, 4] {
+            // SAFETY: in `room`.
+            unsafe { ((title + page * KERNEL_PAGE + 100) as *mut u8).write_volatile(9) };
+        }
+        copy.take(title, title + PAGES * KERNEL_PAGE, true);
+        let mut dirty = copy.take_dirty();
+        dirty.sort_unstable();
+        let part = |a: usize| (a * KERNEL_PAGE, (a + 1) * KERNEL_PAGE);
+        if super::send_parts() {
+            assert_eq!(super::joined(dirty), [part(1), part(4)]);
+        } else {
+            assert_eq!(super::joined(dirty), [(0, PAGES * KERNEL_PAGE)]);
+        }
+        assert_eq!((side[KERNEL_PAGE + 100], side[4 * KERNEL_PAGE + 100]), (9, 9));
+        drop(room);
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3385,6 +3537,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3416,9 +3569,38 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // Big copies of write-combined title memory, which the title's CPU
+        // does not read: what shaders write stays on the card
+        // ([`wc_no_back`]).
+        if self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() && self.write_combined() {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy stays on the card (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -4246,7 +4428,7 @@ impl Shadow {
             return;
         }
         if to - from < long {
-            self.copy_changed_part(from, to);
+            self.copy_changed_part(from, to, &WHOLE_CHANGED);
             return;
         }
         let parts: Vec<(usize, usize)> = (from..to).step_by(part).map(|a| (a, (a + part).min(to))).collect();
@@ -4256,12 +4438,12 @@ impl Shadow {
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
             let (a, b) = parts[i];
-            this.copy_changed_part(a, b);
+            this.copy_changed_part(a, b, &WHOLE_CHANGED);
         });
     }
 
     /// [`Shadow::copy_changed`] of one part, on this thread.
-    fn copy_changed_part(&self, from: usize, to: usize) {
+    fn copy_changed_part(&self, from: usize, to: usize, counted: &'static [AtomicU64; 2]) {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -4291,8 +4473,8 @@ impl Shadow {
                 at = next;
             }
         });
-        WHOLE_CHANGED[0].fetch_add(same, Ordering::Relaxed);
-        WHOLE_CHANGED[1].fetch_add(new, Ordering::Relaxed);
+        counted[0].fetch_add(same, Ordering::Relaxed);
+        counted[1].fetch_add(new, Ordering::Relaxed);
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4539,6 +4721,16 @@ impl Shadow {
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
+            }
+            // Only the 4 KiB parts that differ from the CPU's side
+            // ([`send_parts`]).
+            if self.card.is_some() && !self.window && send_parts() && (known || self.written()) && !crate::host::upcheck::on() {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (a, b) = (from.max(start), to.min(end));
+                if a < b {
+                    self.copy_changed_part(a, b, &PARTS_SENT);
+                }
+                return to - from;
             }
             return self.copy(from, to);
         };
