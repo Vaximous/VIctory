@@ -9635,6 +9635,7 @@ impl Meter {
         upq::line(frames);
         rec::line(frames);
         crate::pipeline::early_depth_line();
+        crate::pipeline::dead_line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

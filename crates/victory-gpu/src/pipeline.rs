@@ -338,6 +338,79 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     rests: 0,
 });
 
+/// `VICTORY_SKIP_DEAD_PASSES` (on by default; `0` off): the draws and dispatches of
+/// the title's pipelines in [`DEAD`] are left out. Each was found, on a recorded frame
+/// of the open world (`victory replay --effects`), to change nothing of what the frame
+/// writes by its end beyond what differs between unchanged runs anyway, the picture
+/// included: what it writes is written over before anything reads it, or never read,
+/// so neither the next frame nor the title could see it, judged both from the
+/// recorded memory and from zeros (in a still scene a pass may only write again
+/// what its last frame left). `VICTORY_DEAD_PASSES` (hashes separated by commas)
+/// replaces the list, for trials.
+#[cfg(windows)]
+pub(crate) fn skip_dead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_DEAD_PASSES").is_none_or(|v| v != "0"))
+}
+
+/// The title's shaders (by the hash the log names them with) whose pipelines'
+/// work has no effect ([`skip_dead`]), with the card's time each took on the
+/// recorded frame (a replay, so over the card's memory budget).
+const DEAD: &[&str] = &[
+    // CS_HorizonVehicleLightCulling: one group of 64, 24.7 ms. On the recorded
+    // (daylight) frame it finds no light; it may find some at night.
+    "2cfa4a6ad9ef005a",
+    // CS_LaserLightShadowRaytracing: under 0.04 ms.
+    "32ed072b9f845048",
+    // CS_IrradianceCache_ShadeVerify: under 0.04 ms.
+    "5a51983c7d66607b",
+];
+
+/// [`DEAD`], or `VICTORY_DEAD_PASSES` in its place.
+fn dead_list() -> &'static [String] {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| match std::env::var("VICTORY_DEAD_PASSES") {
+        Ok(list) => list.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect(),
+        Err(_) => DEAD.iter().map(|h| (*h).to_owned()).collect(),
+    })
+}
+
+/// Since the last frame-rate line: draws and dispatches left out as dead
+/// ([`skip_dead`]); and pipelines found dead, since the start.
+pub(crate) static DEAD_SKIPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+fn of_dead(shaders: &[Arc<Shader>]) -> bool {
+    let dead = skip_dead() && shaders.iter().any(|s| dead_list().iter().any(|h| *h == s.hash));
+    if dead {
+        DEAD_SKIPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    dead
+}
+
+/// Whether the work of `this` is left out as dead ([`skip_dead`]); counted.
+#[cfg(windows)]
+pub(crate) fn is_dead(this: This) -> bool {
+    let dead = !this.is_null() && pipeline(this).dead;
+    if dead {
+        DEAD_SKIPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    dead
+}
+
+/// For the frame-rate line: [`DEAD_SKIPS`].
+pub(crate) fn dead_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let skipped = DEAD_SKIPS[0].swap(0, Relaxed) as f64 / frames;
+    let pipelines = DEAD_SKIPS[1].load(Relaxed);
+    if pipelines > 0 {
+        tracing::info!(
+            "dead passes left out per frame (VICTORY_SKIP_DEAD_PASSES): {skipped:.1} draws and dispatches, of {pipelines} pipelines of {} shaders",
+            dead_list().len()
+        );
+    }
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -496,6 +569,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Its work is left out as dead ([`skip_dead`]).
+    #[cfg(windows)]
+    dead: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -699,6 +775,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        dead: of_dead(&shaders),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
