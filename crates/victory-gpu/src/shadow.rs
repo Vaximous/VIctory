@@ -1755,6 +1755,10 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n >= 2 && each_by_items() {
+        wide_each_items(n, work);
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -1773,6 +1777,119 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
         })
         .collect();
     wide(jobs);
+}
+
+/// Whether [`wide_each`] returns once every number is done, not once every
+/// thread it woke has had its turn (`VICTORY_EACH_ITEMS`, on unless `0`).
+///
+/// Each kept thread took a job that asks for numbers until none are left,
+/// and the caller waited for every job: a thread woken while every core was
+/// busy ran its job only when the work was long done, found nothing, and the
+/// caller waited for it all the same. Here the numbers done are counted and
+/// the caller, which takes numbers itself meanwhile, waits for the last; a
+/// late thread finds none and is gone.
+///
+/// Ported from NitricAcidDev/VIctory-Omega-Fork, commit 071fd7b (GPL-3.0,
+/// as this): there frames were 0.5 ms shorter in 19 of 30 paired turns. The
+/// helpers' jobs carry no call's number here, so a caller of [`wide`] never
+/// runs one while it waits.
+fn each_by_items() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_EACH_ITEMS").is_none_or(|v| v != "0"));
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_EACH_ITEMS") {
+        return on;
+    }
+    on
+}
+
+/// [`wide_each`] with [`each_by_items`]: what the caller and the threads share.
+struct Each<W> {
+    next: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicUsize,
+    n: usize,
+    work: W,
+    finished: Mutex<bool>,
+    all: std::sync::Condvar,
+}
+
+impl<W: Fn(usize)> Each<W> {
+    /// Takes numbers and does them until there are none; whoever does the
+    /// last one says so.
+    fn run(&self) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.n {
+                return;
+            }
+            (self.work)(i);
+            if self.done.fetch_add(1, Ordering::AcqRel) + 1 == self.n {
+                *self.finished.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.all.notify_all();
+            }
+        }
+    }
+}
+
+fn wide_each_items<W: Fn(usize) + Send + Sync + 'static>(n: usize, work: W) {
+    let each = Arc::new(Each {
+        next: std::sync::atomic::AtomicUsize::new(0),
+        done: std::sync::atomic::AtomicUsize::new(0),
+        n,
+        work,
+        finished: Mutex::new(false),
+        all: std::sync::Condvar::new(),
+    });
+    let workers = workers();
+    let helpers = wide_threads().min(n - 1);
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..helpers {
+            let each = each.clone();
+            workers.there.fetch_add(1, Ordering::AcqRel);
+            // Number 0: no call of [`wide`] has it, so none runs this job
+            // while it waits.
+            queue.push_back((0, Box::new(move || each.run()) as Job));
+        }
+    }
+    if wake_few() && helpers < wide_threads() {
+        (0..helpers).for_each(|_| workers.more.notify_one());
+    } else {
+        workers.more.notify_all();
+    }
+    let _wide = crate::timeline::span("work spread over threads");
+    each.run();
+    if each.done.load(Ordering::Acquire) == n {
+        return;
+    }
+    // The last numbers are being done by threads that took them.
+    spin(|| each.done.load(Ordering::Acquire) == n);
+    let mut finished = each.finished.lock().unwrap_or_else(|e| e.into_inner());
+    while !*finished {
+        finished = each.all.wait(finished).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+#[cfg(test)]
+mod each_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Every number once, all of them done when the call returns, again and
+    /// again with the late threads of the calls before still about.
+    #[test]
+    fn every_number_is_done_once_before_the_call_returns() {
+        for n in [2usize, 3, 7, 64, 1000] {
+            for _ in 0..20 {
+                let seen: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+                let s = seen.clone();
+                super::wide_each_items(n, move |i| {
+                    s[i].fetch_add(1, Ordering::Relaxed);
+                });
+                assert!(seen.iter().all(|c| c.load(Ordering::Relaxed) == 1), "n {n}");
+            }
+        }
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
