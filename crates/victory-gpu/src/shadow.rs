@@ -1209,6 +1209,83 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     }
 }
 
+/// [`copy_all`] into memory the card reads from (upload memory, which is
+/// write-combined): with streaming stores, which go to memory without
+/// passing through the caches or reading the lines they fill first
+/// (`VICTORY_STREAM_SENDS=0`: plain copies). The destinations are 16-byte
+/// aligned (the sends' offsets are). Run ow68-move sent 7.5 MB a frame so,
+/// read back from the CPU sides.
+pub(crate) fn copy_all_streaming(copies: Vec<(usize, usize, usize)>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_SENDS").is_none_or(|v| v != "0")) {
+        copy_all(copies);
+        return;
+    }
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    #[cfg(feature = "diagnostics")]
+    STREAMED.fetch_add(bytes as u64, Ordering::Relaxed);
+    if bytes > 4 << 20 && copies.len() > 1 {
+        let copies = Arc::new(copies);
+        wide_each(copies.len(), move |i| {
+            let (src, dst, len) = copies[i];
+            // SAFETY: the caller's ranges.
+            unsafe { stream_copy(src as *const u8, dst as *mut u8, len) };
+        });
+        return;
+    }
+    for (src, dst, len) in copies {
+        // SAFETY: the caller's ranges.
+        unsafe { stream_copy(src as *const u8, dst as *mut u8, len) };
+    }
+}
+
+/// Diagnostics: bytes sent by [`copy_all_streaming`] since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) static STREAMED: AtomicU64 = AtomicU64::new(0);
+
+/// `len` bytes from `src` to `dst` with streaming stores where `dst` is
+/// 16-byte aligned (the rest plainly), fenced before it returns so that the
+/// bytes are in memory for whoever is told next.
+///
+/// # Safety
+/// As [`std::ptr::copy_nonoverlapping`].
+unsafe fn stream_copy(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+        let head = (dst as usize).wrapping_neg() & 15;
+        if len < 256 || head > len {
+            // SAFETY: the caller's.
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            return;
+        }
+        // SAFETY: the caller's ranges; the stores are to 16-byte aligned
+        // addresses inside `dst`'s; SSE2 is in every x86-64.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, head);
+            let (src, dst, n) = (src.add(head), dst.add(head), len - head);
+            let blocks = n / 64;
+            for i in 0..blocks {
+                let s = src.add(i * 64).cast::<__m128i>();
+                let d = dst.add(i * 64).cast::<__m128i>();
+                let (a, b, c, e) = (_mm_loadu_si128(s), _mm_loadu_si128(s.add(1)), _mm_loadu_si128(s.add(2)), _mm_loadu_si128(s.add(3)));
+                _mm_stream_si128(d, a);
+                _mm_stream_si128(d.add(1), b);
+                _mm_stream_si128(d.add(2), c);
+                _mm_stream_si128(d.add(3), e);
+            }
+            let done = blocks * 64;
+            std::ptr::copy_nonoverlapping(src.add(done), dst.add(done), n - done);
+            _mm_sfence();
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: the caller's.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, len)
+    };
+}
+
 /// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
 /// goes up to the copies in the card's memory that hold it, whether their
 /// CPU side held the same before or not. Left out is what shaders in the air

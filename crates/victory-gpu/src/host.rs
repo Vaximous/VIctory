@@ -8471,6 +8471,13 @@ fn split_line(frames: f64) {
         st[4]
     );
     let fs: Vec<f64> = FRONT_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let js: Vec<f64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "front spans per frame joined where they are of one copy and overlap or touch (VICTORY_JOIN_SPANS): {:.0} asked for, {:.0} after;          sends streamed into upload memory since the start (VICTORY_STREAM_SENDS): {:.0} MB",
+        js[0],
+        js[1],
+        crate::shadow::STREAMED.load(Ordering::Relaxed) as f64 / 1e6,
+    );
     tracing::info!(
         "refreshes in front per frame, the submitting thread: {:.2} ms telling which copy nothing, {:.2} asking ahead, {:.2} refreshing on the threads; \
          pieces of long spans looked at {:.0}, {:.0} of them copy nothing, {:.0} MB left (VICTORY_PIECE_LOOKS)",
@@ -8816,6 +8823,57 @@ fn steps_beside_refresh() -> bool {
 pub(crate) fn refresh_pieces() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_PIECES").is_none_or(|v| v != "0"))
+}
+
+/// Whether the spans of a flush of refreshes that are of one copy and
+/// overlap or touch are made one before anything is looked at
+/// (`VICTORY_JOIN_SPANS=0`: each as asked). A copy bound by many draws of a
+/// list came as many spans of it, each looked at, asked about and refreshed
+/// on its own: some 9,000 a frame in run ow68-move, 8,000 of them copying
+/// nothing.
+fn join_spans() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_SPANS").is_none_or(|v| v != "0"))
+}
+
+/// Diagnostics, since the last line: front spans asked for, and after
+/// [`joined_spans`].
+static JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `spans` with those of one copy that overlap or touch made one
+/// ([`join_spans`]), copies in their first span's order.
+fn joined_spans(
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    JOINED[0].fetch_add(spans.len() as u64, Ordering::Relaxed);
+    if !join_spans() || spans.len() < 2 {
+        JOINED[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        return spans;
+    }
+    let mut keyed: Vec<(usize, usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize))> = spans
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| (std::sync::Arc::as_ptr(&s.0) as usize, i, s))
+        .collect();
+    keyed.sort_unstable_by_key(|k| (k.0, k.2.1));
+    let mut out: Vec<(usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize))> = Vec::with_capacity(keyed.len());
+    let mut last: Option<usize> = None;
+    for (copy, i, span) in keyed {
+        if let Some(l) = last
+            && let Some((first, (_, _, to))) = out.last_mut()
+            && l == copy
+            && span.1 <= *to
+        {
+            *to = (*to).max(span.2);
+            *first = (*first).min(i);
+            continue;
+        }
+        last = Some(copy);
+        out.push((i, span));
+    }
+    out.sort_unstable_by_key(|o| o.0);
+    JOINED[1].fetch_add(out.len() as u64, Ordering::Relaxed);
+    out.into_iter().map(|o| o.1).collect()
 }
 
 /// The bytes of a piece of [`refresh_pieces`]: whole pages of the copies'
@@ -9643,6 +9701,7 @@ impl Batch {
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        let spans = joined_spans(spans);
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
