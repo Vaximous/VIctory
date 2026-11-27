@@ -602,12 +602,12 @@ fn need(block: usize) {
     });
 }
 
-/// `VICTORY_WAVE_ALIKE=0`: [`lane_uniform`] proves only what it did before: no value written
+/// `VICTORY_WAVE_ALIKE=1` (off by default): [`lane_uniform`] proves more; off, only what it did before: no value written
 /// under a condition, no phi past a branch on alike values, no loop-carried value and no
 /// thread id shifted past the console wave.
 fn wave_alike_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ALIKE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ALIKE").is_some_and(|v| v != "0"))
 }
 
 /// VGPR values that are the same in every lane of a console wave holding them (`all` is
@@ -1254,7 +1254,7 @@ fn lds_meetings(
     }
     // A region that reads and writes LDS is still taken when it only raises a flag: a read
     // that misses the other host wave's write changes nothing the region leaves behind.
-    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_some_and(|v| v != "0");
     let mut racy = Vec::new();
     let mut refused = false;
     for r in (0..n).filter(|&r| reads[r] && writes[r]) {
