@@ -258,6 +258,39 @@ fn recheck_prints(
     found
 }
 
+/// The longest wait, in milliseconds, between two looks at a texture slot
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`, 1000; 0:
+/// about four seconds counted in passes, as before). The looks back off 1,
+/// 2, 4, ... frames up to it. After Belobug/VIctory-Belobug-AMD 9386b828
+/// (GPL-3.0): counted in passes it came to 13-18 s, long after the memory
+/// had come.
+fn look_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_LOOK_MS")
+            .ok()
+            .map_or(Some(1000), |v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+    })
+}
+
+/// The milliseconds of a frame lately (a mean over the last frames), from
+/// the pass's frame number and clock.
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    static LAST: std::sync::Mutex<(u64, u64, f64)> = std::sync::Mutex::new((0, 0, 50.0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_frame, was_ms, mean) = *last;
+    if frame > was_frame {
+        if was_frame != 0 {
+            let each = now.saturating_sub(was_ms) as f64 / (frame - was_frame) as f64;
+            last.2 = mean * 0.9 + each.clamp(1.0, 2000.0) * 0.1;
+        }
+        last.0 = frame;
+        last.1 = now;
+    }
+    (last.2 as u64).max(1)
+}
+
 /// Whether the first upload of a texture with no host copy yet goes on the
 /// copy queue of `crate::texture::ahead` (`VICTORY_AHEAD_FIRST=0`: not).
 fn ahead_first() -> bool {
@@ -2818,7 +2851,13 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // (`took` is since the last pass, of any heap and list: several a
+        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
+        // second; [`look_ms`] counts by the frame's time.)
+        let most = match look_ms() {
+            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
+            None => (4000 / took).clamp(16, 256),
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
