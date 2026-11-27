@@ -2519,8 +2519,14 @@ fn send_parts() -> bool {
 /// [`whole_changed`] read title memory once, in place, against the CPU's
 /// side (`safecopy::changed`: 32 bytes a step, put in where they differ),
 /// and not through a copy of every 4 KiB first, compared and copied again
-/// (`VICTORY_COMPARE_IN_PLACE`, off unless `=1`: off since run ow31-move
-/// showed banding in a dim interior, until a review or an A/B clears it). With [`landed_parts`] run
+/// (`VICTORY_COMPARE_IN_PLACE`, off unless `=1`). Run ow38-move with it on
+/// ended in heavy banding: its records of 32 bytes were counted from the
+/// range's start, so from an unaligned start each lay across two 4 KiB
+/// pieces, and a byte that differed at the head of one piece sent the piece
+/// before it too, which held no byte of the title's that differed. There the
+/// card's side may hold what the CPU's does not (what shaders wrote and is
+/// left on the card), and it went up over that. The records are aligned to
+/// their size now, and a piece goes up only for a byte of its own. With [`landed_parts`] run
 /// ow29-move compared 100 MB a frame to send 4.9 MB, and the copies' time
 /// went from 19.4 to 26.4 ms a frame. What is sent is the same: each
 /// 4 KiB piece in which a byte differed, whole.
@@ -3360,6 +3366,83 @@ mod in_place_tests {
         assert!(results[0].1 == results[1].1, "the CPU's sides differ");
         assert_eq!(results[0].0, [(KERNEL_PAGE, 2 * KERNEL_PAGE), (3 * KERNEL_PAGE, 4 * KERNEL_PAGE + 45)]);
         drop(room);
+    }
+
+    /// From an unaligned start, a byte that differs at the head of a 4 KiB
+    /// piece sends that piece alone, not the one before it (run ow38-move).
+    #[test]
+    fn a_change_at_a_piece_head_sends_no_piece_before_it() {
+        const PAGES: usize = 3;
+        let room = vec![7u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = (room.as_ptr() as usize).next_multiple_of(KERNEL_PAGE);
+        // SAFETY: in `room`.
+        unsafe { ((title + KERNEL_PAGE) as *mut u8).write_volatile(1) };
+        let mut side = vec![7u8; PAGES * KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        assert!(copy.copy_changed_in_place(title + 5, title + PAGES * KERNEL_PAGE, &WHOLE_CHANGED));
+        assert_eq!(copy.take_dirty(), [(KERNEL_PAGE, 2 * KERNEL_PAGE)]);
+        drop(copy);
+        assert_eq!(side[KERNEL_PAGE], 1);
+        drop(room);
+    }
+
+    /// As above over many random ranges (past 64 KiB calls, unaligned at
+    /// both ends) and random changes, some with a page of title memory that
+    /// cannot be read in the middle.
+    #[test]
+    fn in_place_takes_what_the_staged_compare_takes_at_random() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect};
+        assert!(crate::safecopy::on());
+        const PAGES: usize = 72;
+        let len = PAGES * KERNEL_PAGE;
+        // SAFETY: plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for round in 0..3000 {
+            // SAFETY: the allocation, read-write again.
+            let mut old = 0;
+            unsafe { VirtualProtect(title as *const _, len, PAGE_READWRITE, &mut old) };
+            let base = (round % 7) as u8;
+            // SAFETY: the allocation.
+            unsafe { std::ptr::write_bytes(title as *mut u8, base, len) };
+            let side_was = vec![base; len];
+            for _ in 0..next() % 40 {
+                let at = next() % len;
+                // SAFETY: inside the allocation.
+                unsafe { ((title + at) as *mut u8).write_volatile(next() as u8 | 0x80) };
+            }
+            let hole = (round % 3 == 0).then(|| next() % PAGES);
+            if let Some(page) = hole {
+                // SAFETY: one page of the allocation.
+                unsafe { VirtualProtect((title + page * KERNEL_PAGE) as *const _, KERNEL_PAGE, PAGE_NOACCESS, &mut old) };
+            }
+            let a = next() % len;
+            let b = next() % len;
+            let (from, to) = (title + a.min(b), title + a.max(b) + 1);
+            let mut results = Vec::new();
+            for in_place in [true, false] {
+                let mut side = side_was.clone();
+                let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), len as u64, true);
+                if !in_place || !copy.copy_changed_in_place(from, to, &WHOLE_CHANGED) {
+                    copy.copy_changed_staged(from, to, &WHOLE_CHANGED);
+                }
+                let mut dirty = copy.take_dirty();
+                dirty.sort_unstable();
+                drop(copy);
+                results.push((super::joined(dirty), side));
+            }
+            assert_eq!(results[0].0, results[1].0, "round {round}: what is sent differs ({hole:?})");
+            assert!(results[0].1 == results[1].1, "round {round}: the CPU's sides differ ({hole:?})");
+        }
+        // SAFETY: ours.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
     }
 }
 
@@ -4923,10 +5006,31 @@ impl Shadow {
         let mut all = true;
         BITS.with_borrow_mut(|bits| {
             let mut at = from;
+            // The bytes `[a, b)` (less than a record) as the staged way
+            // takes them: whether they were new.
+            let bytes = |a: usize, b: usize| {
+                if a >= b {
+                    return false;
+                }
+                let mut title = [0u8; RECORD];
+                let title = &mut title[..b - a];
+                crate::host::copy_mapped(title.as_mut_ptr(), a as *const u8, b - a, false);
+                // SAFETY: as below.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(a - start), b - a) };
+                if title != held {
+                    held.copy_from_slice(title);
+                    return true;
+                }
+                false
+            };
             while at < to {
                 let next = ((at / CHUNK + 1) * CHUNK).min(to);
-                let records = (next - at) / RECORD;
-                let tail = at + records * RECORD;
+                // Records at addresses that are multiples of theirs, so that
+                // none lies in two 4 KiB pieces: a byte that differed marks
+                // its own piece, and no other.
+                let first = at.next_multiple_of(RECORD).min(next);
+                let records = (next - first) / RECORD;
+                let tail = first + records * RECORD;
                 bits.clear();
                 bits.resize(records.div_ceil(64).max(1), 0);
                 // SAFETY: the CPU's side holds the copy's bytes at its
@@ -4934,27 +5038,17 @@ impl Shadow {
                 // shader's range holds them, and the parts lie apart); the
                 // bits are zeroed and enough for the records.
                 let read = records == 0
-                    || unsafe { crate::safecopy::changed(at as *const u8, self.data.add(at - start), records, bits) };
-                // The bytes behind the last record, as the staged way does.
-                let mut tail_new = false;
-                if read && tail < next {
-                    let mut title = [0u8; RECORD];
-                    let title = &mut title[..next - tail];
-                    crate::host::copy_mapped(title.as_mut_ptr(), tail as *const u8, next - tail, false);
-                    // SAFETY: as above.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(tail - start), next - tail) };
-                    if title != held {
-                        held.copy_from_slice(title);
-                        tail_new = true;
-                    }
-                }
+                    || unsafe { crate::safecopy::changed(first as *const u8, self.data.add(first - start), records, bits) };
+                // The bytes ahead of the first record and behind the last,
+                // as the staged way does.
+                let (head_new, tail_new) = if read { (bytes(at, first), bytes(tail, next)) } else { (false, false) };
                 // Each 4 KiB piece with a record that differed goes up whole,
                 // as the staged way sends it.
                 let mut piece = at;
                 while piece < next {
                     let end = ((piece / KERNEL_PAGE + 1) * KERNEL_PAGE).min(next);
-                    let (r0, r1) = ((piece - at) / RECORD, (end - at).div_ceil(RECORD).min(records));
-                    let differed = (r0..r1).any(|r| bits[r / 64] >> (r % 64) & 1 != 0) || tail_new && end > tail;
+                    let (r0, r1) = (piece.saturating_sub(first) / RECORD, (end.max(first) - first).div_ceil(RECORD).min(records));
+                    let differed = (r0..r1).any(|r| bits[r / 64] >> (r % 64) & 1 != 0) || head_new && piece < first || tail_new && end > tail;
                     if differed {
                         new += (end - piece) as u64;
                         self.changed(piece - start, end - start);
