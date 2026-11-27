@@ -2418,10 +2418,13 @@ impl HostHeap {
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
             let old = view_at(shown as u32, (shown >> 32) as u32);
-            let kept = old.is_some_and(|old| match kin(&old, &view) {
+            let kept = old.as_ref().is_some_and(|old| match kin(old, &view) {
                 Kin::Same => true,
-                kin => crate::resource::room_lately() && kin.kept(keep_shown()),
+                kin => (keep_when_full() || crate::resource::room_lately()) && kin.kept(keep_shown()),
             });
+            if shown != 0 && !kept && old.as_ref().is_some_and(is_texture_view) {
+                went_grey(index);
+            }
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(index, shown, "neutral");
@@ -3635,6 +3638,13 @@ impl HostHeap {
                 super::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            if later
+                && !keep_views()
+                && is_texture_view(&view)
+                && view_at(shown as u32, (shown >> 32) as u32).as_ref().is_some_and(is_texture_view)
+            {
+                went_grey(index);
+            }
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -3657,13 +3667,14 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
+                    let kept = (keep_when_full() || crate::resource::room_lately()) && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
                         self.unmake_stale(index, stale);
                         return Some(view);
                     }
+                    went_grey(index);
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -4894,7 +4905,32 @@ fn keep_shown() -> u8 {
         return if on { 2 } else { 0 };
     }
     static KEEP: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+    *KEEP.get_or_init(|| std::env::var("VICTORY_KEEP_SHOWN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+}
+
+/// Whether a slot keeps showing its old texture while the new one is made
+/// even when the card has had no room lately (`VICTORY_KEEP_SHOWN_FULL=0`:
+/// only with room, after Belobug/VIctory-Belobug-AMD e9428969f0). A slot
+/// that has shown a texture never goes back to the grey stand-in for want
+/// of room: textures went grey at random and came back (fm17).
+fn keep_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SHOWN_FULL").is_none_or(|v| v != "0"))
+}
+
+/// Slots that showed a texture and went back to a stand-in (zeros, the
+/// neutral texture) while a new one was made: should stay 0.
+pub(crate) static WENT_GREY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn went_grey(index: u32) {
+    let n = WENT_GREY.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            so_far = n,
+            slot = index,
+            "a slot that showed a texture went back to a stand-in while its new texture was made (should not happen)"
+        );
+    }
 }
 
 /// Slots that showed a texture and were written with a view of another,
