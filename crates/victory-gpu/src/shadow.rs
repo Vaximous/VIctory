@@ -126,6 +126,9 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// The copy itself, set once it is in an `Arc` ([`carded`]): put on
+    /// [`TOUCHED`] when `touched` is set.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -363,6 +366,37 @@ fn late_take(size: u64) -> bool {
 
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// The copies in the card's memory whose `touched` was set since
+/// [`card_dirty`] last took them (a copy may be on it twice). Without it each
+/// submission looked at every copy (some 3,900 in the first gameplay area,
+/// about 28 submissions a frame) to find the few dozen with changes.
+/// Ported from VIctory-NVIDIA 441446d47 (GPL-3.0).
+static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// Whether [`card_dirty`] takes [`TOUCHED`] (`VICTORY_TOUCHED_LIST`, on;
+/// =0 it walks every copy in the card's memory, as before).
+fn touched_list() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TOUCHED_LIST").is_none_or(|v| v != "0"))
+}
+
+/// `shadow`, just made with a card side, is noted among the copies in the
+/// card's memory; the copies let go are dropped from the list once it has
+/// doubled since that was last done.
+fn carded(shadow: &Arc<Shadow>) {
+    static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(card) = &shadow.card else {
+        return;
+    };
+    let _ = card.me.set(Arc::downgrade(shadow));
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.push(Arc::downgrade(shadow));
+    if touched_list() && carded.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
+        carded.retain(|weak| weak.strong_count() > 0);
+        KEPT.store(carded.len(), Ordering::Relaxed);
+    }
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -691,12 +725,8 @@ impl SentRuns {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
+    let take = |shadow: Arc<Shadow>, out: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| {
         let ranges = shadow
             .card
             .as_ref()
@@ -715,6 +745,21 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
+    };
+    if touched_list() {
+        let mut touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+        touched.sort_unstable_by_key(|weak| weak.as_ptr() as usize);
+        touched.dedup_by(|a, b| a.ptr_eq(b));
+        for shadow in touched.iter().filter_map(std::sync::Weak::upgrade) {
+            take(shadow, &mut out);
+        }
+        return out;
+    }
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| {
+        let Some(shadow) = weak.upgrade() else {
+            return false;
+        };
+        take(shadow, &mut out);
         true
     });
     out
@@ -1625,6 +1670,11 @@ fn workers() -> &'static Workers {
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
+fn wake_few() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAKE_FEW").is_none_or(|v| v != "0"))
+}
+
 fn wide(jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
@@ -1634,6 +1684,13 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // Helpers woken: one for each job beyond the one this thread takes
+    // first, at most all of them (`VICTORY_WAKE_FEW`, on; =0 all for every
+    // call). Those woken for nothing went back to sleep, a system call each
+    // on this thread; a helper busy meanwhile looks at the queue before it
+    // sleeps again, and this thread takes what nobody took.
+    // Ported from VIctory-NVIDIA 8c1fa5d57 (GPL-3.0).
+    let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1650,7 +1707,11 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= wide_threads() || !wake_few() {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -4592,7 +4653,11 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = card.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4889,6 +4954,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: std::sync::OnceLock::new(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -5045,6 +5111,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                me: std::sync::OnceLock::new(),
             size: len as u64,
         });
         Some(shadow)
@@ -5492,6 +5559,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                me: std::sync::OnceLock::new(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5517,7 +5585,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5720,10 +5788,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        me: std::sync::OnceLock::new(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    carded(&shadow);
     Some(shadow)
 }
 
@@ -5817,6 +5886,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: std::sync::OnceLock::new(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5835,7 +5905,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
