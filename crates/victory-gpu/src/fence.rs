@@ -35,8 +35,30 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// with when they were asked for.
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+}
+
+/// The title's events on fences not reached yet, set since the last frame
+/// line: how many, microseconds from the asking to the set, the longest. A
+/// title thread that waits for its event stands that long (unless it had
+/// other work); they are set when the relay lands what is ahead of them.
+static ASKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The frame line of [`ASKED`], per frame.
+pub(crate) fn line(frames: f64) {
+    let [n, us, most] = [0, 1, 2].map(|i| ASKED[i].swap(0, Ordering::Relaxed));
+    if n == 0 {
+        return;
+    }
+    tracing::info!(
+        "the title's events on fences per frame: {:.1} asked before the value was reached, {:.2} ms from the asking to the set in all, {:.2} ms on average, the longest {:.2} ms",
+        n as f64 / frames,
+        us as f64 / 1e3 / frames,
+        us as f64 / 1e3 / n as f64,
+        most as f64 / 1e3
+    );
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -148,7 +170,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -158,10 +180,14 @@ pub(crate) fn set(this: This, value: u64) {
     crate::timeline::told("a fence set", this as usize, value);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            let us = asked.elapsed().as_micros() as u64;
+            ASKED[0].fetch_add(1, Ordering::Relaxed);
+            ASKED[1].fetch_add(us, Ordering::Relaxed);
+            ASKED[2].fetch_max(us, Ordering::Relaxed);
         }
         !reached
     });
