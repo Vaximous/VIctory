@@ -312,6 +312,13 @@ impl Notes {
         self.read(shard_of(page)).parts_since(page, taken)
     }
 
+    /// Diagnostics: the asking that last found each part of `page` written,
+    /// if its parts are noted apart.
+    #[cfg(feature = "diagnostics")]
+    fn parts_of(&self, page: usize) -> Option<[u64; PARTS]> {
+        self.read(shard_of(page)).parts.get(&page).copied()
+    }
+
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
@@ -1059,6 +1066,8 @@ fn kernel_ask(start: usize, end: usize, pages: &mut Vec<(usize, u16)>) -> bool {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let asked = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _ours = crate::resetwatch::Ours::mark();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
             GetWriteWatch(
@@ -1996,16 +2005,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// the asking that stands, and the asking the journal last found it written
 /// (0: never); and whether it lies in a [`WATCHED`] run.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn audit_page(at: usize) -> (bool, bool, u64, u64, bool) {
+pub(crate) fn audit_page(at: usize) -> (bool, bool, u64, u64, bool, Option<[u64; PARTS]>) {
     let page = at / PAGE;
     let published = published(page * PAGE, (page + 1) * PAGE);
     let j = journal();
     let holds = j.ahead.holds(page, page + 1);
     let note = j.notes.range(page, page + 1).first().map_or(0, |n| n.1);
+    let parts = j.notes.parts_of(page);
     let asked = j.ahead_asked;
     drop(j);
     let watched = WATCHED.read().unwrap_or_else(|e| e.into_inner()).range(..=page).next_back().is_some_and(|(_, &b)| page < b);
-    (published, holds, asked, note, watched)
+    (published, holds, asked, note, watched, parts)
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
@@ -2547,6 +2557,8 @@ pub(crate) fn port_guard_line(frames: f64) {
     );
     once_split_line(frames);
     crate::safecopy::merge_line(frames);
+    #[cfg(feature = "diagnostics")]
+    crate::resetwatch::line(frames);
     #[cfg(feature = "diagnostics")]
     {
         let f: Vec<f64> = FOUND_REFUSED.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();

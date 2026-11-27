@@ -76,6 +76,8 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
+#[cfg(feature = "diagnostics")]
+mod resetwatch;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]

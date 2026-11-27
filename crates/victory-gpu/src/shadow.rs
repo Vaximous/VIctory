@@ -5439,11 +5439,13 @@ impl Shadow {
         let differ = held.iter().zip(&title[..n]).filter(|(a, b)| a != b).count();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(at / PAGE - start / PAGE).copied().unwrap_or(0);
         let ranged = *self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        let (published, holds, asked, note, watched) = crate::watch::audit_page(at);
+        let (published, holds, asked, note, watched, parts) = crate::watch::audit_page(at);
+        let part = at % PAGE / KERNEL_PAGE;
+        let last_stamp = STAMPS.lock().unwrap_or_else(|e| e.into_inner()).get(&(self.id, at / PAGE)).copied();
         Some(format!(
             "copy {} {start:#x}+{:#x} card {} window {} watched-state {}: part {at:#x} {differ} bytes differ; page copied after asking {copied}, ranged {:?}; \
              journal: bit published {published}, ahead holds {holds}, asking standing {asked}, page last found written {note}; in a watched run {watched}; \
-             the copy has landings {} (this page noted {landed}); guards: {}",
+             the copy has landings {} (this page noted {landed}); part {part} of the page: its journal stamps {:?}; the copy that last stamped the page: {}; guards: {}",
             self.id,
             self.len,
             self.card.is_some(),
@@ -5451,6 +5453,12 @@ impl Shadow {
             self.watched.load(Ordering::Relaxed),
             ranged,
             self.landing.load(Ordering::Acquire),
+            parts,
+            last_stamp.map_or("none kept".to_string(), |(now, taken, mask)| format!(
+                "at asking {now}, the page taken before at {taken} ({}), parts taken {mask:#06x}, this part {}",
+                if taken == 0 { "never: whole" } else { "again: the parts written since" },
+                if mask >> part & 1 != 0 { "taken" } else { "not taken" },
+            )),
             crate::watch::audit_block(at),
         ))
     }
@@ -5767,7 +5775,10 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
-        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        let parts = crate::watch::parts_written(&again_at);
+        #[cfg(feature = "diagnostics")]
+        stamped(self.id, base, &copied, now, from, to, &again_at, &parts);
+        let runs = by_parts(runs, &again_at, &parts);
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
@@ -7701,3 +7712,32 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// Diagnostics: per copy and 64 KiB page, the asking a refresh last stamped
+/// the page copied at, the asking it had been taken at before (0: never),
+/// and the 4 KiB parts that refresh took of it ([`Shadow::audit`]).
+#[cfg(feature = "diagnostics")]
+static STAMPS: Mutex<std::collections::BTreeMap<(u64, usize), (u64, u64, u16)>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Diagnostics: [`STAMPS`] of the pages [`Shadow::copy_stale`] stamps: those
+/// of `[from, to)` whose stamp in `copied` (from page `base` on) is `now`.
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::too_many_arguments)]
+fn stamped(id: u64, base: usize, copied: &[u64], now: u64, from: usize, to: usize, again: &[(usize, u64)], parts: &[u16]) {
+    let mut s = STAMPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut again = again.iter().zip(parts).peekable();
+    for page in from / PAGE..to.div_ceil(PAGE) {
+        if copied.get(page - base) != Some(&now) {
+            continue;
+        }
+        while again.peek().is_some_and(|((p, _), _)| *p < page) {
+            again.next();
+        }
+        let entry = match again.peek() {
+            Some(((p, taken), mask)) if *p == page => (now, *taken, **mask),
+            _ => (now, 0, u16::MAX),
+        };
+        s.insert((id, page), entry);
+    }
+}
+
