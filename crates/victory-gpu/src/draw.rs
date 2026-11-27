@@ -169,6 +169,9 @@ thread_local! {
     static PASS_ONLY: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
     /// The slots the last targeted pass found due ([`PASS_ONLY`]).
     static PASS_FOUND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// A targeted pass that catches up: it goes on with the list the last
+    /// one for the same frames took ([`CATCH_LIST`]), not the whole queue.
+    static PASS_RESUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -541,7 +544,9 @@ fn bake_slice() -> u64 {
 }
 
 /// The frames before a bake whose slot writes its pass takes as the
-/// bake's inputs, and takes alone (`VICTORY_BAKE_RECENT_FRAMES`, 16; 0:
+/// bake's inputs, and takes alone, the newest first (`VICTORY_BAKE_RECENT_FRAMES`, 4
+/// since run ow50b found 16,000 slots written in 16 frames as the world
+/// streamed; 0:
 /// the pass takes all that is due, and kept bakes wait until a pass got
 /// through all of it, run ow48: 77-90 frames). The title writes the views
 /// a bake picks from just before it, or the pages under them (made due
@@ -551,7 +556,7 @@ fn bake_slice() -> u64 {
 fn bake_recent() -> u64 {
     static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FRAMES.get_or_init(|| {
-        std::env::var("VICTORY_BAKE_RECENT_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16)
+        std::env::var("VICTORY_BAKE_RECENT_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4)
     })
 }
 
@@ -567,6 +572,12 @@ fn bake_whole_slice() -> u64 {
 /// Frames a bake draw kept for [`Kept::Safety`] waits for a frame with
 /// nothing due before it is let go.
 const BAKE_SAFETY_FRAMES: u64 = 600;
+
+/// The frames (first, last) and the slots of the last catching-up pass's
+/// targeted list ([`PASS_RESUME`]): the next one for the same frames takes
+/// those still due of them, in their order, without going over the queue
+/// (30,000 slots) and sorting it again.
+static CATCH_LIST: std::sync::Mutex<Option<((u64, u64), Vec<(u32, u64)>)>> = std::sync::Mutex::new(None);
 
 /// The milliseconds the bake passes of frame [`BAKED_FRAME`] have taken.
 static BAKED_MS: AtomicU64 = AtomicU64::new(0);
@@ -3256,9 +3267,13 @@ impl State {
             Target::Only(from, to) => Some((from, to)),
             Target::All => None,
         };
+        // (The flush counts against the slice.)
+        let flushed = began.elapsed();
+        let left = if bake_slice() > 0 && left < 100 { left.saturating_sub(flushed.as_millis() as u64) } else { left };
         let run_pass = left > 0 && !nothing_new;
         let mut served = false;
         let mut found = None;
+        let pass_began = std::time::Instant::now();
         if run_pass {
             let n = EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
@@ -3272,12 +3287,15 @@ impl State {
                     "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (VICTORY_BAKE_TEXTURES_MS=0: not)"
                 );
             }
-            PASS_BUDGET.set(Some((left, 2 << 30, true)));
+            // (In a slice, bytes a slice can upload: the copies are waited for.)
+            PASS_BUDGET.set(Some((left, if left < 100 { 64 << 20 } else { 2 << 30 }, true)));
             if let Some(window) = window {
                 PASS_ONLY.set(Some(window));
+                PASS_RESUME.set(matches!(target, Target::Only(..)));
                 PASS_FOUND.set(0);
                 served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
                 PASS_ONLY.set(None);
+                PASS_RESUME.set(false);
                 found = Some(PASS_FOUND.get());
             } else {
                 BAKE_SERVED.store(0, Ordering::Relaxed);
@@ -3286,6 +3304,8 @@ impl State {
             PASS_BUDGET.set(None);
         }
         crate::texture::BAKING.set(false);
+        let passed = pass_began.elapsed();
+        let run_began = std::time::Instant::now();
         if bake_list.has_recorded_work() {
             bake_list.close();
             gpu.execute_sync_internal(bake_list);
@@ -3293,6 +3313,7 @@ impl State {
         } else if !sync.publish.is_empty() {
             crate::host::settle_for_fence();
         }
+        let ran = run_began.elapsed();
         let published = sync.publish.len();
         let unserved = if nothing_new {
             0
@@ -3334,6 +3355,9 @@ impl State {
                     left,
                     unserved,
                     ms = began.elapsed().as_millis() as u64,
+                    flush_us = flushed.as_micros() as u64,
+                    pass_us = passed.as_micros() as u64,
+                    run_us = ran.as_micros() as u64,
                     "bake trace: a bake's texture pass (unserved: 1 slots written lately still due, 2 untargeted and not through, 4 those written lately there)"
                 );
             }
@@ -3703,6 +3727,23 @@ impl State {
         let due_began = std::time::Instant::now();
         let only = PASS_ONLY.get();
         let (mut due, census) = match only {
+            Some(window) if PASS_RESUME.get() => {
+                let mut kept = CATCH_LIST.lock().unwrap_or_else(|e| e.into_inner());
+                match kept.as_ref().filter(|k| k.0 == window) {
+                    Some((_, list)) => {
+                        let due = host.texture_slots_still_due(list, frame + BAKE_AHEAD[0]);
+                        let (_, census) = host.texture_slots_due(frame, 0);
+                        *kept = Some((window, due.clone()));
+                        (due, census)
+                    }
+                    None => {
+                        let (due, census) =
+                            host.texture_slots_due_written(frame, frame + BAKE_AHEAD[0], window.0, window.1, 1 << 16);
+                        *kept = Some((window, due.clone()));
+                        (due, census)
+                    }
+                }
+            }
             Some((first, last)) => host.texture_slots_due_written(frame, frame + BAKE_AHEAD[0], first, last, 1 << 16),
             None => host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 }),
         };
@@ -3873,9 +3914,12 @@ impl State {
             });
         }
         PASS_PHASES[3].store(premake_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // A bake's pass in a slice of a frame counts its time from its start,
+        // what it did before its slots too ([`bake_slice`]).
+        let clock = if short { pass_began } else { began };
         for (index, write) in due {
             in_system = false;
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || clock.elapsed() > span {
                 served = false;
                 break;
             }

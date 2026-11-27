@@ -1980,15 +1980,27 @@ impl HostHeap {
         last: u64,
         max: usize,
     ) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let (due, census) = {
-            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            let mut due = textures.all_due(upto);
-            for part in &mut due {
-                part.retain(|&(written, _, _)| (first..=last).contains(&written));
-            }
-            (due, textures.census(frame))
-        };
-        (TextureQueue::in_order(due, max), census)
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let [again, fresh] = textures.all_due(upto);
+        let census = textures.census(frame);
+        drop(textures);
+        // The newest write first: what was written just before the bake.
+        let mut due: Vec<(u64, u32, u64)> =
+            again.into_iter().chain(fresh).filter(|&(written, _, _)| (first..=last).contains(&written)).collect();
+        due.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        (due.into_iter().take(max).map(|(_, index, write)| (index, write)).collect(), census)
+    }
+
+    /// Those of `slots` (each with its write number) that are still in the
+    /// queue as written then and due at `upto`, in their order: where a
+    /// targeted pass that caught up left off.
+    pub(crate) fn texture_slots_still_due(&self, slots: &[(u32, u64)], upto: u64) -> Vec<(u32, u64)> {
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .copied()
+            .filter(|&(index, write)| textures.slots.get(&index).is_some_and(|w| w.write == write && w.due <= upto))
+            .collect()
     }
 
     /// A number that changes when a slot is written or made due anew, and
