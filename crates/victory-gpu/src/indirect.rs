@@ -561,6 +561,7 @@ pub(crate) struct Waits {
 
 impl Waits {
     /// Both, as the clamps made them before `VICTORY_CLAMP_WAITS`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const BOTH: Self = Self { before: true, after: true };
 
     /// The waits a clamp recorded into `list` now makes

@@ -747,8 +747,11 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and
+        // not resident (the host makes its memory resident when it is ready,
+        // `host::wait_resident`; the replay never does, and the card lost
+        // the device at the first copy into such a texture).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -1367,9 +1370,10 @@ impl Player {
         // Batches of parts with their place in the buffer.
         let mut batches: Vec<Vec<(usize, u64)>> = vec![Vec::new()];
         let (mut at, mut most) = (0u64, 0u64);
+        let staging = if std::env::var_os("VICTORY_REPLAY_TRACE").is_some() { 1 } else { STAGING };
         for (i, (_, len, _)) in parts.iter().enumerate() {
             at = at.next_multiple_of(512);
-            if at + len > STAGING && at > 0 {
+            if at + len > staging && at > 0 {
                 batches.push(Vec::new());
                 at = 0;
             }
@@ -1436,6 +1440,11 @@ impl Player {
             let sent = worker.send(|l| copy(self, l, &list, &buffer));
             self.worker = worker;
             stagings[k].2 = sent?;
+            if std::env::var_os("VICTORY_REPLAY_TRACE").is_some() {
+                let done = self.worker.idle();
+                eprintln!("upload batch {n} of {}: {}", batches.len(), if done.is_ok() { "ok" } else { "FAILED" });
+                done?;
+            }
         }
         self.worker.idle()?;
         Ok(())
@@ -1479,6 +1488,9 @@ impl Player {
                 }
             }
         })?;
+        if std::env::var_os("VICTORY_REPLAY_TRACE").is_some() {
+            eprintln!("contents: states set ({} early, {} into)", early.len(), into.len());
+        }
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -1486,6 +1498,9 @@ impl Player {
                     continue;
                 };
                 let r = &player.frame.resources[o.index];
+                if std::env::var_os("VICTORY_REPLAY_TRACE").is_some() {
+                    eprintln!("  part of {}: first {} count {} len {len:#x} {:?}", player.called(c.res), c.first, c.count, r.place);
+                }
                 // SAFETY: an open list; live resources.
                 unsafe {
                     if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
@@ -3030,7 +3045,7 @@ impl Player {
         }
         // SAFETY: closed lists whose last run has finished.
         unsafe {
-            for all in &submissions {
+            for (at, all) in submissions.iter().enumerate() {
                 if !o.wait_lists {
                     self.worker.queue.ExecuteCommandLists(all);
                     if o.pace > 0.0 {
@@ -3041,9 +3056,13 @@ impl Player {
                     }
                     continue;
                 }
-                for l in all {
+                for (n, l) in all.iter().enumerate() {
                     self.worker.queue.ExecuteCommandLists(&[l.clone()]);
-                    self.worker.idle()?;
+                    let done = self.worker.idle();
+                    if done.is_err() && std::env::var_os("VICTORY_REPLAY_TRACE").is_some() {
+                        eprintln!("the card was lost at list {n} of {} of step {at}", all.len());
+                    }
+                    done?;
                 }
             }
             self.worker

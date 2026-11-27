@@ -130,6 +130,15 @@ pub(crate) struct Replay {
     /// Name resources the frame changes that the replay does not put back.
     #[arg(long)]
     check_written: bool,
+    /// What each --skip-shader alone changes of everything the frame writes,
+    /// at its end, against this many unchanged runs (noise); from the recorded
+    /// memory and again from zeros. Ends with those that changed nothing.
+    #[arg(long, num_args = 0..=1, default_missing_value = "3")]
+    effects: Option<u32>,
+    /// With --effects: also left out of every run, the unchanged ones too
+    /// (a pipeline that cannot be replayed; may be given several times).
+    #[arg(long = "keep-out")]
+    keep_out: Vec<String>,
     /// Run the frame twice and say which words the copies of the CPU's sides
     /// of card buffers bring that the card holds another value of, and what
     /// shaders wrote that was not declared as written.
@@ -266,7 +275,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         ),
         None => None,
     };
-    let options = Options {
+    let mut options = Options {
         loops: r.loops.max(1),
         restore: !r.no_restore,
         detailed: matches!(r.timing, Timing::Detailed),
@@ -363,6 +372,11 @@ pub(crate) fn run(r: Replay) -> Result<()> {
                 .push(pair(text, ':').with_context(|| format!("--split {text}"))?);
         }
         return player.pixel(&options, &pixels, &mut |line| println!("{line}"));
+    }
+    if let Some(runs) = r.effects {
+        let candidates = std::mem::replace(&mut options.skip_shaders, r.keep_out.clone());
+        let mut player = play::Player::load(&r.folder, &options)?;
+        return player.effects(&options, &candidates, runs, &mut |line| println!("{line}"));
     }
     if r.check_written {
         let mut player = play::Player::load(&r.folder, &options)?;
