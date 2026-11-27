@@ -46,6 +46,8 @@ pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (
 
 /// For the log, over `frames` frames.
 pub(super) fn line(frames: f64) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::memcensus::line(frames);
     let all = MOVED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut all: Vec<_> = all.into_iter().collect();
     all.sort_by_key(|(_, m)| std::cmp::Reverse(m.bytes[0] + m.bytes[1]));

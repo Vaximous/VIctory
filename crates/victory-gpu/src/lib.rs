@@ -28,6 +28,8 @@ pub mod console;
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memcensus;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;

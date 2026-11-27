@@ -665,6 +665,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
         #[cfg(feature = "diagnostics")]
         {
             tally(12, count as u64);
+            crate::memcensus::count(crate::memcensus::ASKED_KIB, first * PAGE, ((last - first) * (PAGE >> 10)) as u64);
+            crate::memcensus::count(crate::memcensus::FOUND, first * PAGE, count as u64);
             use crate::copystat::{C, add};
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);
@@ -3896,6 +3898,8 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::memcensus::freed(at, len);
     crate::readprobe::freed(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));

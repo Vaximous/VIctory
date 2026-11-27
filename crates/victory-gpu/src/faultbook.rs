@@ -66,6 +66,17 @@ pub(crate) fn on() -> bool {
 }
 
 pub(crate) fn note(what: What, a: usize, b: usize, c: u64) {
+    {
+        use crate::memcensus::{FAULT, OURS, TAKEN, count};
+        let block = crate::watch::PAGE;
+        match what {
+            What::Fault => count(FAULT, a * block, 1),
+            What::Taken => count(TAKEN, a * block, b.saturating_sub(a) as u64),
+            What::Alias => count(TAKEN, a * block, 1),
+            What::Ours => count(OURS, a * block, b.saturating_sub(a) as u64),
+            _ => {}
+        }
+    }
     if !on() {
         return;
     }
