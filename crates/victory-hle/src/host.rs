@@ -87,10 +87,15 @@ impl HostPolicy {
                 return Some(ours);
             }
         }
-        // With a timeline asked for, what threads wait with is wrapped.
+        // With a timeline asked for, what threads wait with is wrapped;
+        // else the waits on what the card's work sets are timed.
         #[cfg(all(windows, feature = "diagnostics"))]
         if let ImportSymbol::Name { name, .. } = symbol {
-            return Some(victory_gpu::timeline::import(name, address));
+            let wrapped = victory_gpu::timeline::import(name, address);
+            if wrapped != address {
+                return Some(wrapped);
+            }
+            return Some(victory_gpu::gpuwait::import(name, address));
         }
         Some(address)
     }

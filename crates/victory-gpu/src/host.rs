@@ -6056,7 +6056,9 @@ impl Host {
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            let writes: Vec<_> = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::gpuwait::labels_queued(writes.iter().map(|w| w.0));
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -9426,6 +9428,8 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         crate::draw::set_loading(draws);
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::gpuwait::line(frames);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames

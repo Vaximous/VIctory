@@ -80,7 +80,16 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
     });
-    object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
+    let result = object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if !out.is_null() {
+        // SAFETY: `hand_out` wrote the object to `out`, or left it null.
+        let made = unsafe { *out };
+        if !made.is_null() {
+            crate::gpuwait::fence_made(made as usize, gpu_address(made) as usize);
+        }
+    }
+    result
 }
 
 fn set_event(event: usize) {
@@ -112,6 +121,8 @@ extern "system" fn completed_called(this: This) -> u64 {
     let value = completed(this);
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::polled(this as usize, value);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::gpuwait::polled(this as usize, value);
     value
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -171,6 +182,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize, std::time::Instant::now()));
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::gpuwait::event_asked(event as usize, this as usize, value);
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -183,6 +196,8 @@ pub(crate) fn set(this: This, value: u64) {
     waiters.retain(|&(wanted, event, asked)| {
         let reached = wanted <= value;
         if reached {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::gpuwait::event_set(event);
             set_event(event);
             let us = asked.elapsed().as_micros() as u64;
             ASKED[0].fetch_add(1, Ordering::Relaxed);
@@ -192,6 +207,8 @@ pub(crate) fn set(this: This, value: u64) {
         !reached
     });
     drop(waiters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::gpuwait::fence_set(this as usize, value);
     #[cfg(windows)]
     // SAFETY: wake any guest thread polling/blocking via WaitOnAddress on the fence's GPU VA.
     unsafe {

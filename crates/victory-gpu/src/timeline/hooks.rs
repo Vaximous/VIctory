@@ -34,7 +34,7 @@ macro_rules! wrapped {
                     // (or the module the title imports it from).
                     let real: unsafe extern "system" fn($($type),*) $(-> $result)? =
                         unsafe { std::mem::transmute(TABLE[$index].1.load(Ordering::Relaxed)) };
-                    if !on() {
+                    if !on() && !always($index) {
                         // SAFETY: the caller's own call.
                         return unsafe { real($($arg),*) };
                     }
@@ -43,6 +43,13 @@ macro_rules! wrapped {
             )*
         }
     };
+}
+
+/// Wrappers whose body runs while nothing is recorded too: the waits
+/// `crate::gpuwait` times (`WaitForSingleObject(Ex)`, `WaitOnAddress`,
+/// `WaitForMultipleObjects`). Their bodies record only while recording.
+const fn always(index: usize) -> bool {
+    matches!(index, 0 | 1 | 13 | 20)
 }
 
 /// Runs `call`, a wait on `object` that may be long; what the caller may
@@ -107,10 +114,12 @@ fn released(name: &'static str, object: Handle) {
 wrapped! {
     0 WaitForSingleObject(object: Handle, ms: u32) -> u32 => |real: unsafe extern "system" fn(Handle, u32) -> u32| {
         // SAFETY: the caller's own call (so below).
-        wait("WaitForSingleObject", object as u64, || unsafe { real(object, ms) })
+        let gpu = crate::gpuwait::event_object(&[object as usize]);
+        crate::gpuwait::timed(gpu, || if on() { wait("WaitForSingleObject", object as u64, || unsafe { real(object, ms) }) } else { unsafe { real(object, ms) } })
     };
     1 WaitForSingleObjectEx(object: Handle, ms: u32, alertable: i32) -> u32 => |real: unsafe extern "system" fn(Handle, u32, i32) -> u32| {
-        wait("WaitForSingleObjectEx", object as u64, || unsafe { real(object, ms, alertable) })
+        let gpu = crate::gpuwait::event_object(&[object as usize]);
+        crate::gpuwait::timed(gpu, || if on() { wait("WaitForSingleObjectEx", object as u64, || unsafe { real(object, ms, alertable) }) } else { unsafe { real(object, ms, alertable) } })
     };
     2 Sleep(ms: u32) => |real: unsafe extern "system" fn(u32)| {
         wait("Sleep", 0, || unsafe { real(ms) })
@@ -152,7 +161,8 @@ wrapped! {
         unsafe { real(lock) }
     };
     13 WaitOnAddress(at: Handle, compare: Handle, size: usize, ms: u32) -> i32 => |real: unsafe extern "system" fn(Handle, Handle, usize, u32) -> i32| {
-        wait("WaitOnAddress", at as u64, || unsafe { real(at, compare, size, ms) })
+        let gpu = crate::gpuwait::address_object(at as usize);
+        crate::gpuwait::timed(gpu, || if on() { wait("WaitOnAddress", at as u64, || unsafe { real(at, compare, size, ms) }) } else { unsafe { real(at, compare, size, ms) } })
     };
     14 WakeByAddressSingle(at: Handle) => |real: unsafe extern "system" fn(Handle)| {
         released("WakeByAddressSingle", at);
@@ -180,7 +190,8 @@ wrapped! {
         // (Named by the first of them.)
         // SAFETY: the caller passes `count` handles.
         let first = if count > 0 && !objects.is_null() { (unsafe { *objects }) as u64 } else { 0 };
-        wait("WaitForMultipleObjects", first, || unsafe { real(count, objects, all, ms) })
+        let gpu = crate::gpuwait::event_object(&crate::gpuwait::handles(count, objects));
+        crate::gpuwait::timed(gpu, || if on() { wait("WaitForMultipleObjects", first, || unsafe { real(count, objects, all, ms) }) } else { unsafe { real(count, objects, all, ms) } })
     };
     21 GetWriteWatch(flags: u32, at: Handle, size: usize, found: Handle, count: Handle, granularity: Handle) -> u32 => |real: unsafe extern "system" fn(u32, Handle, usize, Handle, Handle, Handle) -> u32| {
         measured("GetWriteWatch", size, || unsafe { real(flags, at, size, found, count, granularity) })
