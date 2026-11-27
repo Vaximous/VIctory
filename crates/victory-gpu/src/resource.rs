@@ -3113,7 +3113,11 @@ impl OnDemand {
             return false;
         };
         let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
-        if changed {
+        // (Shown once this upload has run, not before: under residency a
+        // view must not reach tiles the upload has not filled yet.)
+        if changed && crate::tiles::residency() {
+            crate::descriptor::host::levels_changed_after(memory);
+        } else if changed {
             crate::descriptor::host::levels_changed(memory);
         }
         if waiting {
@@ -3129,16 +3133,24 @@ impl OnDemand {
         let Some(tiled) = &self.0.tiled else {
             return 0;
         };
+        let _ = queue;
         let was = tiled.floor();
-        let (freed, changed) = tiled.set_floor(queue, &self.0.texture, floor);
+        let changed = tiled.set_floor(floor);
         let memory = if memory == 0 { self.1 } else { memory };
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
-        if tiled.floor() < was {
+        let now = tiled.floor();
+        if now < was {
             crate::descriptor::host::levels_wanted(memory);
+            return 0;
         }
-        freed
+        if now > was {
+            // Their tiles go back once no list may read them.
+            RETIRING.lock().unwrap_or_else(|e| e.into_inner()).push((self.0.clone(), crate::frame::current(), None));
+            return tiled.bytes_before(now).saturating_sub(tiled.bytes_before(was));
+        }
+        0
     }
 
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
@@ -3321,6 +3333,48 @@ pub(crate) fn steer_levels(memory: Option<[u64; 4]>, epoch: u32, window: u32) {
 fn cold_trim() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TILED_COLD_TRIM").is_some_and(|v| v == "1"))
+}
+
+/// Copies whose residency floor was raised (`crate::tiles::Tiled::set_floor`),
+/// the frame of it, and once two frames on (by when their slots were made
+/// again with the floor as their clamp) the submissions begun by then.
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+static RETIRING: std::sync::Mutex<Vec<(std::sync::Arc<HostTexture>, u64, Option<u64>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Once a texture pass: the tiles below the raised floors go back, of the
+/// copies whose every list begun before their views changed has run
+/// ([`RETIRING`]).
+#[cfg(windows)]
+pub(crate) fn retire_trims() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let frame = crate::frame::current();
+    let (begun, finished) = crate::host::submissions();
+    let due: Vec<std::sync::Arc<HostTexture>> = {
+        let mut retiring = RETIRING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut due = Vec::new();
+        retiring.retain_mut(|(copy, at, after)| match after {
+            None => {
+                if frame >= *at + 2 {
+                    *after = Some(begun);
+                }
+                true
+            }
+            Some(after) if finished >= *after => {
+                due.push(copy.clone());
+                false
+            }
+            Some(_) => true,
+        });
+        due
+    };
+    for copy in due {
+        if let Some(tiled) = &copy.tiled {
+            tiled.unmap_below(host.queue(), &copy.texture);
+        }
+    }
 }
 
 /// A texture's console memory and description; `None` for buffers.

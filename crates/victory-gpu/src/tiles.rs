@@ -617,7 +617,9 @@ impl Tiled {
                 given.packed
             }
         };
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
+        // (Not below residency's floor: those levels' tiles go back.)
+        let floor = self.floor.load(Ordering::Relaxed);
+        let has = |level: u32| level < 32 && named & (1 << level) != 0 && (level >= floor || level >= first_packed);
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
@@ -644,21 +646,37 @@ impl Tiled {
     /// before, which may still read them; a list recorded before and
     /// submitted after reads zeros there, and views are made again with the
     /// floor as their clamp). Lowered: the next upload gives the levels
-    /// between theirs ([`Tiled::take_regrow`]). Returns the bytes given
-    /// back, and whether the first level a view may show changed.
-    pub(crate) fn set_floor(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource, floor: u32) -> (u64, bool) {
+    /// between theirs ([`Tiled::take_regrow`]). Returns whether the first
+    /// level a view may show changed.
+    pub(crate) fn set_floor(&self, floor: u32) -> bool {
         let floor = floor.min(self.first_packed()).min(self.levels.saturating_sub(1));
-        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         let was = self.floor.swap(floor, Ordering::Relaxed);
         if floor < was {
             self.regrow.store(true, Ordering::Relaxed);
             RESIDENCY[2].fetch_add(1, Ordering::Relaxed);
-            return (0, false);
+            return false;
         }
         if floor == was {
-            return (0, false);
+            return false;
         }
         RESIDENCY[1].fetch_add(1, Ordering::Relaxed);
+        // Raised: views show from the floor on (their clamp) from the next
+        // pass; the tiles below go back only once every list that may have
+        // read them through the views before has run ([`Tiled::unmap_below`],
+        // `crate::resource::retire_trims`): given to another texture sooner,
+        // a list on the card still read them, the other's bytes or its
+        // upload, a mosaic of tiles (run ow13).
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        self.reshow(&given, named)
+    }
+
+    /// The tiles of the levels below residency's floor go back (to be called
+    /// only once no list may read them: [`Tiled::set_floor`]). The bytes
+    /// given back.
+    pub(crate) fn unmap_below(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> u64 {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = self.floor.load(Ordering::Relaxed);
         let mut freed = 0u64;
         for level in 0..floor.min(self.first_packed()) {
             let l = level as usize;
@@ -715,9 +733,7 @@ impl Tiled {
         }
         STATS[2].fetch_sub(freed, Ordering::Relaxed);
         RESIDENCY[0].fetch_add(freed, Ordering::Relaxed);
-        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
-        let changed = self.reshow(&given, named);
-        (freed, changed)
+        freed
     }
 
     /// Sets the floor of a copy just made, before its first upload.

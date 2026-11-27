@@ -2796,6 +2796,9 @@ impl State {
         // (`crate::host::touched`): without room, the slots none read for a
         // while give their textures back (`evict_untouched`); and the due
         // slots read lately go first.
+        if crate::tiles::residency() {
+            crate::resource::retire_trims();
+        }
         // Residency (`crate::tiles::residency`), once an epoch: what shaders
         // asked of each texture, and the floors that follow from it.
         if crate::tiles::residency()
