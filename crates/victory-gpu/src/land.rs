@@ -367,11 +367,17 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// (`VICTORY_UNDER_THREADS`, with this one: a third of the machine's
+/// threads, 6 to 8; 6 before). The submitting thread waits for them: 4.7 ms
+/// a frame putting the title's bytes under flights' writes outdoors (run
+/// ow75b-out), 446 pages compared.
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let threads = std::env::var("VICTORY_UNDER_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(6, |n| n.get() / 3).clamp(6, 8));
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
