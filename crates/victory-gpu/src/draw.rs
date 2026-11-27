@@ -216,6 +216,55 @@ fn system_fallback_left(frame: u64) -> bool {
     true
 }
 
+/// The fingerprints of the title memory of the due slots that are to be
+/// looked at again (`HostHeap::texture_slot_checked`), by slot, with the
+/// memory they were taken of: taken on threads of ours, a share each,
+/// when there are 32 or more (`VICTORY_RECHECK_THREADS`, 6; 0: none here).
+fn recheck_prints(
+    host: &crate::descriptor::host::HostHeap,
+    due: &[(u32, u64)],
+) -> std::collections::HashMap<u32, (u64, u64, u64)> {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_RECHECK_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6)
+    });
+    if threads == 0 {
+        return std::collections::HashMap::new();
+    }
+    let looks: Vec<(u32, u64, u64)> = due
+        .iter()
+        .filter_map(|&(index, _)| host.texture_slot_checked(index).map(|(at, len, ..)| (index, at, len)))
+        .collect();
+    if looks.len() < 32 {
+        return std::collections::HashMap::new();
+    }
+    let share = looks.len().div_ceil(threads);
+    let mut found = std::collections::HashMap::with_capacity(looks.len());
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = looks
+            .chunks(share)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter().map(|&(index, at, len)| (index, (at, len, crate::texture::fingerprint(at, len)))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for part in parts {
+            if let Ok(part) = part.join() {
+                found.extend(part);
+            }
+        }
+    });
+    found
+}
+
+/// Whether the first upload of a texture with no host copy yet goes on the
+/// copy queue of `crate::texture::ahead` (`VICTORY_AHEAD_FIRST=0`: not).
+fn ahead_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_FIRST").is_none_or(|v| v != "0"))
+}
+
 /// Made over the line for bakes this frame ([`bake_over_full`]); in all.
 static BAKE_OVER_FULL: AtomicU64 = AtomicU64::new(0);
 static BAKE_OVER_FULL_MADE: AtomicU64 = AtomicU64::new(0);
@@ -2824,6 +2873,10 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        // The looks again of slots uploaded whole read 48 KiB of title memory
+        // each: done ahead, on threads of ours, for as many as the pass
+        // could reach (`VICTORY_RECHECK_THREADS`, 6; 0: here, one by one).
+        let prints = recheck_prints(host, &due);
         for (index, write) in due {
             in_system = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -2862,7 +2915,11 @@ impl State {
             }
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let now_print = match prints.get(&index) {
+                    Some(&(was_at, was_len, found)) if (was_at, was_len) == (at, len) => found,
+                    _ => crate::texture::fingerprint(at, len),
+                };
+                if now_print == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -3143,7 +3200,11 @@ impl State {
             }
             // The first upload of a texture no list has used: on a queue of
             // its own, and the slot shows it as soon as that has run.
-            let ahead = if late && !tabled && texture.is_some_and(crate::pool::fresh) {
+            // (A texture with no host copy yet too: its copy is made here,
+            // fresh. Only one made in the last second was taken, and the
+            // pass makes most when it first meets them: one upload of ow9's
+            // 40,000 went this way. `VICTORY_AHEAD_FIRST=0`: as before.)
+            let ahead = if late && !tabled && (texture.is_some_and(crate::pool::fresh) || texture.is_none() && ahead_first()) {
                 crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX))
             } else {
                 None

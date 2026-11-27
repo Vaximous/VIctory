@@ -32,7 +32,7 @@ pub(crate) const LISTED: u8 = 3;
 
 /// Bytes of title memory on their way at most: past it uploads go into the
 /// lists, as before.
-const MOST: u64 = 96 << 20;
+const MOST: u64 = 192 << 20;
 /// Bytes and textures of one submission at most.
 const BATCH: (u64, usize) = (16 << 20, 64);
 
@@ -203,7 +203,7 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            for n in 0..3 {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -323,7 +323,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
         let bytes = STATS[1].fetch_add(job.staging.read as u64, Relaxed) + job.staging.read as u64;
         let all = STATS[2].fetch_add(us, Relaxed) + us;
         let most = STATS[3].fetch_max(us, Relaxed).max(us);
-        if n == 1 || n.is_multiple_of(5000) {
+        if n.is_power_of_two() || n.is_multiple_of(2000) {
             tracing::info!(
                 "textures uploaded ahead of the lists (VICTORY_UPLOAD_AHEAD=1), since the start: {n}, {} MB, {:.1} ms from the asking until they were there, the longest {:.0}; {} turned down, {} waited for by lists",
                 bytes >> 20,
