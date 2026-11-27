@@ -31,7 +31,7 @@ pub mod structure;
 /// it was (speed, diagnostics, tests, comments) leave it. When in doubt,
 /// bump; `VICTORY_SHADER_KEY=source` keys by the source as before, for work
 /// on the translator itself.
-pub const TRANSLATOR_VERSION: u32 = 3;
+pub const TRANSLATOR_VERSION: u32 = 4;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
