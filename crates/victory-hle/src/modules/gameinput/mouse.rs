@@ -518,6 +518,26 @@ pub(super) mod host {
             let wheel = WHEEL.swap(0, Ordering::Relaxed);
             let pressed = PRESSED.swap(0, Ordering::Relaxed);
             let held = HELD.load(Ordering::Relaxed);
+            // A route played back (`VICTORY_INPUT_REPLAY`): its mouse, by
+            // the same way the live one goes below; the live one left out.
+            if super::super::route::replaying() {
+                let read = PAD_READ.swap(false, Ordering::Relaxed);
+                return match super::super::route::replay_mouse() {
+                    super::super::route::MouseAt::Released => {
+                        super::super::camera::clear();
+                        PadState::default()
+                    }
+                    super::super::route::MouseAt::Moved(dx, dy, wheel, held, pressed) => {
+                        let stick = if super::super::camera::live() {
+                            super::super::camera::add(dx, dy);
+                            (0, 0)
+                        } else {
+                            (dx, dy)
+                        };
+                        self.mapper.step(s, stick, wheel, held, pressed, read, START.elapsed().as_secs_f64())
+                    }
+                };
+            }
             let area = front.and_then(client);
             // A click into the window takes the cursor back.
             if self.released
@@ -565,10 +585,18 @@ pub(super) mod host {
                     }
                     PAD_READ.store(false, Ordering::Relaxed);
                     super::super::camera::clear();
+                    super::super::route::record_mouse(super::super::route::MouseAt::Released);
                     return PadState::default();
                 }
             }
             self.ignore &= held;
+            super::super::route::record_mouse(super::super::route::MouseAt::Moved(
+                dx,
+                dy,
+                wheel,
+                held & !self.ignore,
+                pressed & !self.ignore,
+            ));
             let read = PAD_READ.swap(false, Ordering::Relaxed);
             let now = START.elapsed().as_secs_f64();
             // Movement turns the camera where one is hooked, else the stick.

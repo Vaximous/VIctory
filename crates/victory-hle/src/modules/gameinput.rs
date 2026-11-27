@@ -23,6 +23,7 @@ use crate::{HleExport, HleModule};
 
 pub mod camera;
 pub mod mouse;
+mod route;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1198,6 +1199,19 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // A route played back (`VICTORY_INPUT_REPLAY`): its pads, not
+            // the live ones.
+            if super::route::replaying() {
+                let mut pad = super::route::replay_pad(slot);
+                if slot == 0 {
+                    for vk in scripted() {
+                        if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                            pad.get_or_insert_with(PadState::default).buttons |= button;
+                        }
+                    }
+                }
+                return pad;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1205,11 +1219,13 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                super::route::record_pad(slot, None);
                 return None;
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            super::route::record_pad(slot, Some(pad));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1226,7 +1242,14 @@ mod host {
 
         fn keys(&mut self) -> Vec<KeyState> {
             let mut down = scripted();
-            if focused() {
+            if super::route::replaying() {
+                // The route's keys, focus or not; live keys left out.
+                for vk in super::route::replay_keys() {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
+            } else if focused() {
                 // The mouse's release key is ours, not the title's.
                 let mouse = super::mouse::settings();
                 let release = if mouse.enabled { mouse.release_key } else { 0 };
@@ -1238,6 +1261,9 @@ mod host {
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
                 down.extend(held);
+            }
+            if !super::route::replaying() {
+                super::route::record_keys(&down);
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1300,7 +1326,7 @@ mod host {
                 };
                 Some((from, to, vk))
             });
-            (Instant::now(), keys.collect())
+            (super::route::zero(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
