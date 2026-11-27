@@ -888,12 +888,13 @@ pub(crate) fn status() {
     if residency() {
         let r: Vec<u64> = RESIDENCY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         tracing::info!(
-            "residency by what shaders sample (VICTORY_TILED_RESIDENCY=0: off), since the start: {} steering passes,              {} floors raised giving back {} MB of finest levels, {} floors lowered, {} notes of textures kept whole              (read by texel or through a table)",
+            "residency by what shaders sample (VICTORY_TILED_RESIDENCY=0: off), since the start: {} steering passes,              {} floors raised giving back {} MB of finest levels, {} floors lowered, {} notes of textures kept whole              (read by texel or through a table); steering took {} ms on its thread",
             r[4],
             r[1],
             r[0] >> 20,
             r[2],
             r[3],
+            crate::draw::STEER_MICROS.load(Ordering::Relaxed) / 1000,
         );
     }
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);

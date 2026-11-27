@@ -92,6 +92,9 @@ pub(crate) struct Usage {
     /// store or atomic tagged `Tag::Repeat` or `Tag::FirstLane`): what a pixel
     /// program forced to test depth early would change.
     pub late_effects: bool,
+    /// Stores or atomics of the program's own (not the slot feedback's): memory it
+    /// writes besides its outputs.
+    pub own_writes: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1130,6 +1133,7 @@ impl Module {
                         || name.starts_with("writeSamplerFeedback"))
                 {
                     u.late_effects = true;
+                    u.own_writes |= name != "discard";
                 }
                 if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;

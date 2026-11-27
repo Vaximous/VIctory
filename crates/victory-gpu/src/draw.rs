@@ -184,13 +184,13 @@ fn early_budgets() -> (u64, u64) {
 }
 
 /// Textures a frame's bake passes may make although the card has no room
-/// for new host copies (`VICTORY_BAKE_OVER_FULL`, 768 a frame; 0: refused
+/// for new host copies (`VICTORY_BAKE_OVER_FULL`, 128 a frame, never past the card's budget; 0: refused
 /// like any other, as before). A bake reads its sources once: one it does
 /// not find on the card is baked as nothing for the run.
 fn bake_over_full() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_BAKE_OVER_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(768)
+        std::env::var("VICTORY_BAKE_OVER_FULL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128)
     })
 }
 
@@ -257,6 +257,43 @@ fn recheck_prints(
     });
     found
 }
+
+/// The longest wait, in milliseconds, between two looks at a texture slot
+/// whose memory is not there yet (`VICTORY_TEXTURE_LOOK_MS`, 1000; 0:
+/// about four seconds counted in passes, as before). The looks back off 1,
+/// 2, 4, ... frames up to it. After Belobug/VIctory-Belobug-AMD 9386b828
+/// (GPL-3.0): counted in passes it came to 13-18 s, long after the memory
+/// had come.
+fn look_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_LOOK_MS")
+            .ok()
+            .map_or(Some(1000), |v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+    })
+}
+
+/// The milliseconds of a frame lately (a mean over the last frames), from
+/// the pass's frame number and clock.
+fn frame_ms(frame: u64, now: u64) -> u64 {
+    static LAST: std::sync::Mutex<(u64, u64, f64)> = std::sync::Mutex::new((0, 0, 50.0));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (was_frame, was_ms, mean) = *last;
+    if frame > was_frame {
+        if was_frame != 0 {
+            let each = now.saturating_sub(was_ms) as f64 / (frame - was_frame) as f64;
+            last.2 = mean * 0.9 + each.clamp(1.0, 2000.0) * 0.1;
+        }
+        last.0 = frame;
+        last.1 = now;
+    }
+    (last.2 as u64).max(1)
+}
+
+/// Microseconds the residency's steering took on its thread, since the
+/// start (`crate::tiles::status`).
+pub(crate) static STEER_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the first upload of a texture with no host copy yet goes on the
 /// copy queue of `crate::texture::ahead` (`VICTORY_AHEAD_FIRST=0`: not).
@@ -2767,11 +2804,45 @@ impl State {
         {
             static EPOCH: AtomicU64 = AtomicU64::new(0);
             const WINDOW: u32 = 4;
-            if EPOCH.swap(u64::from(now), Ordering::Relaxed) != u64::from(now)
+            // On a thread of its own, one steering at a time: over every
+            // slot read and every texture it took 50 to 200 ms of the
+            // recording thread once an epoch (run ow12: the hitches).
+            static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !BUSY.load(Ordering::Acquire)
+                && EPOCH.swap(u64::from(now), Ordering::Relaxed) != u64::from(now)
                 && let Some(lods) = crate::host::touched::slot_min_lod(WINDOW)
             {
-                host.note_level_wants(frame, now, &seen, &lods, WINDOW);
-                crate::resource::steer_levels(memory, now, WINDOW);
+                BUSY.store(true, Ordering::Release);
+                let at = std::ptr::from_ref(heap) as usize;
+                let job = move || {
+                    let began = std::time::Instant::now();
+                    crate::descriptor::with_heap(at, |heap| {
+                        if let Some(host) = heap.host() {
+                            host.note_level_wants(frame, now, &seen, &lods, WINDOW);
+                        }
+                    });
+                    crate::resource::steer_levels(memory, now, WINDOW);
+                    STEER_MICROS.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    BUSY.store(false, Ordering::Release);
+                };
+                static STEERING: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>>> =
+                    std::sync::OnceLock::new();
+                let send = STEERING.get_or_init(|| {
+                    let (send, jobs) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+                    std::thread::Builder::new()
+                        .name("victory-residency".into())
+                        .spawn(move || jobs.into_iter().for_each(|job| job()))
+                        .ok()
+                        .map(|_| std::sync::Mutex::new(send))
+                });
+                match send {
+                    Some(send) => {
+                        if let Err(job) = send.lock().unwrap_or_else(|e| e.into_inner()).send(Box::new(job)) {
+                            (job.0)();
+                        }
+                    }
+                    None => job(),
+                }
             }
         }
         let feedback = if evict_on() { crate::host::touched::slot_epochs() } else { None };
@@ -2818,7 +2889,13 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // (`took` is since the last pass, of any heap and list: several a
+        // frame, so this was often 256 frames, 13-18 s at 14-20 frames a
+        // second; [`look_ms`] counts by the frame's time.)
+        let most = match look_ms() {
+            Some(ms) => (ms / frame_ms(frame, now)).clamp(1, 256),
+            None => (4000 / took).clamp(16, 256),
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -3042,9 +3119,12 @@ impl State {
                 // what the bake does not find on the card it bakes as
                 // nothing, once (dark faces in the open world, where the
                 // card is past its line whenever a passer-by is baked).
+                // (Not past the card's whole budget: ow11 made 7,500 so and
+                // stood at 105 % of it.)
                 let for_bake = !has_its_texture
                     && !back
                     && required
+                    && memory.is_some_and(|[budget, used, ..]| used < budget)
                     && BAKE_OVER_FULL.fetch_add(1, Ordering::Relaxed) < bake_over_full();
                 if for_bake {
                     let n = BAKE_OVER_FULL_MADE.fetch_add(1, Ordering::Relaxed) + 1;
