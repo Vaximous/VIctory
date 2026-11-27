@@ -305,6 +305,16 @@ fn world_ms() -> Option<u64> {
     })
 }
 
+/// Host textures made ahead of a texture pass (`VICTORY_PREMAKE`).
+pub(crate) static PREMADE: AtomicU64 = AtomicU64::new(0);
+
+/// How many host textures a texture pass makes ahead of itself, waited for
+/// as one (`VICTORY_PREMAKE`, 32; 0: none).
+fn premake() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_PREMAKE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32))
+}
+
 /// Whether the due slots shaders read lately are taken first
 /// (`VICTORY_TOUCHED_FIRST=0`: only with eviction).
 fn touched_first() -> bool {
@@ -3011,6 +3021,43 @@ impl State {
         // each: done ahead, on threads of ours, for as many as the pass
         // could reach (`VICTORY_RECHECK_THREADS`, 6; 0: here, one by one).
         let prints = recheck_prints(host, &due);
+        // The host textures of the first due slots that have none yet are
+        // made ahead of the pass and waited for as one until the card has
+        // them mapped (`crate::host::batch_mapped`; one wait each, 0.25 to
+        // 2 ms, was 10.6 s of run ow13). Nothing names them before. The
+        // pass then finds them made. (`VICTORY_PREMAKE`, 32 a pass; 0: not.)
+        if sync.is_none() && room && premake() > 0 && crate::residency::admit_texture_pass(required) {
+            let till = span / 2;
+            crate::host::batch_mapped(|| {
+                let mut made = 0usize;
+                for &(index, _) in due.iter().take(premake() * 4) {
+                    if made >= premake() || began.elapsed() > till {
+                        break;
+                    }
+                    let Some(view) = heap.handle(index).and_then(crate::descriptor::view) else { continue };
+                    if let View::Placed(false, resource, desc) = &view {
+                        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        let len = crate::resource::placed_bytes_from(resource, crate::resource::first_mip(desc)).unwrap_or(1);
+                        if crate::texture::mapped_bytes(address as *const u8, len as usize) < len {
+                            continue;
+                        }
+                    }
+                    let placed = crate::descriptor::host::placed_texture(&view);
+                    let Some(&View::Shader(resource, _)) = placed.as_ref().or(Some(&view)) else { continue };
+                    let resource = resource as This;
+                    if crate::resource::buffer_bytes(resource).is_some()
+                        || !crate::resource::title_fills(resource)
+                        || !crate::resource::host_waits(resource)
+                    {
+                        continue;
+                    }
+                    if crate::resource::host_resource(resource).is_some() {
+                        made += 1;
+                    }
+                }
+                PREMADE.fetch_add(made as u64, Ordering::Relaxed);
+            });
+        }
         for (index, write) in due {
             in_system = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {

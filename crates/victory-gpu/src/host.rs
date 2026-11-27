@@ -246,13 +246,62 @@ struct Aside {
     queue: ID3D12CommandQueue,
     list: ID3D12CommandList,
     fence: ID3D12Fence,
-    event: windows::Win32::Foundation::HANDLE,
     value: u64,
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
-// SAFETY: D3D12 objects are free-threaded, the event is waited on by one
-// thread at a time (the lock).
+// SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Aside {}
+
+/// Whether new memory made inside [`batch_mapped`] is waited for once, at
+/// its end, rather than one by one (`VICTORY_WAIT_RESIDENT_BATCH=0`: one by
+/// one, as before).
+fn wait_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT_BATCH").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// Inside [`batch_mapped`]: the fence and the latest value [`mapped`]
+    /// asked for and did not wait for.
+    static ASKED: std::cell::RefCell<Option<Option<(ID3D12Fence, u64)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `make`, which may make new memory of the card, and returns when all
+/// it made is mapped: one wait for all of it ([`wait_batch`]). Nothing made
+/// in it may be named by a descriptor or a list before this returns.
+pub(crate) fn batch_mapped<R>(make: impl FnOnce() -> R) -> R {
+    if !wait_resident() || !wait_batch() {
+        return make();
+    }
+    let outer = ASKED.with(|a| a.borrow_mut().replace(None));
+    let made = make();
+    let asked = ASKED.with(|a| std::mem::replace(&mut *a.borrow_mut(), outer));
+    if let Some(Some((fence, value))) = asked {
+        let started = std::time::Instant::now();
+        // SAFETY: a live fence; a null event waits here until the value.
+        let _ = unsafe { wait_fence(&fence, value) };
+        let us = started.elapsed().as_micros() as u64;
+        BATCHED[1].fetch_add(1, Ordering::Relaxed);
+        BATCHED[2].fetch_add(us, Ordering::Relaxed);
+        BATCHED[3].fetch_max(us, Ordering::Relaxed);
+    }
+    made
+}
+
+/// Memory made in [`batch_mapped`]: asked, batches waited for, their
+/// microseconds, the longest.
+static BATCHED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Waits until `fence` reaches `value` (no event: the call returns then).
+unsafe fn wait_fence(fence: &ID3D12Fence, value: u64) -> windows::core::Result<()> {
+    // SAFETY: the caller's.
+    unsafe {
+        if fence.GetCompletedValue() < value {
+            fence.SetEventOnCompletion(value, HANDLE::default())?;
+        }
+    }
+    Ok(())
+}
 
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
@@ -268,7 +317,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     let started = std::time::Instant::now();
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
-    unsafe {
+    let (fence, value) = unsafe {
         if aside.is_none() {
             let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
                 let mut made: Option<ID3D12Resource> = None;
@@ -305,7 +354,6 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 queue,
                 list: list.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
-                event: CreateEventW(None, false, false, None)?,
                 value: 0,
                 _keep: (allocator, [from, to]),
             });
@@ -314,11 +362,23 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+        (a.fence.clone(), a.value)
+    };
+    // Waited for outside the lock: other threads ask meanwhile.
+    drop(aside);
+    let batched = ASKED.with(|a| match &mut *a.borrow_mut() {
+        Some(asked) => {
+            *asked = Some((fence.clone(), value));
+            true
         }
+        None => false,
+    });
+    if batched {
+        BATCHED[0].fetch_add(1, Ordering::Relaxed);
+        return Ok(());
     }
+    // SAFETY: a live fence.
+    unsafe { wait_fence(&fence, value)? };
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
@@ -326,9 +386,13 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms;              in batches (VICTORY_WAIT_RESIDENT_BATCH=0: not): {} made, {} waits, {:.1} ms, the longest {:.1} ms",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
+            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            BATCHED[0].load(Ordering::Relaxed),
+            BATCHED[1].load(Ordering::Relaxed),
+            BATCHED[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            BATCHED[3].load(Ordering::Relaxed) as f64 / 1000.0
         );
     }
     Ok(())
