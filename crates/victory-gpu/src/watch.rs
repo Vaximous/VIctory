@@ -1222,7 +1222,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
             #[cfg(feature = "diagnostics")]
             let guarding = std::time::Instant::now();
-            let mut written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+            let mut written = guard_told(first * PAGE, last * PAGE);
             if written.is_none() && viewed {
                 // Not a view after all (other memory there now): forgotten as
                 // one, and the kernel asked as before.
@@ -1517,7 +1517,7 @@ impl Drop for Claims {
 /// done shared; blocks a refresh could not claim (left written); spins for
 /// claims; blocks rested longer for being hot; kernel askings left out for
 /// view memory; blocks found hot.
-static PORT6: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static PORT6: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 const P6_FAULTS: usize = 0;
 const P6_FAULT_WAIT_NS: usize = 1;
 const P6_GUARDS: usize = 2;
@@ -1526,6 +1526,11 @@ const P6_CLAIM_SPINS: usize = 4;
 const P6_RESTED_HOT: usize = 5;
 const P6_NOT_ASKED: usize = 6;
 const P6_HOT: usize = 7;
+/// [`guard_parts`]: 4 KiB parts opened alone; blocks opened whole for too
+/// many parts; parts told written at askings.
+const P6_PARTS: usize = 8;
+const P6_PARTS_WHOLE: usize = 9;
+const P6_PARTS_TOLD: usize = 10;
 
 fn port6_count(what: usize, n: u64) {
     PORT6[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1540,7 +1545,8 @@ pub(crate) fn port_guard_line(frames: f64) {
     tracing::info!(
         "renderer port 6 (VICTORY_PORT_GUARD=1) per frame: faults opened under the shared lock {:.1} ({:.2} ms waiting for it), \
          refreshes' guards done shared {:.1}, blocks left written for want of their claim {:.1}, spins for claims {:.0}; \
-         blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}",
+         blocks found hot {:.1}, rests longer for it {:.1} (VICTORY_GUARD_HOT); kernel askings left out for view memory {:.1}; \
+         parts opened alone {:.1}, blocks opened whole for too many parts {:.1}, parts told written {:.1} (VICTORY_GUARD_PARTS)",
         n[P6_FAULTS],
         n[P6_FAULT_WAIT_NS] / 1e6,
         n[P6_GUARDS],
@@ -1549,6 +1555,9 @@ pub(crate) fn port_guard_line(frames: f64) {
         n[P6_HOT],
         n[P6_RESTED_HOT],
         n[P6_NOT_ASKED],
+        n[P6_PARTS],
+        n[P6_PARTS_WHOLE],
+        n[P6_PARTS_TOLD],
     );
 }
 
@@ -1846,7 +1855,7 @@ pub(crate) fn nothing_put(block: usize) -> bool {
 
 /// The title is about to write block by block around `at`: as by a fault.
 pub(crate) fn opened_for_writing(at: usize) {
-    open_faulted(at);
+    open_faulted(at, false);
 }
 
 /// Opens the guarded block at `at` for a write of the title's that faulted
@@ -1857,7 +1866,11 @@ pub(crate) fn opened_for_writing(at: usize) {
 /// With renderer port #6 the lock is taken shared and the claims of the block
 /// and of its page's other views are waited for, in order: the block's state
 /// is changed by nobody else meanwhile, and other faults go on beside this.
-fn open_faulted(at: usize) -> (usize, std::time::Duration) {
+///
+/// `part`: a fault of the title's own, which may open the 4 KiB part of the
+/// block it wrote alone ([`guard_parts`]); a part so opened is not counted
+/// as the block opened (its heat, [`Guards::opened`]).
+fn open_faulted(at: usize, part: bool) -> (usize, std::time::Duration) {
     let block = at / BLOCK;
     let began = std::time::Instant::now();
     if !port_guard() {
@@ -1873,12 +1886,14 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
     let g = guards_shared();
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
-    let opened = open_claimed(&g, block, true);
+    let opened = open_claimed(&g, block, true, part.then_some(at));
     if opened != 0 {
-        g.opened(block);
+        if opened != PART_OPENED {
+            g.opened(block);
+        }
         port6_count(P6_FAULTS, 1);
     }
-    (opened, waited)
+    (opened.min(1), waited)
 }
 
 /// With renderer port #6 and the guards' lock held shared: opens `block` as
@@ -1887,13 +1902,24 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
 /// block not guarded is left as it is (a fault's, which only a guarded block
 /// makes); otherwise one with other views is opened at them all the same
 /// (our own write through it, as [`open`] does for its range).
-fn open_claimed(g: &Guards, block: usize, fault: bool) -> usize {
+///
+/// `part`: where a fault of the title's wrote, whose 4 KiB part alone is
+/// opened if it can be ([`open_part`]: then [`PART_OPENED`]).
+fn open_claimed(g: &Guards, block: usize, fault: bool, part: Option<usize>) -> usize {
     let at = block * BLOCK;
     let mut views: Vec<usize> = vec![block];
     loop {
         let _claims = Claims::wait_for(&views);
         if !g.protected.contains(block) && (fault || !g.aliased.contains(block)) {
             return 0;
+        }
+        if let Some(wrote) = part
+            && guard_parts()
+            && g.protected.contains(block)
+            && !g.aliased.contains(block)
+            && let Some(opened) = open_part(g, block, wrote)
+        {
+            return opened;
         }
         let given = if g.aliased.contains(block) {
             // (The views as the table has them now, as `open` looks them up;
@@ -1914,6 +1940,98 @@ fn open_claimed(g: &Guards, block: usize, fault: bool) -> usize {
         };
         return open_given(g, at, at + 1, given.as_deref());
     }
+}
+
+/// Whether a write fault of the title's in a guarded block opens only the
+/// 4 KiB part it wrote, the rest of the block staying read-only, and the
+/// next asking tells only the parts so opened as written
+/// (`VICTORY_GUARD_PARTS`, on unless `=0`; renderer port #6 only).
+///
+/// A fault opened the whole 64 KiB block, and every refresh after took all
+/// of it: in run ow33-move about 250 blocks a frame were opened so, the
+/// title's view memory written between nearly every two submissions, while
+/// of what was taken as written only 4.5-6% of the 4 KiB parts differed
+/// (runs ow29-ow31). A block whose parts are opened past [`PARTS_MOST`] is
+/// opened whole, as before; a block with other views is opened whole.
+fn guard_parts() -> bool {
+    crate::toggled!("VICTORY_GUARD_PARTS") && port_guard()
+}
+
+/// Parts of a block [`open_part`] opens alone before the block is opened
+/// whole.
+const PARTS_MOST: u32 = 4;
+
+/// What [`open_claimed`] says when it opened a part of the block alone.
+const PART_OPENED: usize = usize::MAX;
+
+/// The guarded blocks some 4 KiB parts of which are open ([`guard_parts`]),
+/// a bit each; changed by who holds the block's claim, or the guards' lock
+/// alone. Whether there is any at all, read with no lock.
+static PARTS_OPEN: Mutex<BTreeMap<usize, u16>> = Mutex::new(BTreeMap::new());
+static PARTS_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The parts of `block` open alone, forgotten (the block is opened whole,
+/// guarded whole again, or gone).
+fn parts_forget(block: usize) -> u16 {
+    if !PARTS_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
+    PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&block).unwrap_or(0)
+}
+
+/// The parts of `block` open alone, as they are.
+fn parts_open(block: usize) -> u16 {
+    if !PARTS_ANY.load(std::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
+    PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner()).get(&block).copied().unwrap_or(0)
+}
+
+/// With `block`'s claim held and the block guarded, with no other view:
+/// opens the 4 KiB part of it at `wrote` alone, and notes the block not
+/// clean. [`PART_OPENED`] if it did, 0 if that part was open already (by
+/// another thread's fault), `None` if the block is to be opened whole (too
+/// many parts, or the change failed).
+fn open_part(g: &Guards, block: usize, wrote: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let part = wrote % BLOCK / KERNEL_PAGE;
+    let bit = 1u16 << part;
+    let mut open = PARTS_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let had = open.get(&block).copied().unwrap_or(0);
+    if had & bit != 0 {
+        return Some(0);
+    }
+    if (had | bit).count_ones() > PARTS_MOST {
+        port6_count(P6_PARTS_WHOLE, 1);
+        return None;
+    }
+    // Not clean before it can be written.
+    g.clean.remove(block);
+    PUBLISHED.clear(block);
+    let mut old = 0;
+    // SAFETY: a block we made read-only; one 4 KiB page of it.
+    let done = unsafe { VirtualProtect((block * BLOCK + part * KERNEL_PAGE) as *const _, KERNEL_PAGE, PAGE_READWRITE, &mut old) } != 0;
+    if !done {
+        return None;
+    }
+    open.insert(block, had | bit);
+    PARTS_ANY.store(true, std::sync::atomic::Ordering::Release);
+    port6_count(P6_PARTS, 1);
+    Some(PART_OPENED)
+}
+
+/// With `block`'s claim held: makes it read-only whole again, if parts of
+/// it were open alone; which those were (0: none).
+fn parts_close(block: usize) -> u16 {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let parts = parts_forget(block);
+    if parts != 0 {
+        let mut old = 0;
+        // SAFETY: a block we guard, a part of which we opened.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+        port6_count(P6_PARTS_TOLD, u64::from(parts.count_ones()));
+    }
+    parts
 }
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
@@ -2848,7 +2966,14 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_told(start, end).map(|told| told.into_iter().map(|(block, _)| block).collect())
+}
+
+/// [`guard`], with the parts of each block told written: [`WHOLE`] but for
+/// a block parts of which were opened alone ([`guard_parts`]).
+fn guard_told(start: usize, end: usize) -> Option<Vec<(usize, u16)>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -2997,7 +3122,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
-    Some(written)
+    Some(written.into_iter().map(|block| (block, WHOLE)).collect())
 }
 
 /// The rest of [`guard`] with renderer port #6: the lock shared, and a
@@ -3006,7 +3131,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// never in between; a block whose claim another holds (a fault, a cover of
 /// another range's) is left as it is, written: told so now, and looked at
 /// again at the next asking.
-fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<usize> {
+fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::time::Duration) -> Vec<(usize, u16)> {
     if !came.is_empty() {
         // (Changes no block's protection: the sets of what is where.)
         let mut g = guards_timed();
@@ -3017,6 +3142,7 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
         }
     }
     port6_count(P6_GUARDS, 1);
+    let mut told: Vec<(usize, u16)> = Vec::new();
     let g = guards_timed_shared();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
@@ -3046,8 +3172,16 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
             }
             // (No other claim is held here.)
             let mut claims = Claims::wait_for(&[block]);
-            if g.protected.contains(block) && !g.clean.contains(block) && cover(&g, block, block + 1, Some(&mut claims)) {
-                g.clean.insert(block);
+            if g.protected.contains(block) && !g.clean.contains(block) {
+                // Parts of it open alone: read-only whole again, and only
+                // those told written.
+                let parts = parts_close(block);
+                if parts != 0 {
+                    told.push((block, parts));
+                }
+                if cover(&g, block, block + 1, Some(&mut claims)) {
+                    g.clean.insert(block);
+                }
             }
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
@@ -3061,7 +3195,18 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
     drop(g);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
+    // (`told` in the order of `written`.)
+    let mut told = told.into_iter().peekable();
     written
+        .into_iter()
+        .map(|block| match told.peek() {
+            Some(&(b, parts)) if b == block => {
+                told.next();
+                (block, parts)
+            }
+            _ => (block, WHOLE),
+        })
+        .collect()
 }
 
 /// [`protect`] of `[from, to)` with the lock shared: of the blocks whose
@@ -3214,6 +3359,15 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     g.aliased.insert(block);
     if g.protected.contains(block) {
+        if parts_open(block) != 0 {
+            // Parts open alone ([`guard_parts`]): read-only whole now, a
+            // view of a page another copy takes. (It stays not clean, its
+            // parts told written at its next asking, or opened whole.)
+            use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+            let mut old = 0;
+            // SAFETY: a block we guard, a part of which we opened.
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) };
+        }
         return true;
     }
     if g.left_alone(block) || g.rests(block, rest()) {
@@ -3501,6 +3655,7 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.protected.remove(block);
         g.clean.remove(block);
         PUBLISHED.clear(block);
+        parts_forget(block);
     }
     for &block in blocks {
         let mut old = 0;
@@ -3548,7 +3703,7 @@ pub fn writing(at: usize, len: usize) {
             blocks.extend(g.aliased.range(first..last));
             blocks.sort_unstable();
             blocks.dedup();
-            blocks.into_iter().map(|block| open_claimed(&g, block, false)).sum()
+            blocks.into_iter().map(|block| open_claimed(&g, block, false, None)).sum()
         } else {
             let g = guards_timed();
             open(&g, at, at.saturating_add(len))
@@ -3902,7 +4057,7 @@ fn came_back(at: usize, write: bool) -> bool {
             return readable_view(at);
         }
         // (A refresh may have guarded the page that came back.)
-        open_faulted(at).0 != 0 || writable(at)
+        open_faulted(at, false).0 != 0 || writable(at)
     };
     let before = changes();
     if there() || again_after_change(before, there) {
@@ -4063,6 +4218,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
+        parts_forget(block);
     }
 }
 
@@ -4243,7 +4399,7 @@ pub(crate) fn install() {
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let (opened, _waited) = open_faulted(at);
+            let (opened, _waited) = open_faulted(at, true);
             #[cfg(feature = "diagnostics")]
             let waited = _waited;
             if opened != 0 {
