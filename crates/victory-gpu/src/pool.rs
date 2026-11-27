@@ -562,6 +562,20 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
+/// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
+/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
+/// at multiples of 64 KiB, as every other texture).
+///
+/// After Belobug/VIctory-Belobug-AMD c278f0d5 (GPL-3.0): two device losses
+/// there faulted in small block-compressed textures placed at a 4 KiB
+/// multiple that is no 64 KiB one, read the moment their slot was made, the
+/// first level ending past the piece. Textures at 64 KiB multiples had none
+/// of that, for at most 60 KiB more a small texture.
+fn small_placement() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+}
+
 /// Textures made in the last second ([`fresh`]), and when.
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
 
@@ -613,10 +627,11 @@ pub(crate) unsafe fn texture(
         return None;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
-    // (the top mip is 64 KiB at most): 64 KiB each otherwise.
+    // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
+    // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    d.Alignment = if small_placement() { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 };
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {

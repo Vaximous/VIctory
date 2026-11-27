@@ -287,6 +287,25 @@ impl Job {
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
         let (s, texture) = (&self.staging, &self.copy.texture);
+        // A texture cut from a block may lie where another did: what the card
+        // holds of that one is done with before this first upload into it
+        // (as `super::upload` does in a list; after Belobug/VIctory-Belobug-AMD
+        // 5d6bd841, GPL-3.0).
+        if crate::pool::on() {
+            let aliasing = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                        pResourceBefore: std::mem::ManuallyDrop::new(None),
+                        // SAFETY: a borrowed pointer the barrier never releases.
+                        pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
+                    }),
+                },
+            };
+            // SAFETY: the caller's open list; a live texture.
+            unsafe { list.ResourceBarrier(&[aliasing]) };
+        }
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
