@@ -1873,17 +1873,33 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
     let g = guards_shared();
     let waited = began.elapsed();
     port6_count(P6_FAULT_WAIT_NS, waited.as_nanos() as u64);
+    let opened = open_claimed(&g, block, true);
+    if opened != 0 {
+        g.opened(block);
+        port6_count(P6_FAULTS, 1);
+    }
+    (opened, waited)
+}
+
+/// With renderer port #6 and the guards' lock held shared: opens `block` as
+/// [`open`] would, its claim and those of its page's other views waited for,
+/// in order; how many blocks of its own were opened (0 or 1). `fault`: a
+/// block not guarded is left as it is (a fault's, which only a guarded block
+/// makes); otherwise one with other views is opened at them all the same
+/// (our own write through it, as [`open`] does for its range).
+fn open_claimed(g: &Guards, block: usize, fault: bool) -> usize {
+    let at = block * BLOCK;
     let mut views: Vec<usize> = vec![block];
     loop {
         let _claims = Claims::wait_for(&views);
-        if !g.protected.contains(block) {
-            return (0, waited);
+        if !g.protected.contains(block) && (fault || !g.aliased.contains(block)) {
+            return 0;
         }
         let given = if g.aliased.contains(block) {
             // (The views as the table has them now, as `open` looks them up;
             // a view mapped after this opens what is guarded of the page
             // again, holding the lock alone: `views_mapped`.)
-            let mut now: Vec<usize> = crate::inplace::pages_of(block * BLOCK).into_iter().map(|p| p / BLOCK).collect();
+            let mut now: Vec<usize> = crate::inplace::pages_of(at).into_iter().map(|p| p / BLOCK).collect();
             now.push(block);
             now.sort_unstable();
             now.dedup();
@@ -1896,12 +1912,7 @@ fn open_faulted(at: usize) -> (usize, std::time::Duration) {
         } else {
             None
         };
-        let opened = open_given(&g, at, at + 1, given.as_deref());
-        if opened != 0 {
-            g.opened(block);
-            port6_count(P6_FAULTS, 1);
-        }
-        return (opened, waited);
+        return open_given(g, at, at + 1, given.as_deref());
     }
 }
 
@@ -3511,6 +3522,16 @@ fn unguard(g: &Guards, blocks: &[usize]) {
     }
 }
 
+/// Whether [`writing`] takes the guards' lock shared with renderer port #6,
+/// opening its blocks one by one under their claims as a fault does
+/// ([`open_claimed`]), and not alone (`VICTORY_WRITING_SHARED`, on unless
+/// `=0`). In run ow31-move it took the lock alone 12 times a frame, waiting
+/// 1.2-2.5 ms a frame behind the faults' and the guarding's shared holds,
+/// while the title's faults queued behind it in turn.
+fn writing_shared() -> bool {
+    crate::toggled!("VICTORY_WRITING_SHARED")
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
@@ -3519,8 +3540,19 @@ pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
-        let g = guards_timed();
-        let opened = open(&g, at, at.saturating_add(len));
+        let opened = if writing_shared() && port_guard() && TAKING.1.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            // Block by block, each with its claims, beside the title's faults.
+            let g = guards_timed_shared();
+            let first = at / BLOCK;
+            let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
+            blocks.extend(g.aliased.range(first..last));
+            blocks.sort_unstable();
+            blocks.dedup();
+            blocks.into_iter().map(|block| open_claimed(&g, block, false)).sum()
+        } else {
+            let g = guards_timed();
+            open(&g, at, at.saturating_add(len))
+        };
         #[cfg(feature = "diagnostics")]
         {
             tally(6, opened as u64);

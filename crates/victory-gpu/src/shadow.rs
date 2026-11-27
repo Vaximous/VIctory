@@ -2519,7 +2519,8 @@ fn send_parts() -> bool {
 /// [`whole_changed`] read title memory once, in place, against the CPU's
 /// side (`safecopy::changed`: 32 bytes a step, put in where they differ),
 /// and not through a copy of every 4 KiB first, compared and copied again
-/// (`VICTORY_COMPARE_IN_PLACE`, on unless `=0`). With [`landed_parts`] run
+/// (`VICTORY_COMPARE_IN_PLACE`, off unless `=1`: off since run ow31-move
+/// showed banding in a dim interior, until a review or an A/B clears it). With [`landed_parts`] run
 /// ow29-move compared 100 MB a frame to send 4.9 MB, and the copies' time
 /// went from 19.4 to 26.4 ms a frame. What is sent is the same: each
 /// 4 KiB piece in which a byte differed, whole.
@@ -2534,7 +2535,8 @@ fn send_parts() -> bool {
 /// [`send_parts`] saw 7.5 MB. The pages are ones the copy held before
 /// (`known`), the case [`send_parts`] covers, on what it rests on.
 fn compare_in_place() -> bool {
-    crate::toggled!("VICTORY_COMPARE_IN_PLACE")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_IN_PLACE").is_some_and(|v| v == "1"))
 }
 
 fn landed_parts() -> bool {
