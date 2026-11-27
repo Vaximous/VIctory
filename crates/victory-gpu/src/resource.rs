@@ -2968,7 +2968,11 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
+    // (Not a reserved one: a texture cut from a block has its memory, and
+    // the card will not cut it into tiles; levels on demand made none
+    // since the blocks came.)
     if !system
+        && !reserved
         && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
