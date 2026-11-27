@@ -65,6 +65,25 @@ static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
 /// Whether any event is pending: most waits look no further.
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f`, unless this thread is in it already: `None`. The wrappers of the
+/// waits look up and note under locks of ours, and a lock waited for is a
+/// wait on an address, wrapped too where our own imports are (a timeline):
+/// without this the thread went round until its stack overflowed (a suite
+/// that ran a timeline's tests before ones with many threads on one lock).
+fn inside<T>(f: impl FnOnce() -> T) -> Option<T> {
+    if INSIDE.get() {
+        return None;
+    }
+    INSIDE.set(true);
+    let result = f();
+    INSIDE.set(false);
+    Some(result)
+}
+
 fn known<T>(f: impl FnOnce(&mut Known) -> T) -> T {
     f(KNOWN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Known::default))
 }
@@ -189,19 +208,22 @@ pub(crate) fn event_object(objects: &[usize]) -> Option<Object> {
     if EVENTS.load(Relaxed) == 0 {
         return None;
     }
-    known(|k| objects.iter().find_map(|o| k.events.get(o).map(|&(fence, _)| Object::Fence(fence))))
+    inside(|| known(|k| objects.iter().find_map(|o| k.events.get(o).map(|&(fence, _)| Object::Fence(fence))))).flatten()
 }
 
 pub(crate) fn address_object(at: usize) -> Option<Object> {
-    known(|k| {
-        if let Some(&fence) = k.values.get(&at) {
-            Some(Object::Fence(fence))
-        } else if k.labels.contains(&at) {
-            Some(Object::Label(at))
-        } else {
-            None
-        }
+    inside(|| {
+        known(|k| {
+            if let Some(&fence) = k.values.get(&at) {
+                Some(Object::Fence(fence))
+            } else if k.labels.contains(&at) {
+                Some(Object::Label(at))
+            } else {
+                None
+            }
+        })
     })
+    .flatten()
 }
 
 fn waited(object: Object, since: Instant) {
@@ -229,7 +251,7 @@ pub(crate) fn timed<T>(object: Option<Object>, call: impl FnOnce() -> T) -> T {
     unsafe {
         use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
         let error = GetLastError();
-        waited(object, since);
+        inside(|| waited(object, since));
         SetLastError(error);
     }
     result
@@ -355,6 +377,22 @@ pub(crate) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait inside a wrapper's own looking up (a lock of ours waited for)
+    /// goes straight to the real wait: nothing is looked up again.
+    #[test]
+    fn a_wait_inside_the_looking_up_is_not_looked_up() {
+        let at = 0x5EED_0000usize;
+        known(|k| {
+            k.labels.insert(at);
+        });
+        assert!(address_object(at).is_some());
+        assert_eq!(inside(|| address_object(at).is_none()), Some(true));
+        assert!(address_object(at).is_some());
+        known(|k| {
+            k.labels.remove(&at);
+        });
+    }
 
     /// A title thread waits on an event given for a fence value; another
     /// thread sets the fence: the wait is timed against that fence, and the
