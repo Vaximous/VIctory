@@ -546,6 +546,9 @@ pub extern "system" fn ReadFile(
     // into pages the kernel has locked by now: it lands all the same, but a
     // refresh that guards its blocks before it does will not see it.
     if done == 0 && error == windows_sys::Win32::Foundation::ERROR_IO_PENDING {
+        // The kernel's write watch does not see the kernel's writes: the
+        // pages are noted when it is done.
+        victory_gpu::kernel_writing_later(buffer as usize, len as usize, overlapped as usize);
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::info!(len, "ReadFile: a read of the title's goes on after the call"));
     }

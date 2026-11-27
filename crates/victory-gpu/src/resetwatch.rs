@@ -8,7 +8,8 @@
 //! `ResetWriteWatch` and their `Nt`/`Zw` calls (kernelbase's own included,
 //! which the others go through), and a reset that is not ours is counted
 //! and the first ones said with the modules on the caller's stack
-//! (`VICTORY_RESET_WATCH`, on unless `=0`, diagnostics builds).
+//! (`VICTORY_RESET_WATCH=1`, diagnostics builds; off by default since run
+//! ow66-move found none).
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -35,7 +36,7 @@ impl Drop for Ours {
 
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESET_WATCH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESET_WATCH").is_some_and(|v| v == "1"))
 }
 
 /// The real functions: GetWriteWatch, ResetWriteWatch, NtGetWriteWatch,
@@ -277,6 +278,9 @@ unsafe fn wrap(base: usize) -> usize {
 /// The frame line: resets not ours per frame (armed again first, for
 /// modules loaded since).
 pub(crate) fn line(frames: f64) {
+    if !on() {
+        return;
+    }
     let changed = arm();
     let c: Vec<f64> = COUNTS[..3].iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(

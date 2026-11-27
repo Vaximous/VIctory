@@ -70,8 +70,9 @@ mod blocklog {
     }
 
     /// Blocks `[first, last)` had `kind` done to them.
+    /// (Kept only with the audit that reads it, `VICTORY_PIECE_AUDIT=1`.)
     pub(super) fn note(first: usize, last: usize, kind: &'static str) {
-        if first >= last {
+        if first >= last || !crate::host::piece_audit() {
             return;
         }
         let ev = Ev { first, last, kind, path: PATH.get(), ms: ms(), thread: THREAD.with(|t| *t) };
@@ -1452,6 +1453,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     let began = std::time::Instant::now();
+    kernel_writes_done();
     ASK_PARTS.with(|p| p.set([0; 4]));
     {
         let _journal = AskPart::new(AS_JOURNAL);
@@ -2559,6 +2561,10 @@ pub(crate) fn port_guard_line(frames: f64) {
     crate::safecopy::merge_line(frames);
     #[cfg(feature = "diagnostics")]
     crate::resetwatch::line(frames);
+    #[cfg(feature = "diagnostics")]
+    kernel_noted_line(frames);
+    #[cfg(feature = "diagnostics")]
+    copy_check_line(frames);
     #[cfg(feature = "diagnostics")]
     {
         let f: Vec<f64> = FOUND_REFUSED.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
@@ -4855,8 +4861,231 @@ pub fn writing(at: usize, len: usize) {
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]): blocks `[first, last)`, and the bytes.
+pub struct KernelWrite(usize, usize, usize, usize);
+
+/// The runtime has had the kernel write title memory `[at, at + len)`, or
+/// written it through a view of its own, and the bytes are there now.
+/// Opens what is guarded there, as [`writing`] does, and notes the pages in
+/// the journal ([`kernel_wrote`]).
+pub fn kernel_will_write(at: usize, len: usize) {
+    writing(at, len);
+    kernel_wrote(at, len);
+}
+
+/// The kernel's write watch sees writes made in user mode only: a file
+/// read the kernel completes into title memory (`ReadFile`, its overlapped
+/// form, DirectStorage's reads) leaves the pages as they were for every
+/// asking, and copies of them keep the bytes from before for good. The
+/// guards saw such writes by the opening that comes before them; the
+/// write-watched heap does not (runs ow63-ow66-move: 0.2 parts a frame
+/// stale with no write ever noted, no other caller resetting the watch).
+/// So the pages of `[at, at + len)` are noted in the journal under a number
+/// of their own once the bytes are there, as a refused asking's are
+/// ([`note_found`]): every copy of them is older.
+pub fn kernel_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let pages: Vec<(usize, u16)> = (at / PAGE..end.div_ceil(PAGE))
+        .map(|page| {
+            let (from, to) = ((page * PAGE).max(at) - page * PAGE, ((page + 1) * PAGE).min(end) - page * PAGE);
+            let (a, b) = (from / KERNEL_PAGE, to.div_ceil(KERNEL_PAGE));
+            let parts = if b - a >= PARTS { WHOLE } else { (((1u32 << b) - (1u32 << a)) & 0xffff) as u16 };
+            (page, parts)
+        })
+        .collect();
+    #[cfg(feature = "diagnostics")]
+    {
+        KERNEL_NOTED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        KERNEL_NOTED[1].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    note_hot(&pages);
+    let mut j = journal_mut();
+    let now = next_asking();
+    for (page, parts) in pages {
+        j.notes.note(page, parts, now);
+    }
+}
+
+/// Since the last line: kernel writes noted ([`kernel_wrote`]) and their
+/// bytes; overlapped reads seen to finish ([`kernel_writing_later`]).
+#[cfg(feature = "diagnostics")]
+static KERNEL_NOTED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Diagnostics: samples of 4 KiB parts a refresh copied, checked twice
+/// against title memory: right after the copy, and at the next frame line
+/// (`copy_check_line`). Address, the asking the copy was stamped at, the
+/// hash of title memory right after, whether the copy held the same then,
+/// and when.
+#[cfg(feature = "diagnostics")]
+static COPY_SAMPLES: Mutex<Vec<(usize, usize, u64, u64, bool, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// Diagnostics, since the last line: parts sampled; differing right after
+/// the copy, then found written since by the journal or the kernel, and
+/// not; changed later, found written, and not; asked about in vain (the
+/// kernel refused the look).
+#[cfg(feature = "diagnostics")]
+static COPY_CHECK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "diagnostics")]
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// Diagnostics: a refresh has just copied title memory at `at` into
+/// `held` (at most 4 KiB, of one kernel page), stamping it at asking `now`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_sample(at: usize, held: &[u8], now: u64) {
+    let mut title = [0u8; KERNEL_PAGE];
+    let n = held.len().min(KERNEL_PAGE);
+    if n == 0 || !crate::host::read_into(at as *const u8, &mut title[..n]) {
+        return;
+    }
+    COPY_CHECK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let alike = held[..n] == title[..n];
+    let mut samples = COPY_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() < 1 << 14 {
+        samples.push((at, n, now, fnv(&title[..n]), alike, std::time::Instant::now()));
+    }
+}
+
+/// Diagnostics: whether the 4 KiB part at `at` was written after asking
+/// `now` by what the journal holds or the kernel has yet to be asked
+/// (looked at without its reset); `None` if the kernel refused the look.
+#[cfg(feature = "diagnostics")]
+fn written_since(at: usize, now: u64) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let page = at / PAGE;
+    let _held = Asking::hold(page, page + 1);
+    let j = journal();
+    let stamp = match j.notes.parts_of(page) {
+        Some(parts) => parts[at % PAGE / KERNEL_PAGE],
+        None => j.notes.range(page, page + 1).first().map_or(0, |n| n.1),
+    };
+    drop(j);
+    if stamp > now {
+        return Some(true);
+    }
+    let mut found = [0usize; 1];
+    let (mut count, mut granularity) = (1usize, 0u32);
+    let part = at / KERNEL_PAGE * KERNEL_PAGE;
+    // SAFETY: room for one answer; no reset.
+    let failed = unsafe { GetWriteWatch(0, part as *const _, KERNEL_PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity) } != 0;
+    if failed { None } else { Some(count != 0) }
+}
+
+/// Diagnostics: the samples of [`copy_sample`] older than 200 ms checked
+/// again, and the line, per frame.
+#[cfg(feature = "diagnostics")]
+fn copy_check_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let due: Vec<(usize, usize, u64, u64, bool, std::time::Instant)> = {
+        let mut samples = COPY_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+        let (due, keep): (Vec<_>, Vec<_>) = samples.drain(..).partition(|s| s.5.elapsed() >= std::time::Duration::from_millis(200));
+        *samples = keep;
+        due
+    };
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut title = [0u8; KERNEL_PAGE];
+    for (at, n, now, hash, alike, _) in due {
+        let changed = !crate::host::read_into(at as *const u8, &mut title[..n]) || fnv(&title[..n]) != hash;
+        if alike && !changed {
+            continue;
+        }
+        let Some(seen) = written_since(at, now) else {
+            COPY_CHECK[6].fetch_add(1, Relaxed);
+            continue;
+        };
+        let k = match (alike, seen) {
+            (false, true) => 1,
+            (false, false) => 2,
+            (true, true) => 3,
+            (true, false) => 4,
+        };
+        COPY_CHECK[k].fetch_add(1, Relaxed);
+        if !seen && SAID.fetch_add(1, Relaxed) < 32 {
+            tracing::warn!(
+                "a copied part's title memory {} with no write noted since (copy check): {at:#x}, copied after asking {now}; {}",
+                if alike { "changed after the copy" } else { "differed from the copy right after it" },
+                audit_block(at),
+            );
+        }
+    }
+    let c: Vec<f64> = COPY_CHECK.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "copied parts checked against title memory per frame (copy check): {:.1} sampled; differing right after the copy {:.2} written since, {:.2} with no write          noted; changed later {:.2} written since, {:.2} with no write noted; {:.2} the kernel would not say",
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[6],
+    );
+}
+
+/// Kernel reads into title memory that went on after their call: the
+/// range, the title's `OVERLAPPED` (whose first word the kernel sets from
+/// `STATUS_PENDING` to the result), and when it was told.
+static KERNEL_PENDING: Mutex<Vec<(usize, usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// A read of the title's into `[at, at + len)` goes on after its call
+/// (overlapped, `ERROR_IO_PENDING`): its pages are noted in the journal
+/// when it is seen done, at the next submission's asking
+/// ([`kernel_writes_done`]).
+pub fn kernel_writing_later(at: usize, len: usize, overlapped: usize) {
+    if len == 0 || overlapped == 0 {
+        return;
+    }
+    KERNEL_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((at, len, overlapped, std::time::Instant::now()));
+}
+
+/// [`kernel_wrote`] of the overlapped reads [`kernel_writing_later`] was told
+/// of that are done (or whose `OVERLAPPED` cannot be read, or that are
+/// older than ten seconds: noted all the same).
+fn kernel_writes_done() {
+    const STATUS_PENDING: usize = 0x103;
+    let done: Vec<(usize, usize)> = {
+        let mut pending = KERNEL_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        pending.retain(|&(at, len, overlapped, told)| {
+            let mut status = 0usize;
+            let read = crate::host::read_into(overlapped as *const u8, bytemuck_bytes(&mut status));
+            if read && status == STATUS_PENDING && told.elapsed() < std::time::Duration::from_secs(10) {
+                return true;
+            }
+            done.push((at, len));
+            false
+        });
+        done
+    };
+    for (at, len) in done {
+        #[cfg(feature = "diagnostics")]
+        KERNEL_NOTED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        kernel_wrote(at, len);
+    }
+}
+
+fn bytemuck_bytes(word: &mut usize) -> &mut [u8] {
+    // SAFETY: a usize is its bytes.
+    unsafe { std::slice::from_raw_parts_mut(std::ptr::from_mut(word).cast::<u8>(), size_of::<usize>()) }
+}
+
+/// [`KERNEL_NOTED`], taken, for the log: per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kernel_noted_line(frames: f64) {
+    let k: Vec<f64> = KERNEL_NOTED.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "kernel writes into title memory noted in the journal per frame: {:.1}, {:.2} MB; overlapped reads seen done {:.2}",
+        k[0],
+        k[1] / 1e6,
+        k[2],
+    );
+}
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -4882,7 +5111,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, if len == 0 { first } else { last }, at, len)
 }
 
 impl Drop for KernelWrite {
@@ -4890,6 +5119,9 @@ impl Drop for KernelWrite {
         if self.0 == self.1 {
             return;
         }
+        // The call is done: what it read is there (an overlapped read that
+        // goes on is noted again when done, `kernel_writing_later`).
+        kernel_wrote(self.2, self.3);
         let mut g = guards();
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
             g.kernel.swap_remove(i);
@@ -4948,6 +5180,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    kernel_wrote(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {

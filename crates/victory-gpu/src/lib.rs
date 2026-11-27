@@ -139,8 +139,7 @@ pub use inplace::{pool_committed, title_memory_freeing, title_memory_section, ti
 pub use shadow::{title_memory_attributes, title_memory_write_combined};
 #[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_remapping_in, title_memory_splitting, title_memory_unmapping, title_memory_watched,
-    title_memory_written,
-    writing as kernel_will_write,
+    kernel_will_write, kernel_writing, kernel_writing_later, kernel_wrote, title_memory_allocated, title_memory_freed,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_remapping_in, title_memory_splitting,
+    title_memory_unmapping, title_memory_watched, title_memory_written,
 };

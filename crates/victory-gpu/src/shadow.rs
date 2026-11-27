@@ -5777,9 +5777,17 @@ impl Shadow {
         }
         let parts = crate::watch::parts_written(&again_at);
         #[cfg(feature = "diagnostics")]
-        stamped(self.id, base, &copied, now, from, to, &again_at, &parts);
+        if crate::host::piece_audit() {
+            stamped(self.id, base, &copied, now, from, to, &again_at, &parts);
+        }
         let runs = by_parts(runs, &again_at, &parts);
+        #[cfg(feature = "diagnostics")]
+        let sample = copy_sampled().then(|| runs.first().map(|r| (r.0, r.1))).flatten();
         let bytes = self.take_all(runs);
+        #[cfg(feature = "diagnostics")]
+        if let Some((from, to)) = sample {
+            self.copy_sample(from, to, now);
+        }
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
             let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
@@ -7711,6 +7719,37 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Diagnostics: whether this refresh's first run is checked against title
+/// memory (`crate::watch::copy_sample`): one in 16 (`VICTORY_COPY_CHECK=0`:
+/// none).
+#[cfg(feature = "diagnostics")]
+fn copy_sampled() -> bool {
+    static N: AtomicU64 = AtomicU64::new(0);
+    crate::toggled!("VICTORY_COPY_CHECK") && N.fetch_add(1, Ordering::Relaxed).is_multiple_of(16)
+}
+
+#[cfg(feature = "diagnostics")]
+impl Shadow {
+    /// The first kernel page of `[from, to)` (addresses) as the refresh
+    /// stamped at asking `now` left it, sampled for the copy check.
+    fn copy_sample(&self, from: usize, to: usize, now: u64) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to || self.place.is_some() || crate::readprobe::left_now(self) {
+            return;
+        }
+        let n = (KERNEL_PAGE - from % KERNEL_PAGE).min(to - from);
+        let busy = self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < from + n && e > from);
+        if busy {
+            return;
+        }
+        // SAFETY: inside the copy's CPU side; a race with a later refresh
+        // only makes the answer wrong, and it is diagnostics.
+        let held = unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
+        crate::watch::copy_sample(from, held, now);
+    }
 }
 
 /// Diagnostics: per copy and 64 KiB page, the asking a refresh last stamped

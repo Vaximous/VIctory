@@ -8419,12 +8419,13 @@ fn piece_looks() -> bool {
 /// [`piece_looks`], and where the look says it copies nothing one 4 KiB
 /// part of it is compared with title memory (`crate::shadow::Shadow::audit`);
 /// with the switch off the piece is refreshed all the same
-/// (`VICTORY_PIECE_AUDIT`, on unless `=0`). What a look called unchanged and
-/// was not is counted, and the first ones said.
+/// (`VICTORY_PIECE_AUDIT=1`; off by default since run ow66-move, so that
+/// the frame times count). What a look called unchanged and was not is
+/// counted, and the first ones said.
 #[cfg(feature = "diagnostics")]
-fn piece_audit() -> bool {
+pub(crate) fn piece_audit() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_AUDIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_AUDIT").is_some_and(|v| v == "1"))
 }
 
 /// Since the last line: pieces audited, of them called unchanged, of those
@@ -8481,14 +8482,16 @@ fn split_line(frames: f64) {
         fs[5] / 1e6,
     );
     let au: Vec<f64> = AUDIT[..4].iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    tracing::info!(
-        "pieces of long front spans audited per frame (VICTORY_PIECE_AUDIT): {:.0}, {:.0} of them called unchanged by their look, {:.2} of those differing in the part compared, \
-         {:.3} MB taken by the refresh of pieces called unchanged",
-        au[0],
-        au[1],
-        au[2],
-        au[3] / 1e6,
-    );
+    if piece_audit() {
+        tracing::info!(
+            "pieces of long front spans audited per frame (VICTORY_PIECE_AUDIT): {:.0}, {:.0} of them called unchanged by their look, {:.2} of those differing in the part compared, \
+             {:.3} MB taken by the refresh of pieces called unchanged",
+            au[0],
+            au[1],
+            au[2],
+            au[3] / 1e6,
+        );
+    }
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
