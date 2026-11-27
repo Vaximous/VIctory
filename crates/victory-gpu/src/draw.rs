@@ -291,6 +291,10 @@ fn frame_ms(frame: u64, now: u64) -> u64 {
     (last.2 as u64).max(1)
 }
 
+/// Microseconds the residency's steering took on its thread, since the
+/// start (`crate::tiles::status`).
+pub(crate) static STEER_MICROS: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the first upload of a texture with no host copy yet goes on the
 /// copy queue of `crate::texture::ahead` (`VICTORY_AHEAD_FIRST=0`: not).
 fn ahead_first() -> bool {
@@ -2800,11 +2804,45 @@ impl State {
         {
             static EPOCH: AtomicU64 = AtomicU64::new(0);
             const WINDOW: u32 = 4;
-            if EPOCH.swap(u64::from(now), Ordering::Relaxed) != u64::from(now)
+            // On a thread of its own, one steering at a time: over every
+            // slot read and every texture it took 50 to 200 ms of the
+            // recording thread once an epoch (run ow12: the hitches).
+            static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !BUSY.load(Ordering::Acquire)
+                && EPOCH.swap(u64::from(now), Ordering::Relaxed) != u64::from(now)
                 && let Some(lods) = crate::host::touched::slot_min_lod(WINDOW)
             {
-                host.note_level_wants(frame, now, &seen, &lods, WINDOW);
-                crate::resource::steer_levels(memory, now, WINDOW);
+                BUSY.store(true, Ordering::Release);
+                let at = std::ptr::from_ref(heap) as usize;
+                let job = move || {
+                    let began = std::time::Instant::now();
+                    crate::descriptor::with_heap(at, |heap| {
+                        if let Some(host) = heap.host() {
+                            host.note_level_wants(frame, now, &seen, &lods, WINDOW);
+                        }
+                    });
+                    crate::resource::steer_levels(memory, now, WINDOW);
+                    STEER_MICROS.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    BUSY.store(false, Ordering::Release);
+                };
+                static STEERING: std::sync::OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>>> =
+                    std::sync::OnceLock::new();
+                let send = STEERING.get_or_init(|| {
+                    let (send, jobs) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+                    std::thread::Builder::new()
+                        .name("victory-residency".into())
+                        .spawn(move || jobs.into_iter().for_each(|job| job()))
+                        .ok()
+                        .map(|_| std::sync::Mutex::new(send))
+                });
+                match send {
+                    Some(send) => {
+                        if let Err(job) = send.lock().unwrap_or_else(|e| e.into_inner()).send(Box::new(job)) {
+                            (job.0)();
+                        }
+                    }
+                    None => job(),
+                }
             }
         }
         let feedback = if evict_on() { crate::host::touched::slot_epochs() } else { None };

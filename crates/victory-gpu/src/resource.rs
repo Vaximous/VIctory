@@ -3262,12 +3262,18 @@ pub(crate) fn steer_levels(memory: Option<[u64; 4]>, epoch: u32, window: u32) {
             let asked = code as u32;
             // (Grown and trimmed to the same level: no going to and fro
             // about the band's top.)
-            (Some(asked.saturating_sub(1)), Some(asked.saturating_sub(1)))
+            // Two finer than asked: a pass that notes nothing (depth-only
+            // programs: shadow casters with alpha test) may read it finer
+            // than the colour pass asked.
+            (Some(asked.saturating_sub(2)), Some(asked.saturating_sub(2)))
         } else if want == 0 && now_ms.saturating_sub(born) > UNTOLD_MS {
             // Nothing noted of it at all: not a texture read through the
             // heap's slots as far as the feedback tells; whole, as before.
             (Some(0), None)
-        } else if want != 0 {
+        } else if want != 0 && cold_trim() {
+            // Asked of before, not lately: only with `VICTORY_TILED_COLD_TRIM=1`
+            // (a texture read only by programs that note nothing, shadow
+            // casters, looks asked of by none: run ow12 lost its sun shadows).
             (None, Some(coarse))
         } else {
             (None, None)
@@ -3307,6 +3313,14 @@ pub(crate) fn steer_levels(memory: Option<[u64; 4]>, epoch: u32, window: u32) {
         // (The start of its memory: its slots are made again.)
         freed += copy.set_floor(host.queue(), trim, 0);
     }
+}
+
+/// Whether residency takes the finest levels of textures not asked of
+/// lately down to their coarse ones (`VICTORY_TILED_COLD_TRIM=1`; off).
+#[cfg(windows)]
+fn cold_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TILED_COLD_TRIM").is_some_and(|v| v == "1"))
 }
 
 /// A texture's console memory and description; `None` for buffers.
