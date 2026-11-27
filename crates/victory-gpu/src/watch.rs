@@ -2084,7 +2084,8 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn guards_timed() -> GuardsW {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -2094,7 +2095,8 @@ fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
 }
 
 /// [`guards_shared`], the wait for it counted.
-fn guards_timed_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
+#[track_caller]
+fn guards_timed_shared() -> GuardsR {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards_shared();
@@ -2332,7 +2334,8 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     opened: Mutex::new(std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new())),
 });
 
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn guards() -> GuardsW {
     let mut g = guards_bare();
     if TAKING.1.load(std::sync::atomic::Ordering::SeqCst) != 0 {
         taken_now(&mut g, false, true);
@@ -2342,20 +2345,159 @@ fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
 
 /// The guards' lock alone, for a fault: what [`guard_apart`] made read-only
 /// meanwhile is noted only by [`open`] (if in its range), not covered.
-fn guards_bare() -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn guards_bare() -> GuardsW {
     if let Ok(g) = GUARDS.try_write() {
-        return g;
+        return GuardHeld::new(g, true);
     }
-    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let g = waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    lock_site_wait(std::panic::Location::caller(), began.elapsed());
+    GuardHeld::new(g, true)
 }
 
 /// The guards, shared (renderer port #6): what changes a block's state holds
 /// its claim ([`Claims`]).
-fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
+#[track_caller]
+fn guards_shared() -> GuardsR {
     if let Ok(g) = GUARDS.try_read() {
-        return g;
+        return GuardHeld::new(g, false);
     }
-    waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner()))
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let g = waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    lock_site_wait(std::panic::Location::caller(), began.elapsed());
+    GuardHeld::new(g, false)
+}
+
+/// The guards' lock as taken: with diagnostics, where it was taken and
+/// since when, so that what each place waited for it and held it is
+/// counted ([`lock_sites`]).
+struct GuardHeld<G> {
+    g: G,
+    #[cfg(feature = "diagnostics")]
+    at: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    site: &'static std::panic::Location<'static>,
+    #[cfg(feature = "diagnostics")]
+    write: bool,
+}
+
+type GuardsW = GuardHeld<std::sync::RwLockWriteGuard<'static, Guards>>;
+type GuardsR = GuardHeld<std::sync::RwLockReadGuard<'static, Guards>>;
+
+impl<G> GuardHeld<G> {
+    #[track_caller]
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    fn new(g: G, write: bool) -> Self {
+        GuardHeld {
+            g,
+            #[cfg(feature = "diagnostics")]
+            at: std::time::Instant::now(),
+            #[cfg(feature = "diagnostics")]
+            site: std::panic::Location::caller(),
+            #[cfg(feature = "diagnostics")]
+            write,
+        }
+    }
+}
+
+impl<G: std::ops::Deref<Target = Guards>> std::ops::Deref for GuardHeld<G> {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.g
+    }
+}
+
+impl<G: std::ops::DerefMut<Target = Guards>> std::ops::DerefMut for GuardHeld<G> {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.g
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl<G> Drop for GuardHeld<G> {
+    fn drop(&mut self) {
+        lock_site_held(self.site, self.write, self.at.elapsed());
+    }
+}
+
+/// Per place in this file that takes the guards' lock (by line, 256 places
+/// at most, more in the last): the line, waits and their nanoseconds, holds
+/// alone and shared and their nanoseconds. Since the last line.
+#[cfg(feature = "diagnostics")]
+static LOCK_SITES: [[std::sync::atomic::AtomicU64; 7]; 257] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 7] }; 257];
+
+#[cfg(feature = "diagnostics")]
+fn lock_site(site: &'static std::panic::Location<'static>) -> &'static [std::sync::atomic::AtomicU64; 7] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let line = u64::from(site.line());
+    let slot = &LOCK_SITES[(line % 256) as usize];
+    match slot[0].compare_exchange(0, line, Relaxed, Relaxed) {
+        Ok(_) => slot,
+        Err(had) if had == line => slot,
+        Err(_) => &LOCK_SITES[256],
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn lock_site_wait(site: &'static std::panic::Location<'static>, waited: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = lock_site(site);
+    s[1].fetch_add(1, Relaxed);
+    s[2].fetch_add(waited.as_nanos() as u64, Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+fn lock_site_held(site: &'static std::panic::Location<'static>, write: bool, held: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = lock_site(site);
+    let at = if write { 3 } else { 5 };
+    s[at].fetch_add(1, Relaxed);
+    s[at + 1].fetch_add(held.as_nanos() as u64, Relaxed);
+}
+
+/// Per frame, the places that waited longest for the guards' lock and those
+/// that held it longest (alone, and shared), by line of this file.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lock_sites(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let rows: Vec<[u64; 7]> = LOCK_SITES
+        .iter()
+        .map(|s| {
+            let mut row = [0u64; 7];
+            row[0] = s[0].load(Relaxed);
+            for i in 1..7 {
+                row[i] = s[i].swap(0, Relaxed);
+            }
+            row
+        })
+        .filter(|r| r[1] + r[3] + r[5] > 0)
+        .collect();
+    let top = |key: usize, count: usize| {
+        let mut sorted = rows.clone();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r[key]));
+        sorted
+            .iter()
+            .take(6)
+            .filter(|r| r[key] > 0)
+            .map(|r| {
+                let line = if r[0] == 0 { "other".to_string() } else { format!("line {}", r[0]) };
+                format!("{line} {:.1}x {:.2} ms", r[count] as f64 / frames, r[key] as f64 / 1e6 / frames)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "waited longest: {}; held alone longest: {}; held shared longest: {}",
+        top(2, 1),
+        top(4, 3),
+        top(6, 5)
+    )
 }
 
 /// Whether blocks a refresh found written are made read-only with the guards'
@@ -3969,7 +4111,8 @@ fn forget_views(first: usize, last: usize) {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
+#[track_caller]
+fn title_memory_changed(at: usize, len: usize) -> GuardsW {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
