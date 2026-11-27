@@ -10089,6 +10089,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        if title_dst {
+            // The kernel's writes are not in the write watch: they are
+            // noted in the journal as the title's kernel reads are.
+            crate::watch::kernel_wrote(dst as usize, len);
+        }
         return;
     }
     // The copy failed: a source page is not there, or the destination is
@@ -10096,6 +10101,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
         crate::watch::lost("a copy of the title's", dst as usize, len);
+        // (The kernel may have written its first pages.)
+        crate::watch::kernel_wrote(dst as usize, len);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -10105,7 +10112,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, title_dst);
+        if title_dst {
+            crate::watch::kernel_wrote(dst as usize, len);
+        }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
@@ -10128,7 +10138,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            read_pieces(at, to, remaining, false);
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
@@ -10138,15 +10148,17 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             unsafe { to.write_bytes(0, n) };
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            read_pieces(at, to, n, false);
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, title_dst: bool) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read; in title memory it is left
+    // as it is instead (zeros there are bytes the title never wrote: the
+    // pointers of its heap's block ends, for one).
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
@@ -10155,7 +10167,9 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    zero(to, n);
+                    if !title_dst {
+                        zero(to, n);
+                    }
                 }
             });
         }
