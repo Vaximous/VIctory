@@ -447,7 +447,9 @@ pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// (None for the other roles: their table 1 is not read, and the image's
+    /// UAV there was a view of the wrong type, D3D12 error 646.)
+    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -501,7 +503,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
+        if let Some(depth) = views.depth {
+            l.SetComputeRootDescriptorTable(1, depth);
+        }
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
