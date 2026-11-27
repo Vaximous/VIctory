@@ -9792,12 +9792,15 @@ impl Meter {
         crate::readprobe::line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
-            if passes + compares + wc_left > 0.0 {
+            let [wc_declared, wc_copies, wc_bytes] =
+                [0, 1, 2].map(|i| crate::shadow::WC_LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let wc_mb = wc_bytes / 1e6;
+            if passes + compares + wc_declared > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
-                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK=0: copied back)",
+                     writes left on the card in write-combined memory: {wc_declared:.0} ranges declared, in {wc_copies:.1} copies \
+                     of {wc_mb:.1} MB together (VICTORY_WC_NO_BACK=0: copied back)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
