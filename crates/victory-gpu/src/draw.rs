@@ -4478,8 +4478,22 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // Read as raw bytes (`crate::port_cbv`): viewed in
+                        // the host copy of title memory that holds them,
+                        // brought up to date at submission as a buffer
+                        // view's range is, instead of copied for the draw.
+                        if crate::port_cbv::in_place_on() {
+                            if let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                                && host.constant_in_place(index, &shadow, address, size)
+                            {
+                                shadow.refresh(list, address, u64::from(size));
+                                crate::port_cbv::in_place(size);
+                                continue;
+                            }
+                            crate::port_cbv::copied();
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            host.make_null_constant(index);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);

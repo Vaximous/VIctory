@@ -219,7 +219,8 @@ pub fn view_heap_limit() -> u32 {
 /// constant buffer's) has no end: it reads whatever lies there, up to 4 GiB on, and loses the
 /// device where nothing does; and a texture's descriptor read as a buffer's is a wild address.
 /// So the host keeps, for slot `i`, a raw view of the same bytes at this place + `i` (a constant
-/// buffer view of a constant buffer in a title slot, a null raw view of everything else), and
+/// buffer view of a constant buffer in a title slot, a raw view of its bytes with
+/// [`constants_raw`]; a null raw view of everything else), and
 /// shaders translated while this is set read picked buffers there, and tables' buffers that they
 /// read as raw bytes.
 /// A power of two above every slot index.
@@ -235,6 +236,37 @@ thread_local! {
 pub fn set_raw_views(first: u32) {
     debug_assert!(first == 0 || first.is_power_of_two());
     RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`constants_raw`] (unset: off in tests, so the tests written
+    /// before the switch still read constant buffers as they did).
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Constant buffers read as raw bytes (`VICTORY_PORT_CBV`; on by default, `0` turns it off).
+///
+/// The console takes a constant buffer anywhere on 16 bytes, a D3D12 constant buffer view only
+/// on 256. So the host copied every constant buffer a draw's tables name into upload memory of
+/// its own at each submission (some 22,000 a frame of the city, ~9 MB). A raw view starts on
+/// any 4 bytes, so with this switch every constant buffer read through a view heap slot (a
+/// table's, or one picked from the heap by index) is read as raw bytes through that slot, or
+/// through its raw twin where the host keeps them ([`raw_views`]); the host makes every
+/// constant buffer slot a raw view of exactly the title's bytes (its size from the title's
+/// descriptor), which may then be the bytes where they already lie on the host. A raw view's
+/// reads past its end give 0 on every host (D3D12 bounds-checks buffer views), as the console's
+/// reads past a buffer's records do. Root constant buffers (a root descriptor: an address and
+/// no size) stay constant buffers. The host's views must follow the same switch. Part of the
+/// translation: the shader cache keys on it.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    return CONSTANTS_RAW_HERE.get().unwrap_or(false);
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CBV").is_none_or(|v| v != "0"))
+    }
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).

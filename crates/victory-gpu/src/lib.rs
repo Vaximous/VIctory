@@ -58,6 +58,8 @@ pub mod pipeline;
 mod picked;
 #[cfg(windows)]
 mod pool;
+#[cfg(windows)]
+mod port_cbv;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
 #[cfg(windows)]

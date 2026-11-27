@@ -3331,6 +3331,25 @@ impl HostHeap {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
+        if crate::port_cbv::on() {
+            // Read as raw bytes (`crate::port_cbv`): the slot and its twin
+            // raw views of the copy's `size` bytes.
+            // SAFETY: a live buffer.
+            let (offset, width) = unsafe { (gpu - buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+            let made = constant_raw(buffer, offset, width, size, self.at(index));
+            if !made {
+                null_buffer_view(self.at(index));
+            }
+            self.put(index);
+            let twin = self.twin(index).filter(|_| made);
+            if let Some(twin) = twin {
+                constant_raw(buffer, offset, width, size, twin);
+            }
+            self.twin_made(index, twin.is_some());
+            self.write_stride(index, 0);
+            self.keep(index, (made && holds).then(|| buffer.clone()));
+            return;
+        }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
@@ -3367,6 +3386,44 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
+    }
+
+    /// `crate::port_cbv`: makes slot `index` (a dynamic one) the raw view of
+    /// the constant buffer of `size` bytes at title `address`, in the host
+    /// copy `shadow` that holds it, with nothing copied: the caller brings
+    /// the range up to date for its list. Whether it was made (`false`:
+    /// nothing was; the caller copies the bytes as before).
+    pub(crate) fn constant_in_place(&self, index: u32, shadow: &crate::shadow::Shadow, address: u64, size: u32) -> bool {
+        if shadow.offset_in(address).is_none() {
+            return false;
+        }
+        let (offset, width) = (shadow.offset(address), shadow.width());
+        if !constant_raw(&shadow.buffer, offset, width, size, self.at(index)) {
+            return false;
+        }
+        self.put(index);
+        let twin = self.twin(index);
+        if let Some(twin) = twin {
+            constant_raw(&shadow.buffer, offset, width, size, twin);
+        }
+        self.twin_made(index, twin.is_some());
+        self.write_stride(index, 0);
+        self.keep(index, Some(shadow.buffer.clone()));
+        true
+    }
+
+    /// Makes slot `index` (a dynamic one) a constant buffer that reads
+    /// nothing: a null raw view where shaders read constant buffers as raw
+    /// bytes (`crate::port_cbv`), else a null view.
+    pub(crate) fn make_null_constant(&self, index: u32) {
+        if !crate::port_cbv::on() {
+            return self.make_null(index);
+        }
+        null_buffer_view(self.at(index));
+        self.put(index);
+        self.write_stride(index, 0);
+        self.clear_twin(index);
+        self.keep(index, None);
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -4413,6 +4470,35 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// `crate::port_cbv`: makes at `at` the raw view of the constant buffer of
+/// `size` bytes at byte `offset` of `buffer` (`width` bytes), which
+/// translated shaders read it through: exactly the title's bytes, and never
+/// past the buffer's end ([`crate::port_cbv::raw_window`]). Whether it was
+/// made (`false`: nothing was).
+fn constant_raw(buffer: &ID3D12Resource, offset: u64, width: u64, size: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    let Some(host) = host() else { return false };
+    let Some((first, count)) = crate::port_cbv::raw_window(offset, width, size) else {
+        return false;
+    };
+    let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: count,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    };
+    // SAFETY: a live buffer that holds the range (`raw_window`), and a slot
+    // of our heaps.
+    unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), at) };
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4420,8 +4506,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 }
 
 /// [`make`]; `twin`: where the raw twin of a buffer view goes
-/// ([`raw_twins`]; a constant buffer's is the same view again, other views
-/// have none).
+/// ([`raw_twins`]; a constant buffer's is the same view again, a raw view
+/// with `crate::port_cbv` as the slot itself is; other views have none).
 fn make_twinned(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -4432,6 +4518,23 @@ fn make_twinned(
     match view {
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
+            if crate::port_cbv::on() {
+                // Shaders read constant buffers as raw bytes (`crate::port_cbv`):
+                // the slot and its twin are raw views of the title's bytes.
+                let (offset, width) = (shadow.offset(address), shadow.width());
+                if !constant_raw(&shadow.buffer, offset, width, size, at) {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        size,
+                        "constant buffer the host cannot view as raw bytes left null"
+                    );
+                    return None;
+                }
+                if let Some(twin) = twin {
+                    constant_raw(&shadow.buffer, offset, width, size, twin);
+                }
+                return Some(Some(shadow.buffer.clone()));
+            }
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -5051,6 +5154,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
+        // Read as raw bytes (`crate::port_cbv`): a null raw view.
+        View::Constant(..) if crate::port_cbv::on() => return null_buffer_view(at),
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.

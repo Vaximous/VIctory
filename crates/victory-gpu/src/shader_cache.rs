@@ -90,6 +90,10 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // And whether constant buffers are read as raw bytes
+        // (`VICTORY_PORT_CBV`, on unless `0`): the host's views follow it, so
+        // a translation made the other way must not be served.
+        bytes.push(u8::from(victory_shader::emit::constants_raw()));
         bytes
     });
     let mut hash = blake3::Hasher::new();

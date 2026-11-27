@@ -6804,13 +6804,28 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // (`VICTORY_PORT_CBV`: a constant buffer's slot is a raw view of
+            // its bytes, read as one.)
+            let as_raw = self.constants_raw(site, src)?;
+            let h = match as_raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
+            let dwords = match as_raw {
+                Some(h) => self.raw_dwords(h, addr, raw.len() as u32),
+                None => Vec::new(),
+            };
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = match dwords.get(k) {
+                    Some(&x) => x,
+                    None => {
+                        let b = self.cur;
+                        let off = self.s.m.i32(4 * k as u32);
+                        let a = self.s.m.bin(b, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6863,6 +6878,12 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.constants_raw(site, src)? {
+            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7334,6 +7355,31 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// `VICTORY_PORT_CBV` ([`super::shader::constants_raw`]): the handle the
+    /// constant buffer `src` is read through as raw bytes, or `None` to read
+    /// it as a constant buffer, as before.
+    ///
+    /// Every constant buffer read through a view heap slot (a table's, or one
+    /// picked from the heap by an index the program computes) is read so:
+    /// the host makes every such slot that holds a constant buffer a raw view
+    /// of the title's bytes, which needs them on 4 bytes rather than 256 and
+    /// so lets the host view them where they lie instead of copying them at
+    /// every submission. Through the raw twin of the slot where the host
+    /// keeps twins ([`Self::raw_twin`] picks it for a raw read), through the
+    /// slot itself where it does not (NVIDIA: its view heaps hold no twins);
+    /// both are the same raw view. A raw view's reads past its end give 0, as
+    /// the console's past a buffer's records do.
+    ///
+    /// A root constant buffer stays one: a root descriptor is an address
+    /// without a size, so a raw read through it as a root SRV would have no
+    /// end.
+    fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constants_raw() || matches!(src, Source::Built { .. } | Source::Constant(_)) {
+            return Ok(None);
+        }
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -7873,8 +7919,10 @@ impl<'a> Lower<'a> {
     /// heap itself (or picked and read as a constant buffer), the host's raw
     /// twin of that slot ([`super::shader::raw_views`]), whose reads end where
     /// the view does. Everything else (textures, typed buffers, tables'
-    /// constant buffers) stays in place. And whether it is a twin's (inside
-    /// the host's heap).
+    /// constant buffers read as constant buffers) stays in place; a table's
+    /// constant buffer read as raw bytes ([`Self::constants_raw`]) is a raw
+    /// read and goes to the twin. And whether it is a twin's (inside the
+    /// host's heap).
     ///
     /// Tables too: a view that does not begin on 16 bytes cannot be raw, and
     /// a pixel program of the main pass (3711fdad456538a1, stopped at in the
@@ -12344,7 +12392,11 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.constants_raw(site, src)?;
+            let h = match raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -12359,7 +12411,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = match raw {
+                    Some(_) => self.raw_dwords(h, a, 1)[0],
+                    None => self.cbuffer_dword(h, a),
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
