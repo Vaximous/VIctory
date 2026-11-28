@@ -61,8 +61,8 @@ pub(crate) fn words_under() -> bool {
 }
 
 const SCATTER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
-cbuffer Part : register(b0) { uint at; uint count; };
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), UAV(u0)"
+cbuffer Part : register(b0) { uint at; uint count; uint limit; };
 ByteAddressBuffer pairs : register(t0);
 RWByteAddressBuffer card : register(u0);
 [RootSignature(RS)]
@@ -70,6 +70,8 @@ RWByteAddressBuffer card : register(u0);
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
     uint2 p = pairs.Load2(at + id.x * 8u);
+    // A root view has no bounds: a word past the copy is never written.
+    if (p.x > limit - 4u) return;
     card.Store(p.x, p.y);
 }
 "#;
@@ -338,8 +340,9 @@ impl Own {
                     let mut done = 0;
                     while done < words {
                         let n = (words - done).min(MOST);
-                        let constants = [at as u32 + done * 8, n];
-                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        let limit = u32::try_from(shadow.title_len()).unwrap_or(u32::MAX).max(4);
+                        let constants = [at as u32 + done * 8, n, limit];
+                        list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
                         done += n;
                     }

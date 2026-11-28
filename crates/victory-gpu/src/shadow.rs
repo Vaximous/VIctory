@@ -4498,6 +4498,11 @@ impl Shadow {
         self.at
     }
 
+    /// How long the title buffer (and so the copy) is, in bytes.
+    pub(crate) fn title_len(&self) -> u64 {
+        self.len
+    }
+
     /// The card's address of the copy's first byte (of a copy that is not
     /// in place): what passes that read or write the copy by offsets in it
     /// bind.
