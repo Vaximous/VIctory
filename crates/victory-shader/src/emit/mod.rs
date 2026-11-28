@@ -2712,6 +2712,8 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
+            early_depth: false,
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         let cases: [(u32, u32, u32, u32); 12] = [
