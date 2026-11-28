@@ -1631,6 +1631,45 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// What a pipeline sync's flags ask the host for: nothing (cache
+/// invalidations and write-backs alone), a wait for compute work (a compute
+/// partial flush and caches), or the wait for every shader write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncNeed {
+    Nothing,
+    Compute,
+    Every,
+}
+
+/// The sync flags that wait or order work: the compute, vertex and pixel
+/// partial flushes and stream output, idle, the base, colour and depth
+/// coherency checks, the colour and depth data and meta flushes, the parser's
+/// sync with the micro engine and the DMA sync. The rest only invalidate or
+/// write back caches.
+const SYNC_WAITS: u32 = 0x0010_0000
+    | 0x0020_0000
+    | 0x0040_0000
+    | 0x0080_0000
+    | 0x8000_0000
+    | 0x0100_0000
+    | 0x4000_0000
+    | 0x2000_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x0800_0000
+    | 0x1000_0000
+    | 0x0000_0040
+    | 0x0002_0000;
+const SYNC_CS_PARTIAL: u32 = 0x0010_0000;
+
+pub(crate) fn sync_need(flags: u32) -> SyncNeed {
+    match flags & SYNC_WAITS {
+        0 => SyncNeed::Nothing,
+        SYNC_CS_PARTIAL => SyncNeed::Compute,
+        _ => SyncNeed::Every,
+    }
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. The host orders
 /// nothing between dispatches by itself: what shaders wrote is waited for
@@ -1661,8 +1700,23 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: an open list.
-            unsafe { list.list.title_wait() };
+            use crate::host::rec::{SYNCS, group_compute, sync_cache_only};
+            use std::sync::atomic::Ordering::Relaxed;
+            match sync_need(flags) {
+                SyncNeed::Nothing if sync_cache_only() => {
+                    SYNCS[0].fetch_add(1, Relaxed);
+                }
+                SyncNeed::Compute if group_compute() => {
+                    SYNCS[1].fetch_add(1, Relaxed);
+                    // SAFETY: an open list.
+                    unsafe { list.list.title_wait_compute(true) };
+                }
+                _ => {
+                    SYNCS[2].fetch_add(1, Relaxed);
+                    // SAFETY: an open list.
+                    unsafe { list.list.title_wait() };
+                }
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2342,7 +2396,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
             GroupNeed::Compute if group_compute() => {
                 GROUPS[1].fetch_add(1, Relaxed);
                 // SAFETY: an open list.
-                unsafe { list.list.title_wait_compute() };
+                unsafe { list.list.title_wait_compute(false) };
             }
             _ => {
                 GROUPS[2].fetch_add(1, Relaxed);
@@ -2655,6 +2709,18 @@ mod group_tests {
     const COMPUTE: u32 = 0x80;
     const PIXEL: u32 = 0x10;
     const RENDER_TARGET: u32 = 0x40;
+
+    #[test]
+    fn syncs_by_flags() {
+        use super::{SyncNeed, sync_need};
+        // The shapes the title uses outdoors.
+        assert_eq!(sync_need(0x10_0000), SyncNeed::Compute);
+        assert_eq!(sync_need(0xc380), SyncNeed::Nothing);
+        assert_eq!(sync_need(0xc280), SyncNeed::Nothing);
+        assert_eq!(sync_need(0x70_0000), SyncNeed::Every);
+        assert_eq!(sync_need(0xc3c0), SyncNeed::Every);
+        assert_eq!(sync_need(0x8000_0000), SyncNeed::Every);
+    }
 
     #[test]
     fn needs_by_access() {

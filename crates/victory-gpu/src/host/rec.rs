@@ -152,6 +152,28 @@ pub(crate) fn group_compute() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_COMPUTE").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_SYNC_CACHE_ONLY` (on by default; `0` off): a pipeline sync of the
+/// title's that only invalidates or writes back caches (no partial flush of
+/// compute, vertex or pixel work, no idle, no coherency check, no
+/// render-target or depth flush, no parser or DMA sync) makes no host wait:
+/// on the console it orders nothing by itself (a sync that waits comes with
+/// it), and host memory is coherent at the host's own barriers. Some of the
+/// title's syncs are of this kind, and each was a wait for every shader write
+/// (or one held and made before the next write).
+pub(crate) fn sync_cache_only() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SYNC_CACHE_ONLY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_CACHE_ONLY").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: the title's pipeline syncs left without a
+/// wait ([`sync_cache_only`]), made as waits for compute work
+/// ([`group_compute`]), and made as waits for every shader write.
+pub(crate) static SYNCS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Since the last frame-rate line: the title's barrier groups left without a
 /// wait by their accesses ([`group_access`]), made as compute-to-compute
 /// barriers ([`group_compute`]), and given the wait for every shader write.
@@ -226,15 +248,16 @@ impl Rec {
     }
 
     /// The title waits for earlier compute work's shader writes before later
-    /// compute work only ([`group_compute`]): an enhanced global barrier from
-    /// compute shading to compute shading, where the list has them, else
+    /// compute work only, or with `all` before all later work
+    /// ([`group_compute`]): an enhanced global barrier from compute shading
+    /// to compute shading (or to everything), where the list has them, else
     /// [`Rec::title_wait`]. Held as that one is where nothing could have
     /// written; once made, the list still counts as written (draws after it
     /// were not ordered behind the compute work's writes).
     ///
     /// # Safety
     /// An open list.
-    pub(crate) unsafe fn title_wait_compute(&self) {
+    pub(crate) unsafe fn title_wait_compute(&self, all: bool) {
         let Some(list7) = &self.list7 else {
             // SAFETY: the caller's.
             return unsafe { self.title_wait() };
@@ -249,11 +272,19 @@ impl Rec {
         self.flush();
         let compute = [D3D12_GLOBAL_BARRIER {
             SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
-            SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            SyncAfter: if all { D3D12_BARRIER_SYNC_ALL } else { D3D12_BARRIER_SYNC_COMPUTE_SHADING },
             AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
-            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
-                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
-                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER,
+            AccessAfter: if all {
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                    | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                    | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
+                    | D3D12_BARRIER_ACCESS_VERTEX_BUFFER
+                    | D3D12_BARRIER_ACCESS_INDEX_BUFFER
+                    | D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT
+                    | D3D12_BARRIER_ACCESS_COPY_SOURCE
+            } else {
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER
+            },
         }];
         // SAFETY: an open list (the caller's); a global barrier names nothing.
         unsafe {
@@ -443,6 +474,12 @@ pub(crate) fn line(frames: f64) {
     if left + compute + every > 0.0 {
         tracing::info!(
             "the title's barrier groups per frame: {left:.0} with no wait by their accesses (VICTORY_GROUP_ACCESS), {compute:.0} compute to compute (VICTORY_GROUP_COMPUTE), {every:.0} waiting for every shader write"
+        );
+    }
+    let [left, compute, every] = [0, 1, 2].map(|i| SYNCS[i].swap(0, Relaxed) as f64 / frames);
+    if left + compute + every > 0.0 {
+        tracing::info!(
+            "the title's pipeline syncs per frame: {left:.0} of caches only, no wait (VICTORY_SYNC_CACHE_ONLY), {compute:.0} for compute work (VICTORY_GROUP_COMPUTE), {every:.0} waiting for every shader write"
         );
     }
     let [made, left] = [0, 1].map(|i| CLAMP_WAITS[i].swap(0, Relaxed) as f64 / frames);
