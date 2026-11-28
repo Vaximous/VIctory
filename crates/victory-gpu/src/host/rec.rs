@@ -186,12 +186,14 @@ fn enhanced(list: &ID3D12GraphicsCommandList) -> bool {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
         // SAFETY: a live list; the feature data is the size given.
         let known = unsafe {
-            list.GetDevice::<ID3D12Device>().and_then(|device| {
-                device.CheckFeatureSupport(
+            let mut device: Option<ID3D12Device> = None;
+            list.GetDevice(&mut device).and_then(|()| match device {
+                Some(device) => device.CheckFeatureSupport(
                     D3D12_FEATURE_D3D12_OPTIONS12,
                     (&raw mut o).cast(),
                     size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
-                )
+                ),
+                None => Err(windows::core::Error::empty()),
             })
         };
         known.is_ok() && o.EnhancedBarriersSupported.as_bool()
