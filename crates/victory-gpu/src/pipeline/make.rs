@@ -115,7 +115,26 @@ fn ray_pass(shaders: &[Arc<Shader>]) -> bool {
     passes.iter().any(|name| named(shaders, name))
 }
 
+/// The light in the water's volume, in tiles (two compute programs): programs of one 64-lane
+/// wave a group, which a host of 32-lane waves gets in the wave-wide form only. In that form
+/// they leave whole tiles of open water dark (around boats, along shores, under bridges) and
+/// take about 15 ms of the card a frame upstream (RTX 5070, 25 fps with them, 30 without).
+/// Left out there, the water has no light of its own depth (darker, bluer) and no blocks, as
+/// our play script already did through `VICTORY_SKIP_PIPELINES`; `VICTORY_WATER_LIGHT=1` runs
+/// them.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+    }
     if !ray_tracing() {
         if named(shaders, b"CS_RaytracingResolve") || named(shaders, b"CS_ScreenProbes_ActivateRays") {
             return Some("ray tracing is off");
