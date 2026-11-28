@@ -59,6 +59,9 @@ pub(crate) static STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
+    /// The same list for enhanced barriers, where the device has them
+    /// ([`Rec::title_wait_compute`]).
+    list7: Option<ID3D12GraphicsCommandList7>,
     /// Whether anything is held (read at every use of the list, so not the
     /// lock).
     any: AtomicBool,
@@ -115,6 +118,64 @@ pub(crate) fn clamp_waits() -> bool {
 /// Since the last frame-rate line: the clamps' first waits made, and left out.
 pub(crate) static CLAMP_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// `VICTORY_GROUP_ACCESS` (on by default; `0` off): a barrier group of the
+/// title's makes the wait for every shader write only where one of its
+/// barriers says that what came before it may have written memory shaders
+/// reach (unordered access, copies, resolves, stream output, or the common
+/// access that may be anything), or that shaders read before it what is
+/// written after it. Groups that only move render targets and depth to being
+/// read, or a read to another read, are ordered on the host by the state
+/// changes of those textures, as with [`hold_waits`]; in the open world the
+/// title asks for some thousand groups a frame, and each wait made drains
+/// the card.
+pub(crate) fn group_access() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_GROUP_ACCESS") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_ACCESS").is_none_or(|v| v != "0"))
+}
+
+/// `VICTORY_GROUP_COMPUTE=1` (experimental, off by default): a barrier group
+/// of the title's whose waiting barriers are all from compute work to compute
+/// work is made as an enhanced global barrier from compute shading to compute
+/// shading, not as a wait for every shader write: draws before it go on
+/// while it waits. The list then still counts as written for the next group.
+/// Needs enhanced barriers on the device; without them the wait is as before.
+pub(crate) fn group_compute() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_GROUP_COMPUTE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_COMPUTE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line: the title's barrier groups left without a
+/// wait by their accesses ([`group_access`]), made as compute-to-compute
+/// barriers ([`group_compute`]), and given the wait for every shader write.
+pub(crate) static GROUPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Whether the device takes enhanced barriers (asked once).
+fn enhanced(list: &ID3D12GraphicsCommandList) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: a live list; the feature data is the size given.
+        let known = unsafe {
+            list.GetDevice::<ID3D12Device>().and_then(|device| {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut o).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+                )
+            })
+        };
+        known.is_ok() && o.EnhancedBarriersSupported.as_bool()
+    })
+}
+
 /// A wait for every shader write: an unordered-access barrier naming nothing.
 fn wait_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
@@ -126,8 +187,10 @@ fn wait_barrier() -> D3D12_RESOURCE_BARRIER {
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
+        let list7 = if group_compute() && enhanced(&list) { list.cast::<ID3D12GraphicsCommandList7>().ok() } else { None };
         Self {
             list,
+            list7,
             any: AtomicBool::new(false),
             held: Mutex::new(Held::default()),
             dirty: AtomicBool::new(true),
@@ -159,6 +222,48 @@ impl Rec {
         // SAFETY: the caller's; it names no resource.
         unsafe { self.barriers(&[wait_barrier()]) };
         self.dirty.store(false, Relaxed);
+        WAITS[0].fetch_add(1, Relaxed);
+    }
+
+    /// The title waits for earlier compute work's shader writes before later
+    /// compute work only ([`group_compute`]): an enhanced global barrier from
+    /// compute shading to compute shading, where the list has them, else
+    /// [`Rec::title_wait`]. Held as that one is where nothing could have
+    /// written; once made, the list still counts as written (draws after it
+    /// were not ordered behind the compute work's writes).
+    ///
+    /// # Safety
+    /// An open list.
+    pub(crate) unsafe fn title_wait_compute(&self) {
+        let Some(list7) = &self.list7 else {
+            // SAFETY: the caller's.
+            return unsafe { self.title_wait() };
+        };
+        self.quiet.store(false, Relaxed);
+        if hold_waits() && !self.dirty.load(Relaxed) {
+            self.waiting.store(true, Relaxed);
+            WAITS[1].fetch_add(1, Relaxed);
+            return;
+        }
+        // What is held goes first, in its order.
+        self.flush();
+        let compute = [D3D12_GLOBAL_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS
+                | D3D12_BARRIER_ACCESS_SHADER_RESOURCE
+                | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER,
+        }];
+        // SAFETY: an open list (the caller's); a global barrier names nothing.
+        unsafe {
+            list7.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: compute.as_ptr() },
+            }]);
+        }
+        self.uses.fetch_add(1, Relaxed);
         WAITS[0].fetch_add(1, Relaxed);
     }
 
@@ -332,6 +437,12 @@ pub(crate) fn line(frames: f64) {
     if now + held > 0.0 {
         tracing::info!(
             "the title's waits for every shader write per frame (VICTORY_HOLD_WAITS): {now:.0} made, {held:.0} held, {later:.0} of them made later"
+        );
+    }
+    let [left, compute, every] = [0, 1, 2].map(|i| GROUPS[i].swap(0, Relaxed) as f64 / frames);
+    if left + compute + every > 0.0 {
+        tracing::info!(
+            "the title's barrier groups per frame: {left:.0} with no wait by their accesses (VICTORY_GROUP_ACCESS), {compute:.0} compute to compute (VICTORY_GROUP_COMPUTE), {every:.0} waiting for every shader write"
         );
     }
     let [made, left] = [0, 1].map(|i| CLAMP_WAITS[i].swap(0, Relaxed) as f64 / frames);

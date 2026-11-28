@@ -2212,12 +2212,112 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// What a call's barrier groups need of the host: nothing (no barrier says
+/// that shader-reachable memory was written before it, or read before and
+/// written after it), a wait from compute work to compute work, or the wait
+/// for every shader write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupNeed {
+    Nothing,
+    Compute,
+    Every,
+}
+
+/// Accesses that write memory shaders reach on the host: unordered access,
+/// stream output, copy and resolve destinations, acceleration structure
+/// writes and the video writes. Render targets and depth are left out: the
+/// host orders those by their textures' state changes.
+const GROUP_WRITES: u32 = 0x10 | 0x100 | 0x400 | 0x1000 | 0x8000 | 0x40000 | 0x10_0000 | 0x40_0000;
+/// Accesses that read memory shaders write on the host (vertex, constant and
+/// index buffers, unordered access, shader resources, indirect arguments,
+/// copy and resolve sources, acceleration structure reads, shading rate,
+/// the video reads).
+const GROUP_READS: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x80 | 0x200 | 0x800 | 0x2000 | 0x4000 | 0x1_0000 | 0x2_0000 | 0x8_0000 | 0x20_0000;
+const ACCESS_NONE: u32 = 0x8000_0000;
+const SYNC_COMPUTE: u32 = 0x80;
+const SYNC_SPLIT: u32 = 0x8000_0000;
+
+/// What one barrier `(sync before, sync after, access before, access after)`
+/// needs (as [`GroupNeed`]). The common access (0) may be anything; a split
+/// barrier's half is taken as a whole wait.
+pub(crate) fn barrier_need(sync_before: u32, sync_after: u32, before: u32, after: u32) -> GroupNeed {
+    if (sync_before | sync_after) & SYNC_SPLIT != 0 {
+        return GroupNeed::Every;
+    }
+    let nothing_before = sync_before == 0 || before & ACCESS_NONE != 0;
+    let nothing_after = sync_after == 0 || after & ACCESS_NONE != 0;
+    let wrote = !nothing_before && (before == 0 || before & GROUP_WRITES != 0);
+    let read = !nothing_before && (before == 0 || before & GROUP_READS != 0);
+    let writes = !nothing_after && (after == 0 || after & GROUP_WRITES != 0);
+    if !(wrote || (read && writes)) {
+        return GroupNeed::Nothing;
+    }
+    if sync_before == SYNC_COMPUTE && sync_after == SYNC_COMPUTE {
+        GroupNeed::Compute
+    } else {
+        GroupNeed::Every
+    }
+}
+
+/// What `count` barrier groups at `groups` need: the most any barrier of
+/// them does. Each group is a type (global 0, texture 1, buffer 2), a count
+/// and a pointer to its barriers, which all begin with the two syncs and the
+/// two accesses (strides 16, 64 and 40 bytes). An unknown type, or a group
+/// that cannot be read, needs the wait for every shader write.
+///
+/// # Safety
+/// `groups` is null or points to `count` groups the title passed, whose
+/// barrier pointers are valid for their counts.
+pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
+    if groups.is_null() {
+        return GroupNeed::Every;
+    }
+    let mut need = GroupNeed::Nothing;
+    for g in 0..count as usize {
+        // SAFETY: the caller's; 16 bytes a group.
+        let (kind, n, first) = unsafe {
+            let at = groups.add(g * 16);
+            (
+                at.cast::<u32>().read_unaligned(),
+                at.add(4).cast::<u32>().read_unaligned(),
+                at.add(8).cast::<*const u8>().read_unaligned(),
+            )
+        };
+        let stride = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => return GroupNeed::Every,
+        };
+        if n == 0 {
+            continue;
+        }
+        if first.is_null() {
+            return GroupNeed::Every;
+        }
+        for b in 0..n as usize {
+            // SAFETY: the caller's; the first four words of each barrier.
+            let [sb, sa, ab, aa] = unsafe {
+                let at = first.add(b * stride).cast::<u32>();
+                [0, 1, 2, 3].map(|i| at.add(i).read_unaligned())
+            };
+            match barrier_need(sb, sa, ab, aa) {
+                GroupNeed::Every => return GroupNeed::Every,
+                GroupNeed::Compute => need = GroupNeed::Compute,
+                GroupNeed::Nothing => {}
+            }
+        }
+    }
+    need
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+/// write (the title's buffer barriers order compute passes), where their
+/// accesses ask for one ([`crate::host::rec::group_access`]).
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2231,11 +2331,28 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         with_state(this, |_, state| state.synced());
-        // SAFETY: an open list.
-        unsafe { list.list.title_wait() };
+        use crate::host::rec::{GROUPS, group_access, group_compute};
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: the title's groups, as it passed them.
+        let need = if group_access() || group_compute() { unsafe { groups_need(count, groups) } } else { GroupNeed::Every };
+        match need {
+            GroupNeed::Nothing if group_access() => {
+                GROUPS[0].fetch_add(1, Relaxed);
+            }
+            GroupNeed::Compute if group_compute() => {
+                GROUPS[1].fetch_add(1, Relaxed);
+                // SAFETY: an open list.
+                unsafe { list.list.title_wait_compute() };
+            }
+            _ => {
+                GROUPS[2].fetch_add(1, Relaxed);
+                // SAFETY: an open list.
+                unsafe { list.list.title_wait() };
+            }
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2522,6 +2639,89 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::{GroupNeed, barrier_need, groups_need};
+
+    const UAV: u32 = 0x10;
+    const SRV: u32 = 0x80;
+    const RT: u32 = 0x8;
+    const COPY_DEST: u32 = 0x400;
+    const NONE: u32 = 0x8000_0000;
+    const COMPUTE: u32 = 0x80;
+    const PIXEL: u32 = 0x10;
+    const RENDER_TARGET: u32 = 0x40;
+
+    #[test]
+    fn needs_by_access() {
+        // Unordered access to a read: compute to compute, or a wait for all.
+        assert_eq!(barrier_need(COMPUTE, COMPUTE, UAV, SRV), GroupNeed::Compute);
+        assert_eq!(barrier_need(COMPUTE, PIXEL, UAV, SRV), GroupNeed::Every);
+        // A render target read next: the host's state changes order it.
+        assert_eq!(barrier_need(RENDER_TARGET, PIXEL, RT, SRV), GroupNeed::Nothing);
+        // Nothing before.
+        assert_eq!(barrier_need(0, COMPUTE, NONE, UAV), GroupNeed::Nothing);
+        // Read before, written after: the reads must be done first.
+        assert_eq!(barrier_need(PIXEL, COMPUTE, SRV, UAV), GroupNeed::Every);
+        assert_eq!(barrier_need(COMPUTE, COMPUTE, SRV, UAV), GroupNeed::Compute);
+        // Read to read.
+        assert_eq!(barrier_need(PIXEL, COMPUTE, SRV, SRV), GroupNeed::Nothing);
+        // Copies and the common access count as writes.
+        assert_eq!(barrier_need(0x200, PIXEL, COPY_DEST, SRV), GroupNeed::Every);
+        assert_eq!(barrier_need(1, 1, 0, 0), GroupNeed::Every);
+        // A split half.
+        assert_eq!(barrier_need(0x8000_0000, COMPUTE, UAV, SRV), GroupNeed::Every);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn layouts_and_groups() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        assert_eq!(size_of::<D3D12_BARRIER_GROUP>(), 16);
+        assert_eq!(size_of::<D3D12_GLOBAL_BARRIER>(), 16);
+        assert_eq!(size_of::<D3D12_TEXTURE_BARRIER>(), 64);
+        assert_eq!(size_of::<D3D12_BUFFER_BARRIER>(), 40);
+        let texture = D3D12_TEXTURE_BARRIER {
+            SyncBefore: D3D12_BARRIER_SYNC_RENDER_TARGET,
+            SyncAfter: D3D12_BARRIER_SYNC_PIXEL_SHADING,
+            AccessBefore: D3D12_BARRIER_ACCESS_RENDER_TARGET,
+            AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+            ..Default::default()
+        };
+        let buffers = [
+            D3D12_BUFFER_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                ..Default::default()
+            },
+            D3D12_BUFFER_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                SyncAfter: D3D12_BARRIER_SYNC_PIXEL_SHADING,
+                AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                ..Default::default()
+            },
+        ];
+        let group = |kind, n, at: *const u8| D3D12_BARRIER_GROUP {
+            Type: kind,
+            NumBarriers: n,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: at.cast() },
+        };
+        let t = group(D3D12_BARRIER_TYPE_TEXTURE, 1, std::ptr::from_ref(&texture).cast());
+        let b1 = group(D3D12_BARRIER_TYPE_BUFFER, 1, buffers.as_ptr().cast());
+        let b2 = group(D3D12_BARRIER_TYPE_BUFFER, 2, buffers.as_ptr().cast());
+        // SAFETY: groups made here, alive for the calls.
+        unsafe {
+            assert_eq!(groups_need(1, std::ptr::from_ref(&t).cast()), GroupNeed::Nothing);
+            assert_eq!(groups_need(2, [t, b1].as_ptr().cast()), GroupNeed::Compute);
+            assert_eq!(groups_need(2, [t, b2].as_ptr().cast()), GroupNeed::Every);
+            assert_eq!(groups_need(1, std::ptr::null()), GroupNeed::Every);
         }
     }
 }
