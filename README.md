@@ -65,7 +65,8 @@ appears, at about 9,400-9,700 draws a frame.
 |---|---|---|---|---|---|---|
 | bench20 | 47.7 | 21.0 | 120 ms | 654 ms | 4.99 / 4.07 / 4.35 | outdoor baseline |
 | bench21 | 45.7 | 21.9 | 75 ms | 216 ms | 4.71 / 3.77 / 4.40 | front spans of a copy joined; sends streamed into upload memory |
-| **bench22** | | | | 144 ms | not slower (see below) | merges into title memory by whole qwords (crash fix); more helper threads, kept awake |
+| bench22 | | | | 144 ms | not slower (see below) | merges into title memory by whole qwords; more helper threads, kept awake |
+| **bench23** | | | | 185 ms | not slower (see below) | crash fix: the title's heap nodes never take a stale card value; in-place copies noted as sent |
 
 (ms, fps, p99 and worst over world frames 1000-3000; per-draw figures over the window.)
 
@@ -73,6 +74,22 @@ bench22's run left the route and stayed indoors (about 2,850 draws a frame,
 37.0 ms, 27.0 fps), so it has no same-scene figures. Fitted against bench21 at
 the same draw counts it was within noise: frame -3.3 ms, preparing +0.5, GPU
 +0.4. It is the base because it closes a crash path.
+
+bench23 is a crash fix, not a speed-up. Its run ran 180 s with no crash but
+ended beside the pickup rather than in it (about 5,100 draws in the window), so
+it too has no same-scene figures; fitted against bench21 and the outdoor runs at
+the same draw counts it was within noise (frame +0.6 ms, preparing +1.1, GPU
++0.7). Builds that hit the crash within a minute in two of two runs ran clean
+with the fix.
+
+The route replay also gained a camera heading trace
+(`VICTORY_ROUTE_CAMERA_TRACE`): the title's follow camera turns by itself while
+the character walks, by a different amount each run, so runs split at the front
+door. Replaying the camera to a recorded heading, and starting the walk when the
+gameplay camera comes up, holds the heading to within 0.01 rad; the walk still
+lands outdoors in about half the runs, so builds are compared at the same draw
+counts. Replays should set `VICTORY_ROUTE_FRAME_MS=0` and
+`VICTORY_ROUTE_SETTLE_MOST_S=0`.
 
 ### Where a frame goes (bench19, moving)
 
@@ -140,6 +157,18 @@ What was learned along the way:
   from each side, and the title later crashed walking its heap lists. Merging
   each aligned qword with one compare-exchange stops torn pointers; it costs about
   2.5 times as much per merge, but on the copy-back threads, not the submitting one.
+- **A stale card side must never win, part two.** The title's allocator keeps a
+  small node at the end of every 64 KiB block, holding an offset into its record
+  region. One large buffer's card copy fell behind ours, holding 0 where the title
+  held the offset; when shaders wrote elsewhere in that block, the landing merge
+  took the card's 0 for a shader write and stored it, and the title then walked
+  to the region's base and crashed. Keeping the title's bytes wherever the card
+  differed at a block's end fixed the crash but cost 30 ms a frame (shaders really
+  do clear those bytes, about 250 times a frame, so the same blocks were merged
+  again every frame); keeping them only where the node's offset alone went to zero
+  costs nothing measurable and fires about once every 20 frames. Buffer copies the
+  title does in place are now noted as sent, so a landing fetched before them
+  cannot write the card's older bytes back over them.
 - **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
   between the title's first list call and its first submission are not waits on
   us: its submitting thread waits on no fence, event or label at all.
@@ -209,6 +238,8 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_BAKE_SLICE_MS` | The decal bake's texture pass runs in time slices with a catch-up of the slots written lately. |
 | `VICTORY_JOIN_SPANS` | Front spans of one copy that touch or overlap are joined before they are looked at, so fewer looks and refresh items. |
 | `VICTORY_STREAM_SENDS` | Bytes sent up at a submission are written into upload memory with streaming stores. |
+| `VICTORY_LAND_KEEP_FOOT` | Where a landing would zero only the record offset of the title's node at a 64 KiB block's end, the title's bytes are kept and sent to the card. |
+| `VICTORY_PLACED_SENT` | The title's buffer copies done in place are noted as sent with their submission, so earlier landings leave those bytes alone. |
 | `VICTORY_MERGE_QWORDS` | Landed card results are merged into title memory by whole aligned qwords, each with one compare-exchange, so a pointer is never half old and half new. |
 | `VICTORY_WIDE_SPIN=100` | Helper threads stay awake 100 us after a job before sleeping; a third of the machine's threads (up to 8) take shared work, and 6 to 8 refresh title bytes under in-flight writes. |
 
