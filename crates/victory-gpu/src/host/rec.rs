@@ -487,5 +487,11 @@ pub(crate) fn line(frames: f64) {
     let [made, left] = [0, 1].map(|i| CLAMP_WAITS[i].swap(0, Relaxed) as f64 / frames);
     if made + left > 0.0 {
         tracing::info!("argument clamps' waits per frame (VICTORY_CLAMP_WAITS): {made:.0} made, {left:.0} left out");
+    }    let [publish, draw, dispatch, copy, open] =
+        [0, 1, 2, 3, 4].map(|i| crate::draw::BATCH_ENDS[i].swap(0, Relaxed) as f64 / frames);
+    if publish + draw + dispatch + copy + open > 0.0 {
+        tracing::info!(
+            "indirect clamp batches ended per frame: {publish:.1} by a wait that can publish arguments, {draw:.1} by a draw after dispatches, {dispatch:.1} by a shader writing buffers, {copy:.1} by a copy; {open:.1} waits left a written batch open (VICTORY_BATCH_PUBLISH)"
+        );
     }
 }

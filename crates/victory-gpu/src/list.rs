@@ -803,7 +803,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         && !barriers.is_null()
     {
         if count > 0 {
-            with_state(this, |_, state| state.synced());
+            with_state(this, |_, state| state.synced(true));
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
@@ -1680,7 +1680,7 @@ pub(crate) fn sync_need(flags: u32) -> SyncNeed {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
+        with_state(this, |_, state| state.synced(true));
         if let Some(list) = host_list(this) {
             #[cfg(feature = "diagnostics")]
             {
@@ -2339,18 +2339,21 @@ fn note_barrier(kind: u32, b: [u32; 4]) {
 /// them does. Each group is a type (global 0, texture 1, buffer 2), a count
 /// and a pointer to its barriers, which all begin with the two syncs and the
 /// two accesses (strides 16, 64 and 40 bytes). An unknown type, or a group
-/// that cannot be read, needs the wait for every shader write.
+/// that cannot be read, needs the wait for every shader write. Also whether
+/// any barrier can publish indirect arguments ([`publishes_arguments`]; an
+/// unreadable group can).
 ///
 /// # Safety
 /// `groups` is null or points to `count` groups the title passed, whose
 /// barrier pointers are valid for their counts.
-pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
+pub(crate) unsafe fn groups_need_publish(count: u32, groups: *const u8) -> (GroupNeed, bool) {
     if groups.is_null() {
         #[cfg(feature = "diagnostics")]
         note_barrier(0x300, [count, 0, 0, 0]);
-        return GroupNeed::Every;
+        return (GroupNeed::Every, true);
     }
     let mut need = GroupNeed::Nothing;
+    let mut publishes = false;
     for g in 0..count as usize {
         // SAFETY: the caller's; 16 bytes a group.
         let (kind, n, first) = unsafe {
@@ -2376,7 +2379,7 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
             0 => 16,
             1 => 64,
             2 => 40,
-            _ => return GroupNeed::Every,
+            _ => return (GroupNeed::Every, true),
         };
         if n == 0 {
             continue;
@@ -2384,7 +2387,7 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
         if first.is_null() {
             #[cfg(feature = "diagnostics")]
             note_barrier(0x400 | kind, [n, 0, 0, 0]);
-            return GroupNeed::Every;
+            return (GroupNeed::Every, true);
         }
         for b in 0..n as usize {
             // SAFETY: the caller's; the first four words of each barrier.
@@ -2394,14 +2397,41 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
             };
             #[cfg(feature = "diagnostics")]
             note_barrier(kind, [sb, sa, ab, aa]);
+            publishes |= publishes_arguments(sa, aa);
             match barrier_need(sb, sa, ab, aa) {
-                GroupNeed::Every => return GroupNeed::Every,
-                GroupNeed::Compute => need = GroupNeed::Compute,
+                GroupNeed::Every => need = GroupNeed::Every,
+                GroupNeed::Compute if need == GroupNeed::Nothing => need = GroupNeed::Compute,
+                GroupNeed::Compute => {}
                 GroupNeed::Nothing => {}
             }
         }
     }
-    need
+    (need, publishes)
+}
+
+/// [`groups_need_publish`]'s need alone.
+///
+/// # Safety
+/// As [`groups_need_publish`].
+#[cfg(test)]
+pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
+    // SAFETY: the caller's.
+    unsafe { groups_need_publish(count, groups) }.0
+}
+
+/// Whether a barrier with this after side can make shader writes visible to
+/// the argument fetch of indirect executions: the indirect-argument access,
+/// the common access (anything) with a sync, the execute-indirect or every
+/// sync, or a split barrier's half.
+pub(crate) fn publishes_arguments(sync_after: u32, after: u32) -> bool {
+    const INDIRECT_ARGUMENT: u32 = 0x200;
+    const SYNC_ALL: u32 = 0x1;
+    const SYNC_EXECUTE_INDIRECT: u32 = 0x800;
+    sync_after & SYNC_SPLIT != 0
+        || after & ACCESS_NONE == 0
+            && (after & INDIRECT_ARGUMENT != 0
+                || after == 0 && sync_after != 0
+                || sync_after & (SYNC_ALL | SYNC_EXECUTE_INDIRECT) != 0)
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -2420,31 +2450,36 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         }
     }
     if count > 0 {
-        barrier_groups_need(this, count, title_groups_need(count, groups));
+        let (need, publishes) = title_groups_need(count, groups);
+        barrier_groups_need(this, count, need, publishes);
     }
 }
 
-/// What the title's groups need, with [`groups_need`] when a switch looks
-/// at their accesses (else the wait for every shader write).
-pub(crate) fn title_groups_need(count: u32, groups: *const u8) -> GroupNeed {
+/// What the title's groups need, with [`groups_need_publish`] when a switch
+/// looks at their accesses (else the wait for every shader write), and
+/// whether they can publish indirect arguments (always, unless
+/// [`crate::draw::batch_publish`] looks).
+pub(crate) fn title_groups_need(count: u32, groups: *const u8) -> (GroupNeed, bool) {
     use crate::host::rec::{group_access, group_compute};
-    if group_access() || group_compute() {
-        // SAFETY: the title's groups, as it passed them, during its call.
-        unsafe { groups_need(count, groups) }
-    } else {
-        GroupNeed::Every
+    let access = group_access() || group_compute();
+    if !access && !crate::draw::batch_publish() {
+        return (GroupNeed::Every, true);
     }
+    // SAFETY: the title's groups, as it passed them, during its call.
+    let (need, publishes) = unsafe { groups_need_publish(count, groups) };
+    (if access { need } else { GroupNeed::Every }, publishes)
 }
 
 /// The host's side of the title's barrier groups, by what they need: also
 /// for lists whose calls were written down and are made now
-/// (`list::thin`), where the groups themselves are gone.
-pub(crate) fn barrier_groups_need(this: This, count: u32, need: GroupNeed) {
+/// (`list::thin`), where the groups themselves are gone. `publishes`: as
+/// [`crate::draw::State::synced`]'s.
+pub(crate) fn barrier_groups_need(this: This, count: u32, need: GroupNeed, publishes: bool) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
-        with_state(this, |_, state| state.synced());
+        with_state(this, |_, state| state.synced(publishes));
         use crate::host::rec::{GROUPS, group_access, group_compute};
         use std::sync::atomic::Ordering::Relaxed;
         match need {
@@ -2464,7 +2499,7 @@ pub(crate) fn barrier_groups_need(this: This, count: u32, need: GroupNeed) {
         }
     }
     #[cfg(not(windows))]
-    let _ = (this, count, need);
+    let _ = (this, count, need, publishes);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2757,7 +2792,7 @@ mod tests {
 
 #[cfg(test)]
 mod group_tests {
-    use super::{GroupNeed, barrier_need, groups_need};
+    use super::{GroupNeed, barrier_need, groups_need, groups_need_publish, publishes_arguments};
 
     const UAV: u32 = 0x10;
     const SRV: u32 = 0x80;
@@ -2846,6 +2881,20 @@ mod group_tests {
             assert_eq!(groups_need(2, [t, b1].as_ptr().cast()), GroupNeed::Compute);
             assert_eq!(groups_need(2, [t, b2].as_ptr().cast()), GroupNeed::Every);
             assert_eq!(groups_need(1, std::ptr::null()), GroupNeed::Every);
+            // Shader resources after: no argument fetch.
+            assert!(!groups_need_publish(2, [t, b1].as_ptr().cast()).1);
+            assert!(groups_need_publish(1, std::ptr::null()).1);
+            assert!(groups_need_publish(2, [t, b2].as_ptr().cast()).0 == GroupNeed::Every);
         }
+        // Indirect arguments, the execute-indirect or every sync, the common
+        // access with a sync, a split half: these publish; no access does not.
+        assert!(publishes_arguments(0x80, 0x200));
+        assert!(publishes_arguments(0x800, 0x80));
+        assert!(publishes_arguments(0x1, 0x10));
+        assert!(publishes_arguments(0x80, 0));
+        assert!(publishes_arguments(0x8000_0000, 0x8000_0000));
+        assert!(!publishes_arguments(0, 0));
+        assert!(!publishes_arguments(0x80, 0x10 | 0x80));
+        assert!(!publishes_arguments(0x1, 0x8000_0000));
     }
 }

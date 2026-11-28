@@ -944,13 +944,51 @@ fn windows() -> bool {
 /// dispatches the title runs side by side (its tile classes, up to 92 at a
 /// time) are not held up by waits of ours. Off: whether the title has ways
 /// to wait that do not pass through its lists' methods is not known.
+///
+/// Unset, it is 2 under [`batch_publish`] and 1 otherwise.
 fn batches() -> u8 {
-    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
-        Ok("0") => 0,
-        Ok("2") => 2,
-        _ => 1,
-    })
+    static ASKED: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+        Ok("0") => Some(0),
+        Ok("1") => Some(1),
+        Ok("2") => Some(2),
+        _ => None,
+    });
+    asked.unwrap_or(if batch_publish() { 2 } else { 1 })
+}
+
+/// Whether a batch of clamps that dispatches may have written into ends only at a
+/// title wait that can make arguments visible to indirect executions
+/// (`VICTORY_BATCH_PUBLISH`, on; `0`: at every wait, as before), and batches
+/// are of mode 2 ([`batches`]) unless asked otherwise. Under the enhanced barrier
+/// model a shader's writes reach the argument fetch only through a barrier whose
+/// after side names the indirect-argument access or the execute-indirect sync,
+/// or a wide one (all syncs, the common access): [`crate::list::publishes_arguments`]
+/// says which do. Replayed outdoor frame: 200 clamp passes became 91 and the
+/// frame 82 ms became 50 (mode 2 alone, every wait ending the batch).
+/// shortcut: a title that publishes arguments by a wait without those bits (out
+/// of the model) would have draws read records clamped before it.
+pub(crate) fn batch_publish() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_BATCH_PUBLISH")) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_PUBLISH").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line, batches of clamps ended: by a title wait that
+/// can publish arguments, by a draw after dispatches, by a dispatch that may write
+/// buffers (mode 1), by a copy into a buffer; and title waits that left a batch
+/// written into open ([`batch_publish`]).
+pub(crate) static BATCH_ENDS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn batch_end(reason: usize) {
+    BATCH_ENDS[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The records clamped by the pass opened last ([`batches`]).
@@ -5735,28 +5773,41 @@ impl State {
     fn buffers_written(&mut self) {
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
-            batch => *batch = None,
+            batch => {
+                if batch.take().is_some() {
+                    batch_end(2);
+                }
+            }
         }
     }
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
-            self.batch = None;
+        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) && self.batch.take().is_some() {
+            batch_end(2);
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
         self.window = None;
-        self.batch = None;
+        if self.batch.take().is_some() {
+            batch_end(3);
+        }
     }
 
-    /// The title waits for earlier work (a barrier or a pipeline sync).
-    pub(crate) fn synced(&mut self) {
+    /// The title waits for earlier work (a barrier or a pipeline sync);
+    /// `publishes`: a wait that can make what shaders wrote visible to
+    /// indirect executions' argument fetch ([`batch_publish`]).
+    pub(crate) fn synced(&mut self, publishes: bool) {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
-            self.batch = None;
+            if publishes || !batch_publish() {
+                self.batch = None;
+                batch_end(0);
+            } else {
+                batch_end(4);
+            }
         }
     }
 
@@ -5777,8 +5828,9 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
-            self.synced();
+        if kind != DISPATCH && self.batch.as_ref().is_some_and(|b| b.wrote) {
+            self.batch = None;
+            batch_end(1);
         }
         let (id, offset) = (args.id(), args.offset(arguments));
         if let Some(b) = &mut self.batch

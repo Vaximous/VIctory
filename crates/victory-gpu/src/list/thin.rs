@@ -556,8 +556,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// The groups are only valid during the call, so what they need is worked
 /// out now and written down beside the count (high half).
 extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
-    let need = super::title_groups_need(count, groups);
-    front(this).put(BARRIER_GROUPS, &[u64::from(count) | u64::from(need as u8) << 32]);
+    let (need, publishes) = super::title_groups_need(count, groups);
+    front(this).put(BARRIER_GROUPS, &[u64::from(count) | u64::from(need as u8) << 32 | u64::from(publishes) << 40]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -729,12 +729,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 super::barrier(list, n as u32, at_or(w, 1));
             }
             BARRIER_GROUPS => {
-                let need = match w.first().map_or(2, |&x| x >> 32) {
+                let need = match w.first().map_or(2, |&x| x >> 32 & 0xff) {
                     0 => super::GroupNeed::Nothing,
                     1 => super::GroupNeed::Compute,
                     _ => super::GroupNeed::Every,
                 };
-                super::barrier_groups_need(list, n as u32, need);
+                let publishes = w.first().is_none_or(|&x| x >> 40 & 1 != 0);
+                super::barrier_groups_need(list, n as u32, need, publishes);
             }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
