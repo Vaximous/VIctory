@@ -120,6 +120,32 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+
+/// Whether a loop the limit would abort is left at once when it can only go round for
+/// ever: its header's `s_and_saveexec` mask is empty in the whole wave and the skip's SCC
+/// takes it back (`VICTORY_EMPTY_SKIP_EXIT`, on; `0` off). The console's wave never gets
+/// there (it would hang); ours leaves as at the limit, without the wasted iterations.
+pub fn empty_skip_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_SKIP_EXIT").is_none_or(|v| v != "0"))
+}
+
+/// Whether a loop the limit would abort is left at once when EXEC at its header, the same
+/// each time round, is empty in the whole console wave and the loop then changes only
+/// registers (`VICTORY_EMPTY_EXEC_EXIT`, on; `0` off): such a wave only spins to the limit.
+pub fn empty_exec_exit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_EXEC_EXIT").is_none_or(|v| v != "0"))
+}
+
+/// Experimental: [`empty_exec_exit`] without its proof that the header's EXEC comes back
+/// unchanged (`VICTORY_EMPTY_EXEC_LOOSE=1`, off): any loop the limit would abort and that
+/// changes only registers with EXEC empty is left when the header's EXEC is empty.
+pub fn empty_exec_loose() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_EXEC_LOOSE").is_some_and(|v| v == "1"))
+}
+
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_TOUCHED, SLOT_TOUCHED_SLOTS, slot_feedback,

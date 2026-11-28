@@ -99,6 +99,10 @@ fn build() -> [u8; 32] {
             // Whether 16-bit channels move as unsigned integers through
             // table views shown in an unsigned format (`half_views`).
             "VICTORY_HALF_VIEWS",
+            // Loops left at once when an empty mask or an empty EXEC would keep them going.
+            "VICTORY_EMPTY_SKIP_EXIT",
+            "VICTORY_EMPTY_EXEC_EXIT",
+            "VICTORY_EMPTY_EXEC_LOOSE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -113,6 +117,10 @@ fn build() -> [u8; 32] {
         // (`VICTORY_PORT_CBV`, on unless `0`): the host's views follow it, so
         // a translation made the other way must not be served.
         bytes.push(u8::from(victory_shader::emit::constants_raw()));
+        // And the empty-loop exits' defaults: translations made without them are not served.
+        bytes.extend_from_slice(b"empty-exits");
+        bytes.push(u8::from(victory_shader::emit::empty_skip_exit()));
+        bytes.push(u8::from(victory_shader::emit::empty_exec_exit()));
         bytes
     });
     let mut hash = blake3::Hasher::new();

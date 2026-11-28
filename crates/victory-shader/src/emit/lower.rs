@@ -477,6 +477,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// [`Self::scc_some`]'s answers by SCC value: asked where the operation stands, so one
+    /// answer serves every later use (and the halves exchange it once).
+    some_asked: HashMap<Value, V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2343,6 +2346,7 @@ impl<'a> Lower<'a> {
             ring_barriers: Vec::new(),
             ring_stores: Vec::new(),
             abort: None,
+            some_asked: HashMap::new(),
         }
     }
 
@@ -5231,12 +5235,29 @@ impl<'a> Lower<'a> {
     /// the console's waves the host wave's answer is the console's; two host waves of 32
     /// exchange theirs, which needs every lane there.
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
+        if let Some(&x) = self.some_asked.get(&scc) {
+            return Ok(x);
+        }
+        let x = self.scc_some_asked(scc)?;
+        self.some_asked.insert(scc, x);
+        Ok(x)
+    }
+
+    fn scc_some_asked(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
+        let made = self.def_block.get(&scc).copied();
+        self.some_lane(m, made, true)
+    }
+
+    /// Whether lane bit `m` is set in some lane of the console wave, asked where IR block
+    /// `made` (`None`: the entry) stands; the two host waves of a console wave exchange
+    /// their answers. A divergent exchange is named for `emit`'s retry when `retry`, else
+    /// only refused.
+    fn some_lane(&mut self, m: Bool, made: Option<usize>, retry: bool) -> Result<V, Why> {
         // (not for a console wave cut into host waves that do not exchange)
         if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
         }
-        let made = self.def_block.get(&scc).copied();
         let at = match made {
             None => self.s.entry,
             Some(b) if b == self.cur_ir => self.cur,
@@ -5250,7 +5271,9 @@ impl<'a> Lower<'a> {
             return Ok(some);
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
-            need(made.unwrap_or(0));
+            if retry {
+                need(made.unwrap_or(0));
+            }
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
@@ -13719,7 +13742,15 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
+                // A loop that goes round only because its header's mask came up empty in the
+                // whole wave goes round for ever ([`Self::empty_skip`]): it is left now, as at
+                // the limit.
+                let some = self.empty_leave(b, t);
                 let ok = self.count_iteration(t, pred::IULT);
+                let ok = match some {
+                    Some(some) => self.s.m.bin(self.cur, Bin::And, ok, some),
+                    None => ok,
+                };
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -13795,6 +13826,202 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
+    }
+
+    /// For latch `b` jumping back to header `t`: "some lane of the console wave goes on"
+    /// when the loop can only go round with no effect from here on otherwise, so that it
+    /// may be aborted now as the limit would abort it later ([`Self::empty_skip`],
+    /// [`Self::empty_exec`]).
+    fn empty_leave(&mut self, b: usize, t: usize) -> Option<V> {
+        if super::empty_skip_exit()
+            && let Some(scc) = self.empty_skip(b, t)
+            && let Ok(some) = self.scc_some(scc)
+        {
+            return Some(some);
+        }
+        if super::empty_exec_exit()
+            && let Some(m) = self.empty_exec(b, t)
+        {
+            return self.some_lane(m, Some(b), false).ok();
+        }
+        None
+    }
+
+    /// [`super::empty_exec_exit`]: for latch `b` jumping back to header `t`, the lane bit of
+    /// EXEC at the header when that EXEC is the same each time round and the loop has no
+    /// effect but on registers in a wave whose EXEC is empty. So it is when the EXEC the
+    /// latch brings back is a `s_mov_b64 exec` of a copy the header made of its own EXEC
+    /// (`s_mov_b64 s[n:n+1], exec`), and no block between the header and the latch writes
+    /// scalar memory, meets the group (`s_barrier`), sends a message or jumps away. Vector
+    /// instructions then act on no lane, and only scalar registers change: a console wave
+    /// there with EXEC empty runs only what it ran before, for ever or to the limit, which
+    /// aborts it.
+    fn empty_exec(&self, b: usize, t: usize) -> Option<Bool> {
+        let p = self.x.p;
+        let head = &p.blocks[t];
+        let lo = head.phis.iter().find(|ph| ph.reg == Reg::S(EXEC))?;
+        let hi = head.phis.iter().find(|ph| ph.reg == Reg::S(EXEC + 1))?;
+        let bit = self.x.st.mask_bits(lo.value, Some(hi.value)).or_else(|| self.x.st.masks.get(&lo.value).copied())?;
+        // One way back into the loop: this latch, with the header's EXEC copied back.
+        let back = head.preds.iter().position(|&q| q == b)?;
+        if head.preds.iter().any(|&q| q != b && self.rpo[q] >= self.rpo[t]) {
+            return None;
+        }
+        let span: Vec<usize> = (0..p.blocks.len())
+            .filter(|&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[t] && self.rpo[q] <= self.rpo[b])
+            .collect();
+        let writer = |v: Value| {
+            span.iter()
+                .flat_map(|&q| p.blocks[q].insts.iter())
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        // (Experimental, `VICTORY_EMPTY_EXEC_LOOSE=1`: without proof that the EXEC is the
+        // same each time round; wrong where the loop sets EXEC anew, as whole-wave code does.)
+        let pairs = if super::empty_exec_loose() { Vec::new() } else { vec![(EXEC, lo), (EXEC + 1, hi)] };
+        for (r, ph) in pairs {
+            let copy = writer(ph.args[back])?;
+            if copy.name() != "s_mov_b64" || copy.write(Reg::S(r)) != Some(ph.args[back]) {
+                return None;
+            }
+            // what it copies: the header's copy of its own EXEC
+            let mut srcs: Vec<(u8, Value)> = copy
+                .reads
+                .iter()
+                .filter_map(|x| match x.0 {
+                    Reg::S(c) if c != EXEC && c != EXEC + 1 => Some((c, x.1)),
+                    _ => None,
+                })
+                .collect();
+            srcs.sort();
+            let &(k, from) = srcs.get(usize::from(r - EXEC))?;
+            let saved = head.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == from))?;
+            let copies_exec = saved.name() == "s_mov_b64"
+                && saved.write(Reg::S(k)) == Some(from)
+                && saved.read(Reg::S(EXEC)) == Some(lo.value)
+                && saved.read(Reg::S(EXEC + 1)) == Some(hi.value);
+            if !copies_exec {
+                return None;
+            }
+        }
+        let loud = |i: &Inst| {
+            let n = i.name();
+            n.starts_with("s_")
+                && (n.contains("store")
+                    || n.contains("atomic")
+                    || n.starts_with("s_barrier")
+                    || n.starts_with("s_sendmsg")
+                    || n.starts_with("s_setpc")
+                    || n.starts_with("s_swappc")
+                    || n.starts_with("s_dcache_wb"))
+                || n.starts_with("ds_gws")
+                || n.starts_with("ds_ordered")
+        };
+        if span.iter().flat_map(|&q| p.blocks[q].insts.iter()).any(loud) {
+            return None;
+        }
+        Some(bit)
+    }
+
+    /// [`super::empty_skip_exit`]: for latch `b` jumping back to header `t` (a loop the limit
+    /// leaves through [`Self::abort_block`]), the SCC value of the header's mask operation
+    /// when the loop can only go round for ever once that mask is empty in the whole wave.
+    /// So it is when the header ends in `s_and_saveexec_b64` (no later EXEC write) and
+    /// `s_cbranch_execz` to the latch's only predecessor `j`; `j` goes to the latch on SCC
+    /// clear (`s_cbranch_scc0`, or `scc1` the other way) with the SCC the skip brings,
+    /// that operation's (an empty result clears it); the operation's operands are the same
+    /// each time round (its mask is set before the loop; EXEC comes from before the loop
+    /// or is `j`'s `s_mov_b64 exec` of the EXEC it saved); and the way round from `j`
+    /// through the latch to the operation runs only scalar instructions with no effect
+    /// beyond registers. Then an empty mask skips the body every time round: the console
+    /// wave would never leave, and the limit would stop it there, after only registers
+    /// have changed, which nothing reads after an abort.
+    fn empty_skip(&self, b: usize, t: usize) -> Option<Value> {
+        let p = self.x.p;
+        let is_exec = |r: Reg| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1);
+        let quiet = |i: &Inst| {
+            let n = i.name();
+            n.starts_with("s_")
+                && !n.contains("store")
+                && !n.contains("atomic")
+                && !n.starts_with("s_barrier")
+                && !n.starts_with("s_sendmsg")
+                && !n.starts_with("s_setpc")
+                && !n.starts_with("s_swappc")
+        };
+        let (latch, head) = (&p.blocks[b], &p.blocks[t]);
+        let [j] = latch.preds[..] else {
+            return None;
+        };
+        if j == t || latch.insts.iter().any(|i| !quiet(i) || i.writes.iter().any(|w| is_exec(w.0))) {
+            return None;
+        }
+        let from = &p.blocks[j];
+        let branch = from.insts.last()?;
+        let Exit::Branch { taken, not_taken } = from.exit else {
+            return None;
+        };
+        let back_on_clear = match branch.name() {
+            "s_cbranch_scc0" => taken == b,
+            "s_cbranch_scc1" => not_taken == b,
+            _ => false,
+        };
+        if !back_on_clear || from.insts.iter().any(|i| !quiet(i)) {
+            return None;
+        }
+        // The SCC the branch reads: a join of the body's and the skip's, the header's.
+        let scc = branch.read(Reg::Scc)?;
+        let phi = from.phis.iter().find(|ph| ph.value == scc && ph.reg == Reg::Scc)?;
+        let from_head = from.preds.iter().position(|&q| q == t)?;
+        let some = phi.args[from_head];
+        if !self.x.st.scc_some.contains_key(&some) {
+            return None;
+        }
+        // The header: scalar instructions, the operation, then only its `s_cbranch_execz`.
+        let at = head.insts.iter().position(|i| i.write(Reg::Scc) == Some(some))?;
+        let op = &head.insts[at];
+        if !op.name().starts_with("s_and_saveexec_b64") || head.insts[..at].iter().any(|i| !quiet(i)) {
+            return None;
+        }
+        if head.insts[at + 1..].iter().any(|i| i.writes.iter().any(|w| is_exec(w.0))) {
+            return None;
+        }
+        let execz = head.insts.last()?;
+        match head.exit {
+            Exit::Branch { taken, .. } if execz.name() == "s_cbranch_execz" && taken == j => {}
+            _ => return None,
+        }
+        // One way back into the loop: this latch.
+        if head.preds.iter().any(|&q| q != b && self.rpo[q] >= self.rpo[t]) {
+            return None;
+        }
+        let before = |v: Value| self.def_block.get(&v).is_none_or(|&d| self.rpo[d] < self.rpo[t]);
+        let saved: Vec<Value> = op.writes.iter().filter(|w| !is_exec(w.0) && w.0 != Reg::Scc).map(|w| w.1).collect();
+        for &(r, v) in &op.reads {
+            if r == Reg::Scc || before(v) {
+                continue;
+            }
+            if !is_exec(r) {
+                return None;
+            }
+            // EXEC from the header's join: what it brings from the latch is the saved EXEC.
+            let join = head.phis.iter().find(|ph| ph.value == v)?;
+            for (k, &q) in head.preds.iter().enumerate() {
+                let a = join.args[k];
+                if q != b {
+                    if !before(a) {
+                        return None;
+                    }
+                    continue;
+                }
+                let copy = from.insts.iter().find(|i| i.write(r) == Some(a))?;
+                let copies_saved = copy.name() == "s_mov_b64"
+                    && copy.reads.iter().filter(|x| x.0 != Reg::Scc && !is_exec(x.0)).all(|x| saved.contains(&x.1));
+                if !copies_saved {
+                    return None;
+                }
+            }
+        }
+        Some(some)
     }
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
