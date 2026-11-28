@@ -736,6 +736,9 @@ impl HostPipeline {
             super::EARLY_DEPTH[if unsafe_here { 2 } else { 0 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if unsafe_here { s.code_late() } else { None }
         });
+        // Not from the library if it has static samplers (their places in the
+        // driver's table differ between runs: `library::with_static_samplers`).
+        let _samplers = super::library::with_static_samplers(!samplers.is_empty());
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
