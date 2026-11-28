@@ -962,10 +962,24 @@ pub(super) fn following() -> bool {
 
 /// Off the track by more than this (metres), the heading is turned toward it.
 const FOLLOW_OFF_M: f32 = 0.5;
-/// The most the heading is turned toward the track (radians).
+/// The most the heading is turned toward the track (radians), and the most
+/// when farther off than [`FOLLOW_FAR_M`].
 const FOLLOW_MOST: f32 = 0.6;
-/// Moved less than this in [`STALL_S`] while the recorded walk moved on: stuck.
+const FOLLOW_FAR_M: f32 = 1.5;
+const FOLLOW_MOST_FAR: f32 = 0.9;
+/// How far along the track from its point nearest the player the heading is
+/// taken and the walk aimed (seconds of the recording).
+const HEAD_LEAD_S: f64 = 0.3;
+const AIM_LEAD_S: f64 = 0.6;
+/// The nearest point is looked for from this much before the last one found
+/// to this much after the replay's moment (seconds): the walk goes on along
+/// the track, never to a later pass of the same place.
+const NEAR_BACK_S: f64 = 0.5;
+const NEAR_AHEAD_S: f64 = 2.0;
+/// Moved less than [`STALL_M`] in [`STALL_S`] while the recorded player moved
+/// [`STALL_RECORDED_M`] or more in the same second: stuck.
 const STALL_M: f32 = 0.25;
+const STALL_RECORDED_M: f32 = 0.7;
 const STALL_S: f64 = 1.0;
 /// Stuck: the walk backs off this long, then walks on turned aside for
 /// [`ASIDE_S`] by [`ASIDE`] (the side swaps at each stall).
@@ -974,40 +988,90 @@ const ASIDE_S: f64 = 1.0;
 const ASIDE: f32 = 0.7;
 
 /// [`follow_turn`]'s state: the last check (time, position), backing off
-/// and turning aside until (seconds since control), the side, the second
-/// last logged and the stalls so far.
+/// and turning aside until (seconds since control), the side, the track's
+/// moment nearest the player last found, the second last logged and the
+/// stalls so far.
 struct Follow {
     check: Option<(f64, [f32; 3])>,
     back_until: f64,
     aside_until: f64,
     side: f32,
+    near: f64,
     second: i64,
     stalls: u32,
 }
 
-static FOLLOW: std::sync::Mutex<Follow> =
-    std::sync::Mutex::new(Follow { check: None, back_until: f64::MIN, aside_until: f64::MIN, side: 1.0, second: i64::MIN, stalls: 0 });
+const FOLLOW_START: Follow =
+    Follow { check: None, back_until: f64::MIN, aside_until: f64::MIN, side: 1.0, near: 0.0, second: i64::MIN, stalls: 0 };
+static FOLLOW: std::sync::Mutex<Follow> = std::sync::Mutex::new(FOLLOW_START);
 /// The walk backs off now (forward let go, back held: [`route_nudge`]).
 static FOLLOW_BACK: AtomicBool = AtomicBool::new(false);
 
+/// The flat distance between two positions (across the cell's edge).
+fn apart(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (across(a[0] - b[0]).powi(2) + across(a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// The recorded moment in `from..=to` whose position is nearest `now`
+/// (to the recorded points, then between the two around it), and how far.
+fn nearest(points: &[(f64, [f32; 3])], from: f64, to: f64, now: [f32; 3]) -> Option<(f64, f32)> {
+    let lo = points.partition_point(|p| p.0 < from);
+    let hi = points.partition_point(|p| p.0 <= to);
+    let (i, _) = points[lo..hi].iter().enumerate().min_by(|a, b| apart(a.1.1, now).total_cmp(&apart(b.1.1, now)))?;
+    let i = lo + i;
+    // On the segments either side, the nearest spot.
+    let mut best = (points[i].0, apart(points[i].1, now));
+    for j in [i.checked_sub(1), Some(i)].into_iter().flatten() {
+        let (Some(a), Some(b)) = (points.get(j), points.get(j + 1)) else { continue };
+        let (dx, dy) = (across(b.1[0] - a.1[0]), across(b.1[1] - a.1[1]));
+        let len = dx * dx + dy * dy;
+        if len < 1e-6 {
+            continue;
+        }
+        let k = ((across(now[0] - a.1[0]) * dx + across(now[1] - a.1[1]) * dy) / len).clamp(0.0, 1.0);
+        let at = a.0 + (b.0 - a.0) * f64::from(k);
+        let Some(p) = tracked(points, at) else { continue };
+        let d = apart(p, now);
+        if d < best.1 && (from..=to).contains(&at) {
+            best = (at, d);
+        }
+    }
+    Some(best)
+}
+
 /// What [`follow_turn`] decides at `t` (seconds since control), the player
-/// at `now`: the turn added to the recorded heading and whether to back off.
-/// Pure, for the tests; the state is the caller's.
-fn follow_step(f: &mut Follow, tracks: &Tracks, t: f64, now: [f32; 3]) -> (f32, bool) {
-    let (Some(here), Some(ahead)) = (tracked(&tracks.pos, t), tracked(&tracks.pos, t + 1.0)) else { return (0.0, false) };
-    let off = (across(now[0] - here[0]).powi(2) + across(now[1] - here[1]).powi(2)).sqrt();
-    let (rx, ry) = (across(ahead[0] - here[0]), across(ahead[1] - here[1]));
+/// at `now`: the recorded moment whose heading the camera takes (a little
+/// past the track's point nearest the player, so a player behind the
+/// recording turns where the recording turned, not before), the turn added
+/// to it, and whether to back off. Pure, for the tests; the state is the
+/// caller's.
+fn follow_step(f: &mut Follow, tracks: &Tracks, t: f64, now: [f32; 3]) -> (f64, f32, bool) {
+    let Some((near, off)) = nearest(&tracks.pos, (f.near - NEAR_BACK_S).max(0.0), t + NEAR_AHEAD_S, now) else {
+        return (t, 0.0, false);
+    };
+    f.near = f.near.max(near);
+    let head = near + HEAD_LEAD_S;
+    let (Some(from), Some(to), Some(aim)) =
+        (tracked(&tracks.pos, near), tracked(&tracks.pos, near + 1.0), tracked(&tracks.pos, near + AIM_LEAD_S))
+    else {
+        return (head, 0.0, false);
+    };
+    let (rx, ry) = (across(to[0] - from[0]), across(to[1] - from[1]));
     let walking = (rx * rx + ry * ry).sqrt() >= 0.5;
-    // Stuck: the recorded walk goes on, the player stays.
+    // Stuck: the recorded player walked on in the last second, ours not.
     match f.check {
         Some((at, was)) if t - at >= STALL_S => {
-            let moved = (across(now[0] - was[0]).powi(2) + across(now[1] - was[1]).powi(2)).sqrt();
-            if moved < STALL_M && walking && t > f.aside_until {
+            let moved = apart(now, was);
+            let recorded = match (tracked(&tracks.pos, at), tracked(&tracks.pos, t)) {
+                (Some(a), Some(b)) => apart(a, b),
+                _ => 0.0,
+            };
+            if moved < STALL_M && recorded >= STALL_RECORDED_M && t > f.aside_until {
                 f.back_until = t + BACK_S;
                 f.aside_until = t + BACK_S + ASIDE_S;
                 f.side = -f.side;
                 f.stalls += 1;
-                tracing::info!(route_s = t, moved, off, side = f.side, stalls = f.stalls, "route follow: stuck, backing off and turning aside");
+                tracing::info!(route_s = t, moved, recorded, off, side = f.side, stalls = f.stalls, "route follow: stuck, backing off and turning aside");
             }
             f.check = Some((t, now));
         }
@@ -1018,29 +1082,42 @@ fn follow_step(f: &mut Follow, tracks: &Tracks, t: f64, now: [f32; 3]) -> (f32, 
     let turn = if t < f.aside_until {
         f.side * ASIDE
     } else if off > FOLLOW_OFF_M && walking {
-        let wanted = across(ahead[1] - now[1]).atan2(across(ahead[0] - now[0]));
+        let most = if off > FOLLOW_FAR_M { FOLLOW_MOST_FAR } else { FOLLOW_MOST };
+        let wanted = across(aim[1] - now[1]).atan2(across(aim[0] - now[0]));
         let walked = ry.atan2(rx);
-        tracks.sign * wrapped(wanted - walked).clamp(-FOLLOW_MOST, FOLLOW_MOST)
+        tracks.sign * wrapped(wanted - walked).clamp(-most, most)
     } else {
         0.0
     };
     if f.second != t as i64 {
         f.second = t as i64;
-        tracing::info!(route_s = t, off, turn, back, x = now[0], y = now[1], z = now[2], "route follow");
+        tracing::info!(
+            route_s = t,
+            off,
+            behind_s = t - near,
+            turn,
+            back,
+            stalls = f.stalls,
+            x = now[0],
+            y = now[1],
+            z = now[2],
+            "route follow (off: metres from the track; behind_s: how far the player is behind the recording)"
+        );
     }
-    (turn, back)
+    (head, turn, back)
 }
 
-/// [`follow_step`] with its state, the backing off set for the keys.
-fn follow_turn(tracks: &Tracks, t: f64, now: Option<[f32; 3]>) -> f32 {
+/// [`follow_step`] with its state, the backing off set for the keys: the
+/// recorded moment whose heading to take and the turn added to it.
+fn follow_turn(tracks: &Tracks, t: f64, now: Option<[f32; 3]>) -> (f64, f32) {
     let Some(now) = now else {
         FOLLOW_BACK.store(false, Ordering::Relaxed);
-        return 0.0;
+        return (t, 0.0);
     };
     let mut f = FOLLOW.lock().unwrap_or_else(|e| e.into_inner());
-    let (turn, back) = follow_step(&mut f, tracks, t, now);
+    let (head, turn, back) = follow_step(&mut f, tracks, t, now);
     FOLLOW_BACK.store(back, Ordering::Relaxed);
-    turn
+    (head, turn)
 }
 
 /// Writes the first found camera to the recorded heading now, turned toward
@@ -1056,8 +1133,8 @@ fn turn_to_tracks(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<bo
     }
     let (camera, yaw, pitch) = found_camera(memory, base, list)?;
     let (Some(y), Some(p)) = (resolve(memory, base, &camera.yaw), resolve(memory, base, &camera.pitch)) else { return Some(false) };
-    let (new_yaw, new_pitch) = traced(&tracks.cam, t, camera.wrap)?;
-    let turn = follow_turn(tracks, t, position(memory, base, camera));
+    let (at, turn) = follow_turn(tracks, t, position(memory, base, camera));
+    let (new_yaw, new_pitch) = traced(&tracks.cam, at.min(tracks.cam.last()?.0), camera.wrap)?;
     let new_yaw = if turn == 0.0 { new_yaw } else { wrapped(new_yaw + turn) };
     let (lo, hi) = (camera.pitch_min.min(camera.pitch_max), camera.pitch_max.max(camera.pitch_min));
     let new_pitch = new_pitch.clamp(lo, hi);
@@ -1352,7 +1429,7 @@ mod tests {
     }
 
     fn follow() -> Follow {
-        Follow { check: None, back_until: f64::MIN, aside_until: f64::MIN, side: 1.0, second: i64::MIN, stalls: 0 }
+        FOLLOW_START
     }
 
     #[test]
@@ -1377,32 +1454,46 @@ mod tests {
     fn off_the_track_turns_toward_it() {
         let t = straight();
         let mut f = follow();
-        // On the track: no turn.
-        assert_eq!(follow_step(&mut f, &t, 2.0, [1.8, 0.0, 0.0]), (0.0, false));
-        // 2 m to its right (y -2): turned left (toward +y), at most FOLLOW_MOST.
+        // On the track: no turn; the heading a little past the nearest point.
+        let (head, turn, back) = follow_step(&mut f, &t, 2.0, [1.8, 0.0, 0.0]);
+        assert!((head - (2.0 + HEAD_LEAD_S)).abs() < 1e-3 && turn == 0.0 && !back, "{head} {turn}");
+        // 2 m to its right (y -2): turned left (toward +y), at most FOLLOW_MOST_FAR.
         let mut f = follow();
-        let (turn, back) = follow_step(&mut f, &t, 2.0, [1.8, -2.0, 0.0]);
-        assert!(turn > 0.3 && turn <= FOLLOW_MOST && !back, "{turn}");
+        let (_, turn, back) = follow_step(&mut f, &t, 2.0, [1.8, -2.0, 0.0]);
+        assert!(turn > 0.6 && turn <= FOLLOW_MOST_FAR && !back, "{turn}");
     }
 
     #[test]
-    fn a_stop_backs_off_and_turns_aside() {
+    fn a_player_behind_takes_the_heading_where_it_is() {
+        let t = straight();
+        let mut f = follow();
+        // At the recording's 3 s spot while the replay is at 4.5 s.
+        let (head, _, _) = follow_step(&mut f, &t, 4.5, [2.7, 0.0, 0.0]);
+        assert!((head - (3.0 + HEAD_LEAD_S)).abs() < 1e-3, "{head}");
+    }
+
+    #[test]
+    fn a_stop_backs_off_and_turns_aside_only_when_the_recording_walked() {
         let t = straight();
         let mut f = follow();
         let at = [3.0, 0.0, 0.0];
-        assert_eq!(follow_step(&mut f, &t, 3.0, at).1, false);
-        // A second later the player has not moved while the track went on.
-        let (turn, back) = follow_step(&mut f, &t, 4.05, at);
+        assert!(!follow_step(&mut f, &t, 3.0, at).2);
+        // A second later the player has not moved while the recording walked 0.9 m.
+        let (_, turn, back) = follow_step(&mut f, &t, 4.05, at);
         assert!(back && turn.abs() == ASIDE, "{turn} {back}");
-        // After the backing off, turned aside, forward again.
-        let (turn, back) = follow_step(&mut f, &t, 4.05 + BACK_S + 0.1, at);
+        let (_, turn, back) = follow_step(&mut f, &t, 4.05 + BACK_S + 0.1, at);
         assert!(!back && turn.abs() == ASIDE);
         assert_eq!(f.stalls, 1);
-        // A stop at the end of the track (the walk over) is no stall.
+        // The recording standing still too (its first seconds): no stall.
+        let still = Tracks {
+            cam: t.cam.clone(),
+            pos: (0..20).map(|i| (f64::from(i), [if i < 5 { 0.0 } else { (i - 5) as f32 }, 0.0, 0.0])).collect(),
+            sign: 1.0,
+        };
         let mut f = follow();
-        let end = [17.1, 0.0, 0.0];
-        follow_step(&mut f, &t, 19.0, end);
-        assert_eq!(follow_step(&mut f, &t, 20.5, end), (0.0, false));
+        follow_step(&mut f, &still, 3.0, [0.0, 0.0, 0.0]);
+        assert!(!follow_step(&mut f, &still, 4.1, [0.0, 0.0, 0.0]).2);
+        assert_eq!(f.stalls, 0);
     }
 
     #[test]
