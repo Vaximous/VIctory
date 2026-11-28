@@ -626,8 +626,10 @@ fn menu_key(keys: &[(u64, Vec<u8>)], world: u64) -> Option<(u64, u8)> {
     Some((last, key))
 }
 
-const MENU_RETRY_AFTER_US: u64 = 8_000_000;
-const MENU_RETRY_EVERY_US: u64 = 4_000_000;
+/// Past the world's load after an accepted start screen (16.5 s in one replay), so
+/// a press never lands in the load or the intro, where it opens the pause map.
+const MENU_RETRY_AFTER_US: u64 = 30_000_000;
+const MENU_RETRY_EVERY_US: u64 = 10_000_000;
 const MENU_RETRY_HOLD_US: u64 = 150_000;
 
 /// Whether the menu's key is held at `now`, the route's last key before the
