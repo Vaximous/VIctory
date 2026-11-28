@@ -441,6 +441,132 @@ fn traced(points: &[(f64, f32, f32)], t: f64, wrap: f32) -> Option<(f32, f32)> {
     Some((yaw, a.2 + (b.2 - a.2) * k))
 }
 
+/// A track for a route played back with a camera trace
+/// (`VICTORY_ROUTE_STEER=<file>`; off when unset): lines of
+/// `<route seconds> <x> <y> <z>`, where the position the camera file names
+/// (`position`) was at those moments of a replay that went where the route
+/// goes. Between route [`STEER_FROM_S`] and [`STEER_UNTIL_S`], when the
+/// position is more than [`STEER_OFF_M`] from the track's, the traced
+/// heading is turned toward the track a second ahead, by as much as the
+/// walk's bearing is off ([`STEER_MOST`] at most): the player walks where
+/// the camera faces, so the walk turns with it. Which way a heading turns
+/// the walk is taken from the track and the trace themselves (`sign`).
+struct Steer {
+    points: Vec<(f64, [f32; 3])>,
+    /// +1 or -1: the walk's bearing (atan2 of y, x) moves with the yaw so.
+    sign: f32,
+}
+
+const STEER_FROM_S: f64 = 46.0;
+const STEER_UNTIL_S: f64 = 74.0;
+const STEER_OFF_M: f32 = 0.5;
+const STEER_MOST: f32 = 0.5;
+
+fn wrapped(a: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    (a + PI).rem_euclid(TAU) - PI
+}
+
+fn steer() -> Option<&'static Steer> {
+    static STEER: OnceLock<Option<Steer>> = OnceLock::new();
+    STEER
+        .get_or_init(|| {
+            let trace = trace()?;
+            let path = std::env::var_os("VICTORY_ROUTE_STEER")?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(%error, "the route track could not be read (VICTORY_ROUTE_STEER)");
+                    return None;
+                }
+            };
+            let mut points: Vec<(f64, [f32; 3])> = text
+                .lines()
+                .filter_map(|line| {
+                    let v: Vec<f64> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                    (v.len() >= 4 && v.iter().all(|x| x.is_finite())).then(|| (v[0], [v[1] as f32, v[2] as f32, v[3] as f32]))
+                })
+                .collect();
+            points.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // The bearing of each second's step of the walk, against the
+            // traced yaw then: with the camera behind the player the two move
+            // together (sign +1) or against each other (-1); the sign whose
+            // differences stay the most alike.
+            let mut pairs = Vec::new();
+            for w in points.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let (dx, dy) = (b.1[0] - a.1[0], b.1[1] - a.1[1]);
+                if (dx * dx + dy * dy).sqrt() < 0.3 || a.0 < STEER_FROM_S || b.0 > STEER_UNTIL_S {
+                    continue;
+                }
+                if let Some((yaw, _)) = traced(trace, (a.0 + b.0) / 2.0, std::f32::consts::TAU) {
+                    pairs.push((dy.atan2(dx), yaw));
+                }
+            }
+            let spread = |sign: f32| {
+                let (c, s) = pairs.iter().fold((0.0f32, 0.0f32), |(c, s), &(b, y)| {
+                    let d = wrapped(b - sign * y);
+                    (c + d.cos(), s + d.sin())
+                });
+                1.0 - (c * c + s * s).sqrt() / pairs.len().max(1) as f32
+            };
+            let (plus, minus) = (spread(1.0), spread(-1.0));
+            let sign = if plus <= minus { 1.0 } else { -1.0 };
+            tracing::info!(
+                path = %std::path::Path::new(&path).display(),
+                points = points.len(),
+                steps = pairs.len(),
+                spread_plus = plus,
+                spread_minus = minus,
+                sign,
+                "route track (VICTORY_ROUTE_STEER)"
+            );
+            (points.len() >= 2 && !pairs.is_empty()).then_some(Steer { points, sign })
+        })
+        .as_ref()
+}
+
+/// The track's position at route second `t` ([`Steer`]), straight between
+/// its points.
+fn tracked(points: &[(f64, [f32; 3])], t: f64) -> Option<[f32; 3]> {
+    let i = points.partition_point(|p| p.0 <= t);
+    let a = points.get(i.checked_sub(1)?)?;
+    let Some(b) = points.get(i) else { return Some(a.1) };
+    let k = if b.0 > a.0 { ((t - a.0) / (b.0 - a.0)) as f32 } else { 0.0 };
+    Some(std::array::from_fn(|n| a.1[n] + (b.1[n] - a.1[n]) * k))
+}
+
+/// The turn [`Steer`] adds to the traced yaw at route second `t`: 0 when not
+/// steering, on the track, or with no position.
+fn steered(memory: &impl Memory, base: u64, camera: &Camera, _trace: &[(f64, f32, f32)], t: f64) -> f32 {
+    if !(STEER_FROM_S..=STEER_UNTIL_S).contains(&t) || camera.position.is_empty() {
+        return 0.0;
+    }
+    let Some(steer) = steer() else { return 0.0 };
+    let Some(at) = resolve(memory, base, &camera.position) else { return 0.0 };
+    let mut b = [0u8; 12];
+    if !memory.read(at, &mut b) {
+        return 0.0;
+    }
+    let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let now = [f(0), f(4), f(8)];
+    let (Some(here), Some(ahead)) = (tracked(&steer.points, t), tracked(&steer.points, t + 1.0)) else { return 0.0 };
+    let off = ((now[0] - here[0]).powi(2) + (now[1] - here[1]).powi(2)).sqrt();
+    let (rx, ry) = (ahead[0] - here[0], ahead[1] - here[1]);
+    let turn = if off > STEER_OFF_M && (rx * rx + ry * ry).sqrt() >= 0.2 {
+        let wanted = (ahead[1] - now[1]).atan2(ahead[0] - now[0]);
+        let walked = ry.atan2(rx);
+        steer.sign * wrapped(wanted - walked).clamp(-STEER_MOST, STEER_MOST)
+    } else {
+        0.0
+    };
+    static LAST_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if LAST_S.swap(t as u64, Ordering::Relaxed) != t as u64 {
+        tracing::info!(route_s = t, off, turn, x = now[0], y = now[1], z = now[2], "route steer");
+    }
+    turn
+}
+
 /// Writes the first found camera to the trace's heading now; `None` when
 /// the trace does not hold this moment, else whether a camera was found.
 fn turn_to_trace(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<bool> {
@@ -457,6 +583,8 @@ fn turn_to_trace(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<boo
             continue;
         };
         let (new_yaw, new_pitch) = traced(points, t, camera.wrap)?;
+        let turn = steered(memory, base, camera, points, t);
+        let new_yaw = if turn == 0.0 { new_yaw } else { wrapped(new_yaw + turn) };
         let (lo, hi) = (camera.pitch_min.min(camera.pitch_max), camera.pitch_max.max(camera.pitch_min));
         let new_pitch = new_pitch.clamp(lo, hi);
         static SAID: std::sync::Once = std::sync::Once::new();
