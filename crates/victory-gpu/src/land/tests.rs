@@ -474,3 +474,24 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+/// The chunk allocator's nodes at a block's end are told from other bytes
+/// there (`keep_foot_node_on`).
+#[test]
+fn allocator_nodes_at_a_block_end_are_known() {
+    let node = |next: u64, object: u64| {
+        let mut b = [0u8; FOOT];
+        b[..8].copy_from_slice(&next.to_le_bytes());
+        b[8..16].copy_from_slice(&object.to_le_bytes());
+        b[16..20].copy_from_slice(&0x4au32.to_le_bytes());
+        b
+    };
+    assert!(super::foot_node(&node(0, 0x9_0418_d818)));
+    assert!(super::foot_node(&node(0x9_0418_e358, 0x9_0418_d818)));
+    // Not a node: an offset, a pointer off its alignment, another heap, short.
+    assert!(!super::foot_node(&node(0, 1)));
+    assert!(!super::foot_node(&node(0, 0x9_0418_d81d)));
+    assert!(!super::foot_node(&node(0x1_0000_0000, 0x9_0418_d818)));
+    assert!(!super::foot_node(&node(0, 0x6600_0473_1900_0472)));
+    assert!(!super::foot_node(&node(0, 0x9_0418_d818)[..16]));
+}

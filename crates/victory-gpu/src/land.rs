@@ -785,6 +785,37 @@ fn keep_foot_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_KEEP_FOOT").is_none_or(|v| v != "0"))
 }
 
+/// Whether a landing also keeps the title's node at a block's end whole when
+/// it is one of the chunk allocator's (`VICTORY_LAND_KEEP_FOOT_NODE`, on
+/// unless `=0`; with [`keep_foot_on`]).
+///
+/// The title carves 0x18-byte nodes, next at +0 and an object at +8, from
+/// the top of the chunks it takes back once the card is through with them,
+/// and walks them when it takes the chunk again. Its walk read nodes at
+/// 0x3781ffe8, 0x215affe8 and 0x3b00ffe8, block ends in the card's heap,
+/// whose object was 0x6600047319000472 (bytes like a shader's), 0x90418d81d
+/// (off its alignment) or one whose first qword was 0 (runs ow118, ow120,
+/// ow124; ow117 one node earlier: next 0x100000000). The record offset rule
+/// above keeps only a zeroed dword at +8. Where title memory holds such a
+/// node, both pointers into the title's heap or the next one null, the
+/// title's 0x18 bytes stay and go up again.
+fn keep_foot_node_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_KEEP_FOOT_NODE").is_none_or(|v| v != "0"))
+}
+
+/// Whether the 0x18 bytes `there` hold a node of the title's chunk
+/// allocator ([`keep_foot_node_on`]): an 8-aligned pointer into its heap
+/// (0x9_xxxx_xxxx) at +8, and at +0 none or another.
+fn foot_node(there: &[u8]) -> bool {
+    let q = |at: usize| u64::from_le_bytes(there[at..at + 8].try_into().unwrap_or([0; 8]));
+    let heap = |p: u64| p >> 32 == 9 && p & 7 == 0;
+    there.len() == FOOT && heap(q(8)) && (q(0) == 0 || heap(q(0)))
+}
+
+/// Landings whose node at a block's end [`keep_foot_node_on`] kept.
+static NODES: AtomicU64 = AtomicU64::new(0);
+
 /// Landings whose bytes at a block's end were kept ([`keep_foot`]).
 static FEET: AtomicU64 = AtomicU64::new(0);
 
@@ -824,8 +855,13 @@ unsafe fn keep_foot(title: usize, into: usize, now: *const u8, held: *mut u8, fr
     // other data were kept against shaders that cleared them, and were
     // fetched and merged again every frame: 30-40 ms a frame more landing
     // (runs ow97-out, ow98-gpu).
-    if n != FOOT || there[8..12] == [0u8; 4] || card[8..12] != [0u8; 4] || there[..8] != card[..8] || there[12..] != card[12..n] {
+    let offset_gone = n == FOOT && there[8..12] != [0u8; 4] && card[8..12] == [0u8; 4] && there[..8] == card[..8] && there[12..] == card[12..n];
+    let node = n == FOOT && keep_foot_node_on() && foot_node(there);
+    if !offset_gone && !node {
         return false;
+    }
+    if node && !offset_gone {
+        NODES.fetch_add(1, Ordering::Relaxed);
     }
     let had = was.to_vec();
     // The CPU's side takes the title's bytes, and they go up again: the
@@ -840,8 +876,10 @@ unsafe fn keep_foot(title: usize, into: usize, now: *const u8, held: *mut u8, fr
             card_has = q(&card[..n]),
             cpu_side_had = q(&had),
             kept_so_far = k,
+            allocator_node = node && !offset_gone,
+            nodes_so_far = NODES.load(Ordering::Relaxed),
             frame = crate::frame::current(),
-            "a landing would have changed the title's node at a block's end: the title's bytes kept (VICTORY_LAND_KEEP_FOOT)"
+            "a landing would have changed the title's node at a block's end: the title's bytes kept (VICTORY_LAND_KEEP_FOOT, VICTORY_LAND_KEEP_FOOT_NODE)"
         );
     }
     if !copy.is_null() {
