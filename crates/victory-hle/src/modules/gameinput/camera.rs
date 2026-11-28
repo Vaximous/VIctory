@@ -461,6 +461,14 @@ const STEER_FROM_S: f64 = 46.0;
 const STEER_UNTIL_S: f64 = 74.0;
 const STEER_OFF_M: f32 = 0.5;
 const STEER_MOST: f32 = 0.5;
+/// The position wraps at a cell of this many metres (x and y): run ow93-out's
+/// track went from y -31.7 to -1.4 in a second of walking straight on.
+const STEER_CELL: f32 = 32.0;
+
+/// A difference of positions across the cell's edge, the short way.
+fn across(d: f32) -> f32 {
+    d - STEER_CELL * (d / STEER_CELL).round()
+}
 
 fn wrapped(a: f32) -> f32 {
     use std::f32::consts::{PI, TAU};
@@ -495,7 +503,7 @@ fn steer() -> Option<&'static Steer> {
             let mut pairs = Vec::new();
             for w in points.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                let (dx, dy) = (b.1[0] - a.1[0], b.1[1] - a.1[1]);
+                let (dx, dy) = (across(b.1[0] - a.1[0]), across(b.1[1] - a.1[1]));
                 if (dx * dx + dy * dy).sqrt() < 0.3 || a.0 < STEER_FROM_S || b.0 > STEER_UNTIL_S {
                     continue;
                 }
@@ -533,7 +541,7 @@ fn tracked(points: &[(f64, [f32; 3])], t: f64) -> Option<[f32; 3]> {
     let a = points.get(i.checked_sub(1)?)?;
     let Some(b) = points.get(i) else { return Some(a.1) };
     let k = if b.0 > a.0 { ((t - a.0) / (b.0 - a.0)) as f32 } else { 0.0 };
-    Some(std::array::from_fn(|n| a.1[n] + (b.1[n] - a.1[n]) * k))
+    Some(std::array::from_fn(|n| a.1[n] + if n < 2 { across(b.1[n] - a.1[n]) } else { b.1[n] - a.1[n] } * k))
 }
 
 /// The turn [`Steer`] adds to the traced yaw at route second `t`: 0 when not
@@ -551,10 +559,10 @@ fn steered(memory: &impl Memory, base: u64, camera: &Camera, _trace: &[(f64, f32
     let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     let now = [f(0), f(4), f(8)];
     let (Some(here), Some(ahead)) = (tracked(&steer.points, t), tracked(&steer.points, t + 1.0)) else { return 0.0 };
-    let off = ((now[0] - here[0]).powi(2) + (now[1] - here[1]).powi(2)).sqrt();
-    let (rx, ry) = (ahead[0] - here[0], ahead[1] - here[1]);
+    let off = (across(now[0] - here[0]).powi(2) + across(now[1] - here[1]).powi(2)).sqrt();
+    let (rx, ry) = (across(ahead[0] - here[0]), across(ahead[1] - here[1]));
     let turn = if off > STEER_OFF_M && (rx * rx + ry * ry).sqrt() >= 0.2 {
-        let wanted = (ahead[1] - now[1]).atan2(ahead[0] - now[0]);
+        let wanted = across(ahead[1] - now[1]).atan2(across(ahead[0] - now[0]));
         let walked = ry.atan2(rx);
         steer.sign * wrapped(wanted - walked).clamp(-STEER_MOST, STEER_MOST)
     } else {
