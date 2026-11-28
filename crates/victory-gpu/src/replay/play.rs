@@ -170,7 +170,13 @@ impl Options {
             wait_lists: false,
             awake: false,
             only: None,
-            skip_shaders: Vec::new(),
+            // `VICTORY_REPLAY_SKIP_BOTH=1`: the shaders left out stay out of the unchanged
+            // run too (a pass that cannot run in the replay, the others compared).
+            skip_shaders: if std::env::var_os("VICTORY_REPLAY_SKIP_BOTH").is_some_and(|v| v == "1") {
+                self.skip_shaders.clone()
+            } else {
+                Vec::new()
+            },
             ..self.clone()
         }
     }
