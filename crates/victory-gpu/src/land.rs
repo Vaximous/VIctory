@@ -778,8 +778,8 @@ const FOOT: usize = 0x18;
 /// the title's walk of its nodes read through a null record (runs ow94,
 /// ow94b: five threads at once, the ledger naming a landing as the only
 /// write of ours there). Shaders have no business in the allocator's nodes,
-/// so where the title holds anything but zeros there its bytes stay, the
-/// CPU's side takes them, and they go to the card's side again.
+/// so where the title holds anything but zeros there its bytes stay in
+/// title memory.
 fn keep_foot_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_KEEP_FOOT").is_none_or(|v| v != "0"))
@@ -791,9 +791,10 @@ static FEET: AtomicU64 = AtomicU64::new(0);
 /// [`keep_foot_on`]: offsets `[from, to)` of the piece at `title` (inside
 /// its block's last [`FOOT`] bytes). Where the card's bytes (`now`) differ
 /// from the CPU's side (`held`) and title memory (read at `into`) holds
-/// anything but zeros there, the title's stay and the CPU's side takes them
-/// (and the card's side, as [`resend_kept`] does); else, or if the title's
-/// are zeros, they are merged as usual. False if they are to be merged as
+/// anything but zeros there, the title's stay in title memory and the CPU's
+/// side takes the card's (nothing is sent up: in run ow98-gpu some 250 a
+/// frame were sent up and cleared again by shaders, frame after frame);
+/// else, or if the title's are zeros, they are merged as usual. False if they are to be merged as
 /// usual (the title's are zeros, or title memory could not be read).
 ///
 /// # Safety
@@ -822,7 +823,11 @@ unsafe fn keep_foot(title: usize, into: usize, now: *const u8, held: *mut u8, fr
         return false;
     }
     let had = was.to_vec();
-    was.copy_from_slice(there);
+    // The CPU's side takes the card's bytes, as a merge would: the card's
+    // side is left as it is (shaders that cleared these bytes keep them
+    // cleared there), and the next landing finds nothing new here. Only
+    // title memory keeps its own.
+    was.copy_from_slice(&card[..n]);
     let k = FEET.fetch_add(1, Ordering::Relaxed) + 1;
     if k <= 8 || k.is_power_of_two() {
         let q = |b: &[u8]| b.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap_or([0; 4])))).collect::<Vec<_>>().join(" ");
@@ -836,19 +841,7 @@ unsafe fn keep_foot(title: usize, into: usize, now: *const u8, held: *mut u8, fr
             "a landing would have changed the title's node at a block's end: the title's bytes kept (VICTORY_LAND_KEEP_FOOT)"
         );
     }
-    if !copy.is_null() {
-        // SAFETY: the caller's copy.
-        let copy = unsafe { &*copy };
-        if let Some(base) = title.checked_sub(copy.span().0 as usize) {
-            if copy.carded() {
-                copy.resend(base + from, base + to);
-            } else {
-                // SAFETY: `now` is the copy itself here, ours over the piece
-                // (as in `resend_kept`).
-                unsafe { std::ptr::copy_nonoverlapping(held.add(from).cast_const(), now.cast_mut().add(from), n) };
-            }
-        }
-    }
+    let _ = copy;
     true
 }
 
