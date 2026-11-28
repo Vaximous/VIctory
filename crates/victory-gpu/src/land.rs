@@ -673,9 +673,27 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing, mut kept) = (0, 0u64, 0, 0, 0, 0u64);
     let mut span: Option<(usize, usize)> = None;
+    let foot = (title / BLOCK * BLOCK + BLOCK - FOOT).wrapping_sub(title);
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
+            return;
+        }
+        // The block's last bytes, where the title's allocator keeps its
+        // node: the title's stay if they differ ([`keep_foot`]).
+        let n = if keep_foot_on() && from + n > foot {
+            let a = from.max(foot);
+            // SAFETY: the caller's.
+            if !unsafe { keep_foot(title, into, now, held, a, from + n, copy) } {
+                // (Zeros of the title's, or not there: merged as before.)
+                n
+            } else {
+                a - from
+            }
+        } else {
+            n
+        };
+        if n == 0 {
             return;
         }
         // SAFETY: the caller's; title memory, by an address that shows it
@@ -740,6 +758,98 @@ unsafe fn piece_at(
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     (dwords * 4, kept)
+}
+
+/// The bytes at the end of each 64 KiB block of title memory that
+/// [`keep_foot`] keeps: the node the title's allocator keeps there.
+const FOOT: usize = 0x18;
+
+/// Whether a landing keeps the title's bytes at the ends of its 64 KiB
+/// blocks where the card's differ (`VICTORY_LAND_KEEP_FOOT`, on unless
+/// `=0`: merged as any other bytes, as before).
+///
+/// The title's allocator keeps a node in each 64 KiB block's last 0x18
+/// bytes, an offset into its record region among them. A copy in the
+/// card's memory whose side fell behind the CPU's (the title wrote the node
+/// after the card's side was last sent) held the old bytes there, zeros,
+/// and a landing of a piece the shaders wrote elsewhere took them for the
+/// card's: the merge stores what differs from the CPU's side where title
+/// memory still holds that, which it did. The node's offset went to 0 and
+/// the title's walk of its nodes read through a null record (runs ow94,
+/// ow94b: five threads at once, the ledger naming a landing as the only
+/// write of ours there). Shaders have no business in the allocator's nodes,
+/// so where the title holds anything but zeros there its bytes stay, the
+/// CPU's side takes them, and they go to the card's side again.
+fn keep_foot_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_KEEP_FOOT").is_none_or(|v| v != "0"))
+}
+
+/// Landings whose bytes at a block's end were kept ([`keep_foot`]).
+static FEET: AtomicU64 = AtomicU64::new(0);
+
+/// [`keep_foot_on`]: offsets `[from, to)` of the piece at `title` (inside
+/// its block's last [`FOOT`] bytes). Where the card's bytes (`now`) differ
+/// from the CPU's side (`held`) and title memory (read at `into`) holds
+/// anything but zeros there, the title's stay and the CPU's side takes them
+/// (and the card's side, as [`resend_kept`] does); else, or if the title's
+/// are zeros, they are merged as usual. False if they are to be merged as
+/// usual (the title's are zeros, or title memory could not be read).
+///
+/// # Safety
+/// [`piece`]'s, with `into` the address title memory is written at.
+unsafe fn keep_foot(title: usize, into: usize, now: *const u8, held: *mut u8, from: usize, to: usize, copy: *const crate::shadow::Shadow) -> bool {
+    let n = to - from;
+    let mut there = [0u8; FOOT];
+    // SAFETY: title memory, read faulting into the failing exit.
+    if !unsafe { crate::safecopy::copy(there.as_mut_ptr(), into.wrapping_add(from) as *const u8, n) } {
+        return false;
+    }
+    let mut card = [0u8; FOOT];
+    // SAFETY: the caller's: `now` and `held` are ours over the piece.
+    unsafe { std::ptr::copy_nonoverlapping(now.add(from), card.as_mut_ptr(), n) };
+    let was = unsafe { std::slice::from_raw_parts_mut(held.add(from), n) };
+    let there = &there[..n];
+    if card[..n] == *was || card[..n] == *there {
+        // The card changed nothing here, or nothing the title has.
+        if card[..n] == *there {
+            was.copy_from_slice(there);
+        }
+        return true;
+    }
+    if there.iter().all(|&b| b == 0) {
+        // Nothing of the title's here: as any other bytes.
+        return false;
+    }
+    let had = was.to_vec();
+    was.copy_from_slice(there);
+    let k = FEET.fetch_add(1, Ordering::Relaxed) + 1;
+    if k <= 8 || k.is_power_of_two() {
+        let q = |b: &[u8]| b.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes(c.try_into().unwrap_or([0; 4])))).collect::<Vec<_>>().join(" ");
+        tracing::warn!(
+            at = format_args!("{:#x}", title + from),
+            title_has = q(there),
+            card_has = q(&card[..n]),
+            cpu_side_had = q(&had),
+            kept_so_far = k,
+            frame = crate::frame::current(),
+            "a landing would have changed the title's node at a block's end: the title's bytes kept (VICTORY_LAND_KEEP_FOOT)"
+        );
+    }
+    if !copy.is_null() {
+        // SAFETY: the caller's copy.
+        let copy = unsafe { &*copy };
+        if let Some(base) = title.checked_sub(copy.span().0 as usize) {
+            if copy.carded() {
+                copy.resend(base + from, base + to);
+            } else {
+                // SAFETY: `now` is the copy itself here, ours over the piece
+                // (as in `resend_kept`).
+                unsafe { std::ptr::copy_nonoverlapping(held.add(from).cast_const(), now.cast_mut().add(from), n) };
+            }
+        }
+    }
+    true
 }
 
 /// After a piece kept title writes ([`crate::safecopy::merge`]: the title
