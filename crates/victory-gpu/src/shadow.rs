@@ -1109,6 +1109,41 @@ impl SentRuns {
     }
 }
 
+thread_local! {
+    /// The number of the send the submission this thread prepares took last
+    /// ([`sending_as`]; 0: none, or no relay).
+    static SENDING_AS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// With [`relay`]: the submission this thread prepares took its sends to the
+/// card's sides as `number` (`crate::host`'s order of the queue); its lists
+/// run behind them.
+pub(crate) fn sending_as(number: u64) {
+    SENDING_AS.set(number);
+}
+
+/// Whether the title's buffer copies done in place ([`Shadow::placed_copy`])
+/// are noted as sent with the submission that does them
+/// (`VICTORY_PLACED_SENT`, on unless `=0`: not, as before).
+///
+/// The CPU's side of the destination takes the copy's bytes when the
+/// submission is prepared, and the copy itself runs on the card with its
+/// lists. A landing of an earlier flight, fetched before those lists ran,
+/// found the card's old bytes there against the copy's on the CPU's side
+/// and title memory, took them for what its shaders wrote and put them
+/// back over the copy: a revert of title data the title had just copied
+/// (runs ow94/ow94b: a copy in the card's memory whose side "fell behind
+/// the CPU's" just before the crash in the title's heap nodes). Noted as
+/// sent, such a landing leaves those bytes alone, as it does for what went
+/// up behind its fetch.
+fn placed_sent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_SENT").is_none_or(|v| v != "0"))
+}
+
+/// Ranges [`placed_sent`] noted since the start.
+pub(crate) static PLACED_NOTED: AtomicU64 = AtomicU64::new(0);
+
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -6199,10 +6234,18 @@ impl Shadow {
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-        if self.card.is_some() {
+        if let Some(card) = &self.card {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+            // Noted as sent with this submission's sends, under the same
+            // lock: a landing of a fetch made before the copy ran leaves
+            // these bytes to it ([`placed_sent`]).
+            let number = SENDING_AS.get();
+            if placed_sent() && relay() && number != 0 {
+                card.sent.lock().unwrap_or_else(|e| e.into_inner()).note_joined(number, vec![(from, to)]);
+                PLACED_NOTED.fetch_add(1, Ordering::Relaxed);
+            }
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             // SAFETY: the snapshot's allocation holds the copy's length.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };

@@ -4686,6 +4686,7 @@ impl Host {
             }
             None => 0,
         };
+        crate::shadow::sending_as(sent_as);
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
