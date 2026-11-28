@@ -138,6 +138,17 @@ pub fn empty_exec_exit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_EXEC_EXIT").is_none_or(|v| v != "0"))
 }
 
+/// Whether [`empty_exec_exit`] leaves alone loops with a conditional branch on anything
+/// but EXEC between header and latch (`VICTORY_EMPTY_EXEC_STRICT`, on; `0`: left as
+/// before). Such a loop, a count of lights say, ends on the console with EXEC empty, and
+/// the stores after it run under the EXEC from before; aborting the wave drops them.
+/// (Suspected in three crashes of three in one function of the title's allocator with
+/// the exits on, none in one run without.)
+pub fn empty_exec_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_EXEC_STRICT").is_none_or(|v| v != "0"))
+}
+
 /// Experimental: [`empty_exec_exit`] without its proof that the header's EXEC comes back
 /// unchanged (`VICTORY_EMPTY_EXEC_LOOSE=1`, off): any loop the limit would abort and that
 /// changes only registers with EXEC empty is left when the header's EXEC is empty.

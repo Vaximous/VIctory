@@ -103,6 +103,7 @@ fn build() -> [u8; 32] {
             "VICTORY_EMPTY_SKIP_EXIT",
             "VICTORY_EMPTY_EXEC_EXIT",
             "VICTORY_EMPTY_EXEC_LOOSE",
+            "VICTORY_EMPTY_EXEC_STRICT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -121,6 +122,7 @@ fn build() -> [u8; 32] {
         bytes.extend_from_slice(b"empty-exits");
         bytes.push(u8::from(victory_shader::emit::empty_skip_exit()));
         bytes.push(u8::from(victory_shader::emit::empty_exec_exit()));
+        bytes.push(u8::from(victory_shader::emit::empty_exec_strict()));
         bytes
     });
     let mut hash = blake3::Hasher::new();

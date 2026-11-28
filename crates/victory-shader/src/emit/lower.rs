@@ -13919,6 +13919,18 @@ impl<'a> Lower<'a> {
         if span.iter().flat_map(|&q| p.blocks[q].insts.iter()).any(loud) {
             return None;
         }
+        // A way out on a scalar condition (a count, a value read): with EXEC empty the
+        // loop still leaves there on the console, and what comes after it runs with the
+        // EXEC from before (stores among it), so it is not to be aborted
+        // ([`super::empty_exec_strict`]). Branches on EXEC alone go the same way each
+        // time round while it is empty.
+        let scalar_exit = |i: &Inst| {
+            let n = i.name();
+            n.starts_with("s_cbranch_") && n != "s_cbranch_execz" && n != "s_cbranch_execnz"
+        };
+        if super::empty_exec_strict() && span.iter().flat_map(|&q| p.blocks[q].insts.iter()).any(scalar_exit) {
+            return None;
+        }
         Some(bit)
     }
 
