@@ -581,7 +581,60 @@ fn playing(route: &Route) -> Option<u64> {
 
 /// The keys the route holds now.
 pub(super) fn replay_keys() -> Vec<u8> {
-    replay().and_then(|r| latest(&r.keys, playing(r)?)).unwrap_or_default()
+    let Some(route) = replay() else { return Vec::new() };
+    let mut keys = playing(route).and_then(|at| latest(&route.keys, at)).unwrap_or_default();
+    if let Some(enter) = menu_retry(route, now_us())
+        && !keys.contains(&enter)
+    {
+        keys.push(enter);
+    }
+    keys
+}
+
+/// The menu's key pressed again (`VICTORY_ROUTE_MENU_RETRY=0`: not): a
+/// replay whose world has not begun [`MENU_RETRY_AFTER_US`] after the last
+/// key the route gave before its world presses the menu's key again
+/// ([`menu_key`]: Enter at the start screen) for [`MENU_RETRY_HOLD_US`] every
+/// [`MENU_RETRY_EVERY_US`], until the world begins. The start screen comes up
+/// at its own time: one replay gave the route's Enter presses at the polls
+/// and the times they were recorded at, 29.6 and 29.9 s, and stayed on the
+/// start screen (run ow116b-ref), where the same presses had started the
+/// game in the replay before it.
+fn menu_retry(route: &Route, now: u64) -> Option<u8> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_ROUTE_MENU_RETRY").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let world = route.world?;
+    if victory_gpu::frame::world_began().is_some() {
+        return None;
+    }
+    let (last, key) = menu_key(&route.keys, world)?;
+    retry_at(last, now).then(|| {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!(key = format_args!("{key:#04x}"), "route: the world has not begun; the menu's key is pressed again (VICTORY_ROUTE_MENU_RETRY=0: not)"));
+        key
+    })
+}
+
+/// Of the keys before the world: when the last was given, and the key to
+/// press again: Enter if the route pressed it there, else its last pressed.
+fn menu_key(keys: &[(u64, Vec<u8>)], world: u64) -> Option<(u64, u8)> {
+    let before: Vec<&(u64, Vec<u8>)> = keys.iter().filter(|(at, _)| *at < world).collect();
+    let last = before.last()?.0;
+    let key = if before.iter().any(|(_, k)| k.contains(&0x0d)) { 0x0d } else { *before.iter().rev().find_map(|(_, k)| k.first())? };
+    Some((last, key))
+}
+
+const MENU_RETRY_AFTER_US: u64 = 8_000_000;
+const MENU_RETRY_EVERY_US: u64 = 4_000_000;
+const MENU_RETRY_HOLD_US: u64 = 150_000;
+
+/// Whether the menu's key is held at `now`, the route's last key before the
+/// world given at `last` (both from the first poll).
+fn retry_at(last: u64, now: u64) -> bool {
+    let Some(since) = now.checked_sub(last + MENU_RETRY_AFTER_US) else { return false };
+    since % MENU_RETRY_EVERY_US < MENU_RETRY_HOLD_US
 }
 
 /// Pad slot `slot` as the route has it now (empty before its first word).
@@ -644,6 +697,29 @@ mod tests {
         assert_eq!(latest(&r.keys, 45), Some(vec![0x0d, 0x57]));
         assert_eq!(latest(&r.keys, 5), None);
         assert_eq!(r.world, None);
+    }
+
+    #[test]
+    fn the_menu_key_is_pressed_again_after_a_while() {
+        let last = 30_000_000;
+        assert!(!retry_at(last, last + 1_000_000));
+        assert!(!retry_at(last, last + MENU_RETRY_AFTER_US - 1));
+        assert!(retry_at(last, last + MENU_RETRY_AFTER_US + 10));
+        assert!(!retry_at(last, last + MENU_RETRY_AFTER_US + MENU_RETRY_HOLD_US + 10));
+        assert!(retry_at(last, last + MENU_RETRY_AFTER_US + MENU_RETRY_EVERY_US + 10));
+        let r = parse("# x
+10:1 K 0d
+20:2 K -
+30:3 K a4
+40:4 K -
+500:40 W
+");
+        assert_eq!(menu_key(&r.keys, 500), Some((40, 0x0d)));
+        assert_eq!(menu_key(&parse("# x
+30:3 K a4
+40:4 K -
+500:40 W
+").keys, 500), Some((40, 0xa4)));
     }
 
     #[test]
