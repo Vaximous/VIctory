@@ -2313,6 +2313,28 @@ pub(crate) fn barrier_need(sync_before: u32, sync_after: u32, before: u32, after
     }
 }
 
+/// Diagnostics: each kind of barrier the title's groups hold, logged the first time
+/// (64 at most), with what it needs.
+#[cfg(feature = "diagnostics")]
+fn note_barrier(kind: u32, b: [u32; 4]) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<(u32, [u32; 4])>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(HashSet::new);
+    if seen.len() < 64 && seen.insert((kind, b)) {
+        tracing::info!(
+            kind,
+            sync_before = format_args!("{:#x}", b[0]),
+            sync_after = format_args!("{:#x}", b[1]),
+            access_before = format_args!("{:#x}", b[2]),
+            access_after = format_args!("{:#x}", b[3]),
+            need = ?barrier_need(b[0], b[1], b[2], b[3]),
+            "a kind of title barrier"
+        );
+    }
+}
+
 /// What `count` barrier groups at `groups` need: the most any barrier of
 /// them does. Each group is a type (global 0, texture 1, buffer 2), a count
 /// and a pointer to its barriers, which all begin with the two syncs and the
@@ -2324,6 +2346,8 @@ pub(crate) fn barrier_need(sync_before: u32, sync_after: u32, before: u32, after
 /// barrier pointers are valid for their counts.
 pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
     if groups.is_null() {
+        #[cfg(feature = "diagnostics")]
+        note_barrier(0x300, [count, 0, 0, 0]);
         return GroupNeed::Every;
     }
     let mut need = GroupNeed::Nothing;
@@ -2337,6 +2361,17 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
                 at.add(8).cast::<*const u8>().read_unaligned(),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        note_barrier(0x500, [kind, n.min(4), 0, 0]);
+        #[cfg(feature = "diagnostics")]
+        if !matches!(kind, 0..=2) {
+            // SAFETY: as above: the group's 16 bytes.
+            let head = unsafe {
+                let at = groups.add(g * 16).cast::<u32>();
+                [0, 1, 2, 3].map(|i| at.add(i).read_unaligned())
+            };
+            note_barrier(0x100 | kind, head);
+        }
         let stride = match kind {
             0 => 16,
             1 => 64,
@@ -2347,6 +2382,8 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
             continue;
         }
         if first.is_null() {
+            #[cfg(feature = "diagnostics")]
+            note_barrier(0x400 | kind, [n, 0, 0, 0]);
             return GroupNeed::Every;
         }
         for b in 0..n as usize {
@@ -2355,6 +2392,8 @@ pub(crate) unsafe fn groups_need(count: u32, groups: *const u8) -> GroupNeed {
                 let at = first.add(b * stride).cast::<u32>();
                 [0, 1, 2, 3].map(|i| at.add(i).read_unaligned())
             };
+            #[cfg(feature = "diagnostics")]
+            note_barrier(kind, [sb, sa, ab, aa]);
             match barrier_need(sb, sa, ab, aa) {
                 GroupNeed::Every => return GroupNeed::Every,
                 GroupNeed::Compute => need = GroupNeed::Compute,
@@ -2380,6 +2419,27 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
             return;
         }
     }
+    if count > 0 {
+        barrier_groups_need(this, count, title_groups_need(count, groups));
+    }
+}
+
+/// What the title's groups need, with [`groups_need`] when a switch looks
+/// at their accesses (else the wait for every shader write).
+pub(crate) fn title_groups_need(count: u32, groups: *const u8) -> GroupNeed {
+    use crate::host::rec::{group_access, group_compute};
+    if group_access() || group_compute() {
+        // SAFETY: the title's groups, as it passed them, during its call.
+        unsafe { groups_need(count, groups) }
+    } else {
+        GroupNeed::Every
+    }
+}
+
+/// The host's side of the title's barrier groups, by what they need: also
+/// for lists whose calls were written down and are made now
+/// (`list::thin`), where the groups themselves are gone.
+pub(crate) fn barrier_groups_need(this: This, count: u32, need: GroupNeed) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
@@ -2387,8 +2447,6 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         with_state(this, |_, state| state.synced());
         use crate::host::rec::{GROUPS, group_access, group_compute};
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: the title's groups, as it passed them.
-        let need = if group_access() || group_compute() { unsafe { groups_need(count, groups) } } else { GroupNeed::Every };
         match need {
             GroupNeed::Nothing if group_access() => {
                 GROUPS[0].fetch_add(1, Relaxed);
@@ -2406,7 +2464,7 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         }
     }
     #[cfg(not(windows))]
-    let _ = (this, count, groups);
+    let _ = (this, count, need);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
