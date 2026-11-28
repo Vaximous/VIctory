@@ -66,7 +66,7 @@ appears, at about 9,400-9,700 draws a frame.
 | bench20 | 47.7 | 21.0 | 120 ms | 654 ms | 4.99 / 4.07 / 4.35 | outdoor baseline |
 | bench21 | 45.7 | 21.9 | 75 ms | 216 ms | 4.71 / 3.77 / 4.40 | front spans of a copy joined; sends streamed into upload memory |
 | bench22 | | | | 144 ms | not slower (see below) | merges into title memory by whole qwords; more helper threads, kept awake |
-| **bench23** | | | | 185 ms | not slower (see below) | crash fix: the title's heap nodes never take a stale card value; in-place copies noted as sent |
+| bench23 | | | | 185 ms | not slower (see below) | crash fix: the title's heap nodes never take a stale card value; in-place copies noted as sent |
 
 (ms, fps, p99 and worst over world frames 1000-3000; per-draw figures over the window.)
 
@@ -90,6 +90,39 @@ gameplay camera comes up, holds the heading to within 0.01 rad; the walk still
 lands outdoors in about half the runs, so builds are compared at the same draw
 counts. Replays should set `VICTORY_ROUTE_FRAME_MS=0` and
 `VICTORY_ROUTE_SETTLE_MOST_S=0`.
+
+### Followed route and in-run comparisons (from bench27)
+
+Replaying recorded keys could not hold a route: the character wakes up a little
+differently each run and the camera starts facing another way, so the same keys
+walk somewhere else. The recorder now also writes the player's position and the
+camera's heading four times a second from the moment the player has control, and
+a replay follows that track (`VICTORY_ROUTE_TRACKS`): it waits for its own
+player's control, steers toward the track a little past its nearest point, forces
+the recorded heading, and backs off and turns aside when the player stops while
+the recording walked on. A menu key is pressed again if the world has not begun
+30 s after the route's last menu key (`VICTORY_ROUTE_MENU_RETRY=0` turns that off).
+The route leaves the house, crosses the street and ends in a car crash, which
+makes a good stress stretch.
+
+Runs of the same build on this route still differ by 6-9 ms a frame, mostly
+because a few metres change how much is drawn, which is larger than most single
+changes. So changes are now measured inside one run: `VICTORY_AB=<seconds>,<switch>`
+flips a switch every few seconds, and phases at the same scene and draw count are
+compared. GPU work is also measured offline by replaying a captured frame
+(`victory replay --timing detailed`).
+
+| Build | Scene | ms / frame (mean / median) | fps | Notes |
+|---|---|---|---|---|
+| **bench27**, helper priority off | street, ~9,300 draws | 58.9 / 50.8 | 17.0 | same run, same scene |
+| **bench27**, helper priority on | street, ~9,300 draws | 49.6 / 47.1 | 20.2 | preparing 34-42 ms against 44-49; GPU unchanged |
+| **bench27** | street, ~7,000 draws | 51.7 / 47.9 | 19.3 | |
+| **bench27** | lighter, ~3,200 draws | 42.3 / 33.6 | 23.6 | |
+
+bench27 brings the water-light loop fix, three crash fixes, the barrier-group fix,
+argument-clamp batching and a set of NVIDIA fixes from another fork (below). In
+five runs since the allocator-node fix, builds of this line have not crashed,
+where four of six crashed before it.
 
 ### Where a frame goes (bench19, moving)
 
@@ -169,6 +202,34 @@ What was learned along the way:
   costs nothing measurable and fires about once every 20 frames. Buffer copies the
   title does in place are now noted as sent, so a landing fetched before them
   cannot write the card's older bytes back over them.
+- **A runaway loop under an empty mask.** One water-lighting compute shader ran
+  its light loop in host waves whose lanes were all inactive: the loop's counter
+  only changes in active lanes, so it spun to the 4096-round safety limit, about
+  8 ms of GPU a frame outdoors. Leaving such a loop at once when no lane of the wave
+  is active gives the same output and takes 0.04 ms. The exit is only taken where
+  every branch in the loop tests the active mask, because a loop that ends on a
+  scalar count still finishes on the console, and the code after it writes results.
+- **A stale card side must never win, part three.** The title's chunk allocator
+  keeps a list node of a next pointer and an object pointer at each 64 KiB block's
+  end. A landing could put a card copy's older bytes over a node the title had
+  just rewritten, and the title then followed a stale, zero or all-ones pointer.
+  Timing decided it, so builds whose GPU work ran differently crashed in most runs.
+  Landings now keep the title's node whole when it holds such a pointer pair; in
+  five runs since, none crashed.
+- **Barriers that never reached us.** The title's barrier groups say which
+  accesses must finish first, but every one waited for all shader writes. Lists
+  whose calls are written down for later replay passed the groups on as a null
+  pointer, so nothing could be narrowed. Working out what a group needs at the
+  call fixed it: about 110 of 860 groups a frame now skip the wait.
+- **The card waits on two things.** With the card idle 9-17 ms a frame, about half
+  is behind our submitting thread and half is the title's own CPU between
+  submissions; the title waits on no fence or present in that time. Raising the
+  helper threads the submitter waits on (`VICTORY_HELPER_PRIORITY`) cut preparing
+  by about 7 ms in the one steady comparison.
+- **Indirect-argument clamps.** Ending a clamp batch at every wait drained the card
+  around each one. Batching until the title's next wait made a replayed frame
+  20-40% faster on the GPU; ending batches only at waits that can make written
+  arguments visible saves about 1 ms more at light load.
 - **Part of the frame is the title's own CPU time.** Stretches where 8-15 ms pass
   between the title's first list call and its first submission are not waits on
   us: its submitting thread waits on no fence, event or label at all.
@@ -202,6 +263,15 @@ What was learned along the way:
   was to stop faulting.
 - Per-part claims and some refresh orderings made the title crash, which turned
   out to be the landing-merge bug above, exposed by different timing.
+- Keeping the title's bytes wherever a landing would change anything that looks
+  like a pointer: packed pairs of small numbers look the same, about 2,100 blocks a
+  frame were merged again every frame, and frames were 71 ms slower.
+- Hooking the title's cache write-backs as a "written" signal: the memory it
+  writes back is never asked about anyway, so it would save almost nothing.
+- Asking the write watch on a thread behind the submitter, and refreshing the
+  longest spans first: both work, but neither beat the noise in one-run A/B.
+- Steering a replay by the strafe keys, or by a time-based point on the track:
+  both cut corners at the doorway; following the nearest point does not.
 
 ## Optimizations in Blueyes
 
@@ -241,6 +311,14 @@ Each one has a switch, on by default; `=0` turns it off.
 | `VICTORY_LAND_KEEP_FOOT` | Where a landing would zero only the record offset of the title's node at a 64 KiB block's end, the title's bytes are kept and sent to the card. |
 | `VICTORY_PLACED_SENT` | The title's buffer copies done in place are noted as sent with their submission, so earlier landings leave those bytes alone. |
 | `VICTORY_MERGE_QWORDS` | Landed card results are merged into title memory by whole aligned qwords, each with one compare-exchange, so a pointer is never half old and half new. |
+| `VICTORY_EMPTY_EXEC_EXIT`, `VICTORY_EMPTY_SKIP_EXIT`, `VICTORY_EMPTY_EXEC_STRICT` | Loops that would spin to the round limit under an empty mask are left at once, only where every branch in them tests the active mask. |
+| `VICTORY_LAND_KEEP_FOOT_NODE` | A landing keeps the title's chunk-allocator node at a 64 KiB block's end whole when it holds a pointer pair. |
+| `VICTORY_GROUP_ACCESS`, `VICTORY_SYNC_CACHE_ONLY` | Barrier groups wait only where their accesses ask; syncs that only touch caches make no wait. |
+| `VICTORY_BATCH_PUBLISH` | Indirect-argument clamps are batched until a wait that can make written arguments visible. |
+| `VICTORY_HELPER_PRIORITY` | The threads the submitting thread waits on (shared pool, landing pools, heap records) run above normal priority. |
+| `VICTORY_TEARING` | Frames are shown as soon as they are presented where the display allows it. |
+| `VICTORY_RAW_VIEW_CLAMP`, `VICTORY_THREAD_TICKET`, `VICTORY_OWNERLESS_VIEWS` | Raw buffer views stay inside their buffer; console lanes in groups of several host waves take their thread numbers from a group counter; views no resource releases are capped. |
+| `VICTORY_WATER_LIGHT=1` (set it; off on 32-lane hosts) | Runs the water's tiled light, which on NVIDIA only translates in a slow form. |
 | `VICTORY_WIDE_SPIN=100` | Helper threads stay awake 100 us after a job before sleeping; a third of the machine's threads (up to 8) take shared work, and 6 to 8 refresh title bytes under in-flight writes. |
 
 The grey placeholder is kept on purpose: it shows what hasn't streamed in yet.
@@ -391,7 +469,10 @@ commits taken from elsewhere name the commit and its source.
   **[pepezin-ai/VIctory-NVIDIA](https://github.com/pepezin-ai/VIctory-NVIDIA)**
   and **[readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)**:
   the face-skinning fix (half views), BVH miss, NaN scrub, target variants,
-  pipeline wait-once and submit-thread work ported here.
+  pipeline wait-once and submit-thread work ported here; from trustno1-coder's
+  fork for bench27 also helper priority, descriptor-slot and view fixes, lane and
+  division fixes for 32-lane hosts, static-sampler pipelines, raw view clamps,
+  tearing, the water light switch and several robustness fixes.
 - **[adanaport](https://github.com/adanaport/adanaport)**: the idea of turning the
   graphics heap into write-watched memory, and measurements of in-place heaps.
 - **[NitricAcidDev/VIctory-Omega-Fork](https://github.com/NitricAcidDev/VIctory-Omega-Fork)**
