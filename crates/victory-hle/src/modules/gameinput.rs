@@ -1250,6 +1250,21 @@ mod host {
                         down.push(vk);
                     }
                 }
+                // Nudged toward the steering track (`VICTORY_ROUTE_NUDGE`).
+                let (strafe, back) = super::camera::route_nudge();
+                if back {
+                    down.retain(|&vk| vk != 0x57);
+                    if !down.contains(&0x53) {
+                        down.push(0x53);
+                    }
+                }
+                if let Some(vk) = strafe {
+                    // (The other strafe key let go: held together they cancel.)
+                    down.retain(|&k| k != if vk == 0x41 { 0x44 } else { 0x41 });
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
             } else if focused() {
                 // The mouse's release key is ours, not the title's.
                 let mouse = super::mouse::settings();

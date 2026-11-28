@@ -568,11 +568,101 @@ fn steered(memory: &impl Memory, base: u64, camera: &Camera, _trace: &[(f64, f32
     } else {
         0.0
     };
+    let second = LAST_S_PEEK.load(Ordering::Relaxed) != t as u64;
+    if nudge_on() {
+        nudge(t, now, here, (rx, ry), off, turn, second);
+    }
     static LAST_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    LAST_S_PEEK.store(t as u64, Ordering::Relaxed);
     if LAST_S.swap(t as u64, Ordering::Relaxed) != t as u64 {
-        tracing::info!(route_s = t, off, turn, x = now[0], y = now[1], z = now[2], "route steer");
+        let (key, back) = route_nudge();
+        tracing::info!(route_s = t, off, turn, x = now[0], y = now[1], z = now[2], nudge = key.unwrap_or(0), back, "route steer");
     }
     turn
+}
+
+/// The route second [`steered`] last saw.
+static LAST_S_PEEK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether the steered walk is also nudged toward the track by the strafe
+/// keys, and backed off when it is blocked (`VICTORY_ROUTE_NUDGE=1`; off by
+/// default; with `VICTORY_ROUTE_STEER`).
+///
+/// Turning the heading alone did not bring the walk back where it was
+/// blocked: at route 65-71 s of the outdoor route the player stood at the
+/// stairs, 7 m off the track and behind it, the bearing to the track ahead
+/// nearly the walk's own, so the turns stayed tiny (run ow96-base).
+fn nudge_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROUTE_NUDGE").is_some_and(|v| v == "1"))
+}
+
+/// Off the track by more than this sideways (metres), the strafe key toward it is held.
+const NUDGE_SIDE_M: f32 = 0.6;
+/// The distance grew by more than this in a second with the turns small: blocked.
+const NUDGE_GREW_M: f32 = 0.8;
+/// How long the walk backs off when blocked (route seconds).
+const NUDGE_BACK_S: f64 = 0.6;
+
+/// The strafe key to hold (0: none), whether to back off, and the state
+/// that decides them, from [`nudge`].
+static NUDGE_KEY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NUDGE_BACK: AtomicBool = AtomicBool::new(false);
+/// Of the second before: the distance off and sideways (f32 bits), whether
+/// a strafe key was held, and which way strafing left goes (+1 / -1: the
+/// track's left as the walk's bearing turns, until it is seen otherwise).
+static NUDGE_STATE: std::sync::Mutex<(f32, f32, bool, f32, f64)> = std::sync::Mutex::new((0.0, 0.0, false, 1.0, f64::MIN));
+
+/// [`nudge_on`]: decides the keys for route second `t` from where the
+/// player is (`now`), where the track is (`here`) and goes (`dir`), how far
+/// off that is, and the turn the heading got; `second`: the first call of
+/// a route second, where what the second before did is looked at.
+fn nudge(t: f64, now: [f32; 3], here: [f32; 3], dir: (f32, f32), off: f32, turn: f32, second: bool) {
+    let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt();
+    let mut state = NUDGE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (dx, dy) = (across(here[0] - now[0]), across(here[1] - now[1]));
+    // The track to the walk's left (> 0) or right, and how far behind it the
+    // player is (> 0: behind).
+    let (side, behind) = if len >= 0.2 { ((dir.0 * dy - dir.1 * dx) / len, (dir.0 * dx + dir.1 * dy) / len) } else { (0.0, 0.0) };
+    if second {
+        let (off_was, side_was, strafed, _, _) = *state;
+        // Strafing made it worse: the keys go the other way round.
+        if strafed && side.abs() > side_was.abs() + 0.3 {
+            state.3 = -state.3;
+            tracing::info!(route_s = t, side, side_was, "route nudge: strafing went away from the track, the other way round now");
+        }
+        // Blocked: the distance grew with the turns small, behind the track.
+        if off > 1.5 && off - off_was > NUDGE_GREW_M && turn.abs() < 0.15 && behind > 0.5 {
+            state.4 = t + NUDGE_BACK_S;
+        }
+        state.0 = off;
+        state.1 = side;
+    }
+    let key = if off > 1.0 && side.abs() > NUDGE_SIDE_M {
+        // A (0x41) to the left, D (0x44) to the right.
+        if side * state.3 > 0.0 { 0x41 } else { 0x44 }
+    } else {
+        0
+    };
+    if second {
+        state.2 = key != 0;
+    }
+    NUDGE_KEY.store(key, Ordering::Relaxed);
+    NUDGE_BACK.store(t < state.4, Ordering::Relaxed);
+}
+
+/// While a route is replayed with [`nudge_on`]: the strafe key to hold
+/// (`A` or `D`), and whether the walk backs off (forward let go, `S` held).
+pub(super) fn route_nudge() -> (Option<u8>, bool) {
+    if !nudge_on() {
+        return (None, false);
+    }
+    let t = super::route::route_now_us().map_or(0.0, |us| us as f64 / 1e6);
+    if !(STEER_FROM_S..=STEER_UNTIL_S).contains(&t) {
+        return (None, false);
+    }
+    let key = NUDGE_KEY.load(Ordering::Relaxed);
+    ((key != 0).then_some(key), NUDGE_BACK.load(Ordering::Relaxed))
 }
 
 /// Writes the first found camera to the trace's heading now; `None` when
