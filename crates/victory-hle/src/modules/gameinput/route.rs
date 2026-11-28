@@ -17,7 +17,15 @@
 //! `<us> R` the mouse let go (not captured);
 //! `<us> W` the first frame of the world was shown
 //! (`victory_gpu::frame::world_began`);
-//! `<us> S` the world settled after it (`victory_gpu::frame::world_settled`).
+//! `<us> S` the world settled after it (`victory_gpu::frame::world_settled`);
+//! `<us> C` the player first had control: the gameplay camera came up
+//! (`camera::control_at`). Beside the file, `<name>.cam` and `<name>.pos`
+//! get the camera's heading and the player's position a few times a second
+//! from then on, timed in seconds since that moment (`camera`), where the
+//! camera file names them. Played back with both beside it, the route's
+//! events after `C` are given by the time since the replay's own player got
+//! control, and the camera follows the recorded heading, steered toward the
+//! recorded positions.
 //!
 //! From version 2 on each time is `<us>:<poll>`, with the count of the title's
 //! keyboard polls by then. Played back, the events before the world are given
@@ -95,6 +103,37 @@ pub(super) fn polled() {
     let mut rec = rec.lock().unwrap_or_else(|e| e.into_inner());
     let _ = writeln!(rec.out, "{us} S");
     let _ = rec.out.flush();
+}
+
+/// Whether the input is recorded (`VICTORY_INPUT_RECORD`).
+pub(super) fn recording() -> bool {
+    recorder().is_some()
+}
+
+/// The recording's file (`VICTORY_INPUT_RECORD`), if the input is recorded.
+pub(super) fn record_path() -> Option<std::path::PathBuf> {
+    recorder()?;
+    std::env::var_os("VICTORY_INPUT_RECORD").map(Into::into)
+}
+
+/// The route played back's file (`VICTORY_INPUT_REPLAY`), if one is.
+pub(super) fn replay_path() -> Option<std::path::PathBuf> {
+    replay()?;
+    std::env::var_os("VICTORY_INPUT_REPLAY").map(Into::into)
+}
+
+/// Recording: the player got control at `at` (written once, `C`).
+pub(super) fn record_control(at: Instant) {
+    let Some(rec) = recorder() else { return };
+    let us = at.saturating_duration_since(zero()).as_micros() as u64;
+    let mut rec = rec.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = writeln!(rec.out, "{us}:{} C", POLLS.load(Ordering::Relaxed));
+    let _ = rec.out.flush();
+}
+
+/// The route played back's moment of control (`C`), route microseconds.
+pub(super) fn route_control_us() -> Option<u64> {
+    replay()?.control
 }
 
 /// The mouse at a poll: moved, wheel, held, pressed; or let go.
@@ -218,6 +257,8 @@ struct Route {
     /// When the world settled after it, if the file (or
     /// `VICTORY_ROUTE_SETTLE_S`) says.
     settle: Option<u64>,
+    /// When the player first had control, if the file says (`C`).
+    control: Option<u64>,
     /// Of events before the world that have a poll count: the count and the
     /// time, in order.
     polls: Vec<(u64, u64)>,
@@ -232,6 +273,7 @@ fn parse(text: &str) -> Route {
         end: 0,
         world: None,
         settle: None,
+        control: None,
         polls: Vec::new(),
     };
     let mut polls = Vec::new();
@@ -248,12 +290,14 @@ fn parse(text: &str) -> Route {
         if let Some(poll) = poll
             && kind != Some("W")
             && kind != Some("S")
+            && kind != Some("C")
         {
             polls.push((poll, us));
         }
         match kind {
             Some("W") => route.world = route.world.or(Some(us)),
             Some("S") => route.settle = route.settle.or(Some(us)),
+            Some("C") => route.control = route.control.or(Some(us)),
             Some("K") => {
                 let keys = match words.next() {
                     Some("-") | None => Vec::new(),
@@ -318,6 +362,29 @@ fn clock(route: &Route) -> u64 {
             );
         });
         let by_world = world + now.saturating_sub(here);
+        // With the recorded tracks followed: held short of the route's moment
+        // of control until the replay's player has it, then by the time since
+        // (the wake-up before it takes as long as it takes); one that has not
+        // got it within `CAMERA_WAIT_US` of the world goes on as below.
+        if let Some(control) = route.control.filter(|&c| c > world && super::camera::following()) {
+            if let Some(got) = super::camera::control_at() {
+                let there = got.saturating_duration_since(zero()).as_micros() as u64;
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        route_after_world_ms = (control - world) / 1000,
+                        replay_after_world_ms = there.saturating_sub(here) / 1000,
+                        "route: anchored on the player's control (the tracks beside the route): from here the route plays by the time since it"
+                    );
+                });
+                return control + now.saturating_sub(there);
+            }
+            if now.saturating_sub(here) < CAMERA_WAIT_US {
+                return by_world.min(control - 1);
+            }
+            static GAVE_UP: std::sync::Once = std::sync::Once::new();
+            GAVE_UP.call_once(|| tracing::warn!("route: the player's control did not come; the route goes on by the world"));
+        }
         // With a camera trace: held at its first checkpoint until the
         // title's gameplay camera comes up, then by the time since; one that
         // has not come up within `CAMERA_WAIT_US` of the world falls back
@@ -577,6 +644,18 @@ mod tests {
         assert_eq!(latest(&r.keys, 45), Some(vec![0x0d, 0x57]));
         assert_eq!(latest(&r.keys, 5), None);
         assert_eq!(r.world, None);
+    }
+
+    #[test]
+    fn control_is_read_and_not_a_poll_event() {
+        let r = parse("# x
+500:40 W
+900 S
+1500:90 C
+1600:95 K 57
+");
+        assert_eq!((r.world, r.settle, r.control), (Some(500), Some(900), Some(1500)));
+        assert!(r.polls.is_empty());
     }
 
     #[test]

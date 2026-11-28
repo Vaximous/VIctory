@@ -14,6 +14,7 @@
 //! for its gamepad reading, on its own thread, before it updates its
 //! camera from the (then still) stick.
 
+use std::io::Write;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(feature = "diagnostics")]
@@ -760,6 +761,9 @@ fn nudge(t: f64, now: [f32; 3], here: [f32; 3], dir: (f32, f32), off: f32, turn:
 /// While a route is replayed with [`nudge_on`]: the strafe key to hold
 /// (`A` or `D`), and whether the walk backs off (forward let go, `S` held).
 pub(super) fn route_nudge() -> (Option<u8>, bool) {
+    if following() {
+        return (None, FOLLOW_BACK.load(Ordering::Relaxed));
+    }
     if !nudge_on() {
         return (None, false);
     }
@@ -769,6 +773,306 @@ pub(super) fn route_nudge() -> (Option<u8>, bool) {
     }
     let key = NUDGE_KEY.load(Ordering::Relaxed);
     ((key != 0).then_some(key), NUDGE_BACK.load(Ordering::Relaxed))
+}
+
+/// When the player first had control: the first pad read at which the
+/// gameplay camera was found with its yaw other than zero (from the world's
+/// first frame until the gameplay camera comes up it reads exactly 0). Asked
+/// for only while the input is recorded or recorded tracks are followed.
+static CONTROL: OnceLock<std::time::Instant> = OnceLock::new();
+
+/// When the player first had control ([`CONTROL`]).
+pub(super) fn control_at() -> Option<std::time::Instant> {
+    CONTROL.get().copied()
+}
+
+/// How often the recorded tracks get a line (seconds).
+const TRACK_EVERY_S: f64 = 0.25;
+
+/// The tracks written beside a recording: `<name>.cam` lines of
+/// `<seconds since control> <yaw> <pitch>`, `<name>.pos` lines of
+/// `<seconds since control> <x> <y> <z>`, each flushed as written (a crash
+/// loses nothing said before it).
+struct TrackOut {
+    cam: std::io::BufWriter<std::fs::File>,
+    pos: Option<std::io::BufWriter<std::fs::File>>,
+    last: f64,
+}
+
+/// `None`: not begun; `Some(None)`: the files could not be made.
+static TRACK_OUT: std::sync::Mutex<Option<Option<TrackOut>>> = std::sync::Mutex::new(None);
+
+/// The position the camera file names, read now.
+fn position(memory: &impl Memory, base: u64, camera: &Camera) -> Option<[f32; 3]> {
+    if camera.position.is_empty() {
+        return None;
+    }
+    let at = resolve(memory, base, &camera.position)?;
+    let mut b = [0u8; 12];
+    if !memory.read(at, &mut b) {
+        return None;
+    }
+    let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let p = [f(0), f(4), f(8)];
+    p.iter().all(|v| v.is_finite()).then_some(p)
+}
+
+/// The first found camera, with its heading.
+fn found_camera<'a>(memory: &impl Memory, base: u64, list: &'a [Camera]) -> Option<(&'a Camera, f32, f32)> {
+    list.iter().filter(|c| present(memory, base, c)).find_map(|c| {
+        let y = read_f32(memory, resolve(memory, base, &c.yaw)?)?;
+        let p = read_f32(memory, resolve(memory, base, &c.pitch)?)?;
+        Some((c, y, p))
+    })
+}
+
+/// Recording (`VICTORY_INPUT_RECORD`): from the player's first control on
+/// ([`CONTROL`]), a line of each track every [`TRACK_EVERY_S`].
+fn record_tracks(memory: &impl Memory, base: u64, list: &[Camera]) {
+    let Some(&got) = CONTROL.get() else { return };
+    let t = got.elapsed().as_secs_f64();
+    let mut out = TRACK_OUT.lock().unwrap_or_else(|e| e.into_inner());
+    if out.is_none() {
+        let opened = super::route::record_path().and_then(|rec| {
+            let open = |ext: &str| {
+                let path = rec.with_extension(ext);
+                match std::fs::File::create(&path) {
+                    Ok(f) => Some(std::io::BufWriter::new(f)),
+                    Err(error) => {
+                        tracing::warn!(%error, path = %path.display(), "a recorded track could not be made");
+                        None
+                    }
+                }
+            };
+            let cam = open("cam")?;
+            let pos = if list.iter().any(|c| !c.position.is_empty()) { open("pos") } else { None };
+            tracing::info!(
+                position = pos.is_some(),
+                "route: the camera's heading and the player's position are recorded beside the route, in seconds since the player's control"
+            );
+            Some(TrackOut { cam, pos, last: f64::MIN })
+        });
+        *out = Some(opened);
+    }
+    let Some(Some(track)) = out.as_mut() else { return };
+    if t - track.last < TRACK_EVERY_S {
+        return;
+    }
+    let Some((camera, yaw, pitch)) = found_camera(memory, base, list) else { return };
+    track.last = t;
+    let _ = writeln!(track.cam, "{t:.3} {yaw} {pitch}");
+    let _ = track.cam.flush();
+    if let (Some(pos), Some([x, y, z])) = (track.pos.as_mut(), position(memory, base, camera)) {
+        let _ = writeln!(pos, "{t:.3} {x} {y} {z}");
+        let _ = pos.flush();
+    }
+}
+
+/// Recorded tracks a replay follows: the heading and position lines beside
+/// the route (`<name>.cam`, `<name>.pos`, as [`record_tracks`] writes them),
+/// when the route says when its player got control (`C`). Off with
+/// `VICTORY_ROUTE_TRACKS=0`. From the replay's own player's control on, the
+/// camera is written to the recorded heading at each pad read (the route's
+/// mouse counts are in it already and are not added), turned toward the
+/// recorded position a second ahead when the player is off it
+/// ([`follow_turn`]); a player that stops while the recorded walk goes on
+/// backs off and walks on turned aside.
+struct Tracks {
+    cam: Vec<(f64, f32, f32)>,
+    pos: Vec<(f64, [f32; 3])>,
+    /// As [`Steer`]'s: how the walk's bearing moves with the yaw.
+    sign: f32,
+}
+
+/// Lines of a time and `N` numbers, sorted by time; others are left out.
+fn read_lines<const N: usize>(path: &std::path::Path) -> Option<Vec<(f64, [f32; N])>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut points: Vec<(f64, [f32; N])> = text
+        .lines()
+        .filter_map(|line| {
+            let v: Vec<f64> = line.split_whitespace().map_while(|w| w.parse().ok()).collect();
+            (v.len() > N && v.iter().all(|x| x.is_finite())).then(|| (v[0], std::array::from_fn(|i| v[i + 1] as f32)))
+        })
+        .collect();
+    points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Some(points)
+}
+
+/// Whether the walk's bearing moves with the yaw (+1) or against it (-1),
+/// from the recorded steps of 0.3 m or more against the heading then; with
+/// how alike each sign leaves the differences (0: all alike) and the steps.
+fn walk_sign(pos: &[(f64, [f32; 3])], cam: &[(f64, f32, f32)]) -> (f32, f32, f32, usize) {
+    let mut pairs = Vec::new();
+    for w in pos.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (dx, dy) = (across(b.1[0] - a.1[0]), across(b.1[1] - a.1[1]));
+        if (dx * dx + dy * dy).sqrt() < 0.3 {
+            continue;
+        }
+        if let Some((yaw, _)) = traced(cam, (a.0 + b.0) / 2.0, std::f32::consts::TAU) {
+            pairs.push((dy.atan2(dx), yaw));
+        }
+    }
+    let spread = |sign: f32| {
+        let (c, s) = pairs.iter().fold((0.0f32, 0.0f32), |(c, s), &(b, y)| {
+            let d = wrapped(b - sign * y);
+            (c + d.cos(), s + d.sin())
+        });
+        1.0 - (c * c + s * s).sqrt() / pairs.len().max(1) as f32
+    };
+    let (plus, minus) = (spread(1.0), spread(-1.0));
+    (if plus <= minus { 1.0 } else { -1.0 }, plus, minus, pairs.len())
+}
+
+fn tracks() -> Option<&'static Tracks> {
+    static TRACKS: OnceLock<Option<Tracks>> = OnceLock::new();
+    TRACKS
+        .get_or_init(|| {
+            super::route::route_control_us()?;
+            if std::env::var_os("VICTORY_ROUTE_TRACKS").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let rec = super::route::replay_path()?;
+            let cam: Vec<(f64, f32, f32)> =
+                read_lines::<2>(&rec.with_extension("cam"))?.into_iter().map(|(t, [y, p])| (t, y, p)).collect();
+            let pos = read_lines::<3>(&rec.with_extension("pos")).unwrap_or_default();
+            if cam.len() < 2 {
+                return None;
+            }
+            let (sign, plus, minus, steps) = walk_sign(&pos, &cam);
+            tracing::info!(
+                cam = cam.len(),
+                pos = pos.len(),
+                until_s = cam.last().map(|c| c.0),
+                steps,
+                spread_plus = plus,
+                spread_minus = minus,
+                sign,
+                "route: the recorded tracks beside it are followed (VICTORY_ROUTE_TRACKS=0: not)"
+            );
+            Some(Tracks { cam, pos, sign })
+        })
+        .as_ref()
+}
+
+/// Whether a replay follows recorded tracks ([`Tracks`]).
+pub(super) fn following() -> bool {
+    tracks().is_some()
+}
+
+/// Off the track by more than this (metres), the heading is turned toward it.
+const FOLLOW_OFF_M: f32 = 0.5;
+/// The most the heading is turned toward the track (radians).
+const FOLLOW_MOST: f32 = 0.6;
+/// Moved less than this in [`STALL_S`] while the recorded walk moved on: stuck.
+const STALL_M: f32 = 0.25;
+const STALL_S: f64 = 1.0;
+/// Stuck: the walk backs off this long, then walks on turned aside for
+/// [`ASIDE_S`] by [`ASIDE`] (the side swaps at each stall).
+const BACK_S: f64 = 0.7;
+const ASIDE_S: f64 = 1.0;
+const ASIDE: f32 = 0.7;
+
+/// [`follow_turn`]'s state: the last check (time, position), backing off
+/// and turning aside until (seconds since control), the side, the second
+/// last logged and the stalls so far.
+struct Follow {
+    check: Option<(f64, [f32; 3])>,
+    back_until: f64,
+    aside_until: f64,
+    side: f32,
+    second: i64,
+    stalls: u32,
+}
+
+static FOLLOW: std::sync::Mutex<Follow> =
+    std::sync::Mutex::new(Follow { check: None, back_until: f64::MIN, aside_until: f64::MIN, side: 1.0, second: i64::MIN, stalls: 0 });
+/// The walk backs off now (forward let go, back held: [`route_nudge`]).
+static FOLLOW_BACK: AtomicBool = AtomicBool::new(false);
+
+/// What [`follow_turn`] decides at `t` (seconds since control), the player
+/// at `now`: the turn added to the recorded heading and whether to back off.
+/// Pure, for the tests; the state is the caller's.
+fn follow_step(f: &mut Follow, tracks: &Tracks, t: f64, now: [f32; 3]) -> (f32, bool) {
+    let (Some(here), Some(ahead)) = (tracked(&tracks.pos, t), tracked(&tracks.pos, t + 1.0)) else { return (0.0, false) };
+    let off = (across(now[0] - here[0]).powi(2) + across(now[1] - here[1]).powi(2)).sqrt();
+    let (rx, ry) = (across(ahead[0] - here[0]), across(ahead[1] - here[1]));
+    let walking = (rx * rx + ry * ry).sqrt() >= 0.5;
+    // Stuck: the recorded walk goes on, the player stays.
+    match f.check {
+        Some((at, was)) if t - at >= STALL_S => {
+            let moved = (across(now[0] - was[0]).powi(2) + across(now[1] - was[1]).powi(2)).sqrt();
+            if moved < STALL_M && walking && t > f.aside_until {
+                f.back_until = t + BACK_S;
+                f.aside_until = t + BACK_S + ASIDE_S;
+                f.side = -f.side;
+                f.stalls += 1;
+                tracing::info!(route_s = t, moved, off, side = f.side, stalls = f.stalls, "route follow: stuck, backing off and turning aside");
+            }
+            f.check = Some((t, now));
+        }
+        None => f.check = Some((t, now)),
+        _ => {}
+    }
+    let back = t < f.back_until;
+    let turn = if t < f.aside_until {
+        f.side * ASIDE
+    } else if off > FOLLOW_OFF_M && walking {
+        let wanted = across(ahead[1] - now[1]).atan2(across(ahead[0] - now[0]));
+        let walked = ry.atan2(rx);
+        tracks.sign * wrapped(wanted - walked).clamp(-FOLLOW_MOST, FOLLOW_MOST)
+    } else {
+        0.0
+    };
+    if f.second != t as i64 {
+        f.second = t as i64;
+        tracing::info!(route_s = t, off, turn, back, x = now[0], y = now[1], z = now[2], "route follow");
+    }
+    (turn, back)
+}
+
+/// [`follow_step`] with its state, the backing off set for the keys.
+fn follow_turn(tracks: &Tracks, t: f64, now: Option<[f32; 3]>) -> f32 {
+    let Some(now) = now else {
+        FOLLOW_BACK.store(false, Ordering::Relaxed);
+        return 0.0;
+    };
+    let mut f = FOLLOW.lock().unwrap_or_else(|e| e.into_inner());
+    let (turn, back) = follow_step(&mut f, tracks, t, now);
+    FOLLOW_BACK.store(back, Ordering::Relaxed);
+    turn
+}
+
+/// Writes the first found camera to the recorded heading now, turned toward
+/// the recorded positions ([`follow_turn`]); `None` when no tracks are
+/// followed or this moment is outside them, else whether a camera was found.
+fn turn_to_tracks(memory: &impl Memory, base: u64, list: &[Camera]) -> Option<bool> {
+    let tracks = tracks()?;
+    let got = CONTROL.get()?;
+    let t = got.elapsed().as_secs_f64();
+    if t > tracks.cam.last()?.0 {
+        FOLLOW_BACK.store(false, Ordering::Relaxed);
+        return None;
+    }
+    let (camera, yaw, pitch) = found_camera(memory, base, list)?;
+    let (Some(y), Some(p)) = (resolve(memory, base, &camera.yaw), resolve(memory, base, &camera.pitch)) else { return Some(false) };
+    let (new_yaw, new_pitch) = traced(&tracks.cam, t, camera.wrap)?;
+    let turn = follow_turn(tracks, t, position(memory, base, camera));
+    let new_yaw = if turn == 0.0 { new_yaw } else { wrapped(new_yaw + turn) };
+    let (lo, hi) = (camera.pitch_min.min(camera.pitch_max), camera.pitch_max.max(camera.pitch_min));
+    let new_pitch = new_pitch.clamp(lo, hi);
+    if (new_yaw, new_pitch) != (yaw, pitch) {
+        memory.write(y, &new_yaw.to_le_bytes());
+        memory.write(p, &new_pitch.to_le_bytes());
+        let mut by_yaw = new_yaw - yaw;
+        if camera.wrap > 0.0 {
+            let half = camera.wrap / 2.0;
+            by_yaw = (by_yaw + half).rem_euclid(camera.wrap) - half;
+        }
+        shift(memory, base, &camera.yaw_copies, by_yaw, camera.wrap);
+        shift(memory, base, &camera.pitch_copies, new_pitch - pitch, 0.0);
+    }
+    Some(true)
 }
 
 /// Writes the first found camera to the trace's heading now; `None` when
@@ -826,8 +1130,27 @@ pub(super) fn apply() {
     {
         tracing::info!(route_s = super::route::route_now_us().map(|us| us as f64 / 1e6), "route camera trace: the gameplay camera came up (its yaw read other than 0)");
     }
+    // The player's first control, where it is asked for (recording, or a
+    // replay that follows recorded tracks): nothing more is read otherwise.
     #[cfg(windows)]
-    let found = if let Some(found) = turn_to_trace(&host::Own, cameras.base, &cameras.list) {
+    if CONTROL.get().is_none()
+        && (super::route::recording() || following())
+        && heading(&host::Own, cameras.base, &cameras.list).is_some_and(|(yaw, _)| yaw != 0.0)
+    {
+        let now = std::time::Instant::now();
+        if CONTROL.set(now).is_ok() {
+            tracing::info!("route: the player has control (the gameplay camera came up)");
+            super::route::record_control(now);
+        }
+    }
+    #[cfg(windows)]
+    if super::route::recording() {
+        record_tracks(&host::Own, cameras.base, &cameras.list);
+    }
+    #[cfg(windows)]
+    let found = if let Some(found) = turn_to_tracks(&host::Own, cameras.base, &cameras.list) {
+        found
+    } else if let Some(found) = turn_to_trace(&host::Own, cameras.base, &cameras.list) {
         found
     } else if absolute() {
         turn_to(&host::Own, cameras.base, &cameras.list, counts, cameras.scale, cameras.invert_y)
@@ -1017,6 +1340,80 @@ mod tests {
         m.put(0x2000_0000, &(base + 0x6000).to_le_bytes());
         assert!(!turn(&m, base, std::slice::from_ref(&c), (100, 0), 1.0, false));
         assert!((m.f32(0x2000_0020) - 3.1).abs() < 1e-5);
+    }
+
+    /// A walk along x at 1 m/s whose bearing is the yaw (sign +1).
+    fn straight() -> Tracks {
+        Tracks {
+            cam: (0..20).map(|i| (f64::from(i), 0.0, 0.0)).collect(),
+            pos: (0..20).map(|i| (f64::from(i), [i as f32 * 0.9, 0.0, 0.0])).collect(),
+            sign: 1.0,
+        }
+    }
+
+    fn follow() -> Follow {
+        Follow { check: None, back_until: f64::MIN, aside_until: f64::MIN, side: 1.0, second: i64::MIN, stalls: 0 }
+    }
+
+    #[test]
+    fn walk_sign_is_read_from_the_tracks() {
+        let t = straight();
+        let (sign, plus, _, steps) = walk_sign(&t.pos, &t.cam);
+        assert_eq!((sign, steps), (1.0, 19));
+        assert!(plus < 1e-3, "{plus}");
+        // The bearing against the yaw: -1.
+        let cam: Vec<(f64, f32, f32)> = (0..10).map(|i| (f64::from(i), 0.2 * i as f32, 0.0)).collect();
+        let mut p = [0.0f32; 3];
+        let mut pos = vec![(0.0, p)];
+        for i in 0..9 {
+            let b = -0.2 * (i as f32 + 0.5);
+            p = [p[0] + b.cos(), p[1] + b.sin(), 0.0];
+            pos.push((f64::from(i + 1), p));
+        }
+        assert_eq!(walk_sign(&pos, &cam).0, -1.0);
+    }
+
+    #[test]
+    fn off_the_track_turns_toward_it() {
+        let t = straight();
+        let mut f = follow();
+        // On the track: no turn.
+        assert_eq!(follow_step(&mut f, &t, 2.0, [1.8, 0.0, 0.0]), (0.0, false));
+        // 2 m to its right (y -2): turned left (toward +y), at most FOLLOW_MOST.
+        let mut f = follow();
+        let (turn, back) = follow_step(&mut f, &t, 2.0, [1.8, -2.0, 0.0]);
+        assert!(turn > 0.3 && turn <= FOLLOW_MOST && !back, "{turn}");
+    }
+
+    #[test]
+    fn a_stop_backs_off_and_turns_aside() {
+        let t = straight();
+        let mut f = follow();
+        let at = [3.0, 0.0, 0.0];
+        assert_eq!(follow_step(&mut f, &t, 3.0, at).1, false);
+        // A second later the player has not moved while the track went on.
+        let (turn, back) = follow_step(&mut f, &t, 4.05, at);
+        assert!(back && turn.abs() == ASIDE, "{turn} {back}");
+        // After the backing off, turned aside, forward again.
+        let (turn, back) = follow_step(&mut f, &t, 4.05 + BACK_S + 0.1, at);
+        assert!(!back && turn.abs() == ASIDE);
+        assert_eq!(f.stalls, 1);
+        // A stop at the end of the track (the walk over) is no stall.
+        let mut f = follow();
+        let end = [17.1, 0.0, 0.0];
+        follow_step(&mut f, &t, 19.0, end);
+        assert_eq!(follow_step(&mut f, &t, 20.5, end), (0.0, false));
+    }
+
+    #[test]
+    fn track_lines_read_back() {
+        let dir = std::env::temp_dir().join(format!("victory-track-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.cam");
+        std::fs::write(&path, "# x\n1.250 0.5 -0.1\n0.000 0.4 0\nbad\n").unwrap();
+        let lines = read_lines::<2>(&path).unwrap();
+        assert_eq!(lines, vec![(0.0, [0.4, 0.0]), (1.25, [0.5, -0.1])]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
