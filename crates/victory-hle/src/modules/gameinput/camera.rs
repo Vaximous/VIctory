@@ -455,6 +455,9 @@ struct Steer {
     points: Vec<(f64, [f32; 3])>,
     /// +1 or -1: the walk's bearing (atan2 of y, x) moves with the yaw so.
     sign: f32,
+    /// The walk's bearing less `sign` times the yaw, on average: the yaw
+    /// that walks toward a bearing ([`reach`]).
+    offset: f32,
 }
 
 const STEER_FROM_S: f64 = 46.0;
@@ -520,6 +523,11 @@ fn steer() -> Option<&'static Steer> {
             };
             let (plus, minus) = (spread(1.0), spread(-1.0));
             let sign = if plus <= minus { 1.0 } else { -1.0 };
+            let (c, s) = pairs.iter().fold((0.0f32, 0.0f32), |(c, s), &(b, y)| {
+                let d = wrapped(b - sign * y);
+                (c + d.cos(), s + d.sin())
+            });
+            let offset = s.atan2(c);
             tracing::info!(
                 path = %std::path::Path::new(&path).display(),
                 points = points.len(),
@@ -529,7 +537,7 @@ fn steer() -> Option<&'static Steer> {
                 sign,
                 "route track (VICTORY_ROUTE_STEER)"
             );
-            (points.len() >= 2 && !pairs.is_empty()).then_some(Steer { points, sign })
+            (points.len() >= 2 && !pairs.is_empty()).then_some(Steer { points, sign, offset })
         })
         .as_ref()
 }
@@ -568,6 +576,10 @@ fn steered(memory: &impl Memory, base: u64, camera: &Camera, _trace: &[(f64, f32
     } else {
         0.0
     };
+    let turn = match reach(t, now, steer, yaw_now(t)) {
+        Some(to) => to,
+        None => turn,
+    };
     let second = LAST_S_PEEK.load(Ordering::Relaxed) != t as u64;
     if nudge_on() {
         nudge(t, now, here, (rx, ry), off, turn, second);
@@ -579,6 +591,100 @@ fn steered(memory: &impl Memory, base: u64, camera: &Camera, _trace: &[(f64, f32
         tracing::info!(route_s = t, off, turn, x = now[0], y = now[1], z = now[2], nudge = key.unwrap_or(0), back, "route steer");
     }
     turn
+}
+
+/// The traced yaw at route second `t` (0 if the trace has none).
+fn yaw_now(t: f64) -> f32 {
+    trace().and_then(|points| traced(points, t, std::f32::consts::TAU)).map_or(0.0, |(yaw, _)| yaw)
+}
+
+/// The route second of a key press the walk must reach the track for
+/// (`VICTORY_ROUTE_REACH=<route seconds>`; off when unset): the outdoor
+/// route presses the key that gets into the pickup at 66.1 s, at the foot
+/// of the stairs, and the title walks the player to the door from where
+/// they stand. Replayed, the player came off the stairs a second late,
+/// 1.6 m short, and the walk to the door stuck at the stairs' rail: 7-9 m
+/// off the track from 66 s on, every run that stayed indoors (ow96-base,
+/// ow102-base). From that second on, until the player is within
+/// [`REACH_NEAR_M`] of where the track was then, the camera faces that
+/// spot and forward is held, the key left out; once there the key is
+/// pressed ([`REACH_PRESS_S`]), and the route goes on as recorded.
+fn reach_at() -> Option<f64> {
+    static AT: OnceLock<Option<f64>> = OnceLock::new();
+    *AT.get_or_init(|| std::env::var("VICTORY_ROUTE_REACH").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+const REACH_NEAR_M: f32 = 0.8;
+const REACH_PRESS_S: f64 = 0.2;
+/// How long after the press the walk is helped at most.
+const REACH_MOST_S: f64 = 8.0;
+/// The key the route presses there (`Y`).
+const REACH_KEY: u8 = 0x59;
+
+/// [`reach_at`]'s state: 0 not begun, 1 walking there, 2 pressing (until
+/// the route second in the second field), 3 done.
+static REACH: std::sync::Mutex<(u8, f64)> = std::sync::Mutex::new((0, 0.0));
+
+/// [`reach_at`]: the camera's turn from the traced yaw `yaw` at route second
+/// `t`, the player at `now`, if the walk is being helped.
+fn reach(t: f64, now: [f32; 3], steer: &Steer, yaw: f32) -> Option<f32> {
+    let at = reach_at()?;
+    if t < at || t > at + REACH_MOST_S {
+        return None;
+    }
+    let target = tracked(&steer.points, at)?;
+    let (dx, dy) = (across(target[0] - now[0]), across(target[1] - now[1]));
+    let far = (dx * dx + dy * dy).sqrt();
+    let mut state = REACH.lock().unwrap_or_else(|e| e.into_inner());
+    match state.0 {
+        0 if far <= REACH_NEAR_M => {
+            // There in time: the route's own press does it.
+            state.0 = 3;
+            tracing::info!(route_s = t, far, "route reach: there in time");
+            None
+        }
+        0 | 1 if far > REACH_NEAR_M => {
+            if state.0 == 0 {
+                tracing::info!(route_s = t, far, "route reach: walking there");
+            }
+            state.0 = 1;
+            // The yaw that walks toward the spot.
+            let wanted = steer.sign * wrapped(dy.atan2(dx) - steer.offset);
+            Some(wrapped(wanted - yaw))
+        }
+        1 => {
+            tracing::info!(route_s = t, far, "route reach: there, the key pressed");
+            *state = (2, t + REACH_PRESS_S);
+            None
+        }
+        2 if t >= state.1 => {
+            state.0 = 3;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// [`reach_at`]'s keys: forward held and the route's key left out while
+/// walking there, the key held while pressing.
+pub(super) fn route_reach_keys(down: &mut Vec<u8>) {
+    if reach_at().is_none() {
+        return;
+    }
+    match REACH.lock().unwrap_or_else(|e| e.into_inner()).0 {
+        1 => {
+            down.retain(|&k| k != REACH_KEY);
+            if !down.contains(&0x57) {
+                down.push(0x57);
+            }
+        }
+        2 => {
+            if !down.contains(&REACH_KEY) {
+                down.push(REACH_KEY);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The route second [`steered`] last saw.

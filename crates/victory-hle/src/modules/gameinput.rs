@@ -1250,6 +1250,8 @@ mod host {
                         down.push(vk);
                     }
                 }
+                // Walked to where a key must be pressed (`VICTORY_ROUTE_REACH`).
+                super::camera::route_reach_keys(&mut down);
                 // Nudged toward the steering track (`VICTORY_ROUTE_NUDGE`).
                 let (strafe, back) = super::camera::route_nudge();
                 if back {
